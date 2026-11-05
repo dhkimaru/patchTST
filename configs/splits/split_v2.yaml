@@ -1,0 +1,85 @@
+# Run-level split carried over from patchtst-agent-lab (manifests/split_v2.json).
+# Chronological file holdout over 73 eligible runs; standard_trace_071 is excluded
+# (backward timestamp jump / duplicated block). Test runs stay sealed until final candidates.
+split_id: split_v2
+strategy: chronological_run_holdout
+source_split_hash: 68f0ccffcf2226b4d204f8266a06aa2cf25820d28c274005d12180e15dc4fd8b
+excluded:
+  - run_id: standard_trace_071
+    reason: BACKWARD_TIMESTAMP_JUMP
+train:
+  - standard_trace_001
+  - standard_trace_002
+  - standard_trace_003
+  - standard_trace_004
+  - standard_trace_005
+  - standard_trace_006
+  - standard_trace_007
+  - standard_trace_008
+  - standard_trace_009
+  - standard_trace_010
+  - standard_trace_011
+  - standard_trace_012
+  - standard_trace_013
+  - standard_trace_014
+  - standard_trace_015
+  - standard_trace_016
+  - standard_trace_017
+  - standard_trace_018
+  - standard_trace_019
+  - standard_trace_020
+  - standard_trace_021
+  - standard_trace_022
+  - standard_trace_023
+  - standard_trace_024
+  - standard_trace_025
+  - standard_trace_026
+  - standard_trace_027
+  - standard_trace_028
+  - standard_trace_029
+  - standard_trace_030
+  - standard_trace_031
+  - standard_trace_032
+  - standard_trace_033
+  - standard_trace_034
+  - standard_trace_035
+  - standard_trace_036
+  - standard_trace_037
+  - standard_trace_038
+  - standard_trace_039
+  - standard_trace_040
+  - standard_trace_042
+  - standard_trace_043
+  - standard_trace_044
+  - standard_trace_045
+  - standard_trace_046
+  - standard_trace_047
+  - standard_trace_048
+  - standard_trace_049
+  - standard_trace_050
+  - standard_trace_051
+  - standard_trace_052
+validation:
+  - standard_trace_053
+  - standard_trace_054
+  - standard_trace_055
+  - standard_trace_057
+  - standard_trace_058
+  - standard_trace_062
+  - standard_trace_063
+  - standard_trace_064
+  - standard_trace_065
+  - standard_trace_066
+  - standard_trace_067
+test:
+  - standard_trace_068
+  - standard_trace_069
+  - standard_trace_070
+  - standard_trace_072
+  - standard_trace_073
+  - standard_trace_074
+  - standard_trace_075
+  - standard_trace_077
+  - standard_trace_078
+  - standard_trace_079
+  - standard_trace_080

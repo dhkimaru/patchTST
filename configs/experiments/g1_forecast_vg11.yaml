@@ -1,0 +1,39 @@
+# G1 예측 — 챔버 압력(VG11) 10·20·30초 뒤 값.
+# 이전 프로젝트와 같은 과제·같은 분할(split_v2)·같은 입력(legacy_primary 38개)으로 모델을 비교한다.
+# 이전 기록(시험 run): 현재값 유지 2.092, 기존 코드 2.020, PatchTST 독립 0.235, PatchTST 혼합 0.188.
+name: g1_forecast_vg11
+task: forecast
+description: 챔버 압력(VG11)의 10·20·30초 뒤 값 예측 — 이전 프로젝트 과제 재확인과 모델 비교
+targets: [VG11]
+data:
+  split: split_v2
+  sample_seconds: 1.0        # 이전 프로젝트와 같은 1초 (0.5초 원본을 2개씩 평균)
+  region: all                # window 끝이 run 어디에 있어도 됨 (all | process | cycle)
+  inputs: legacy_primary     # all | core | core_ab | legacy_primary | [컬럼 목록]
+window:
+  context_seconds: 192
+  horizons_seconds: [10, 20, 30]
+train:
+  batch_size: 1024
+  max_epochs: 60
+  windows_per_epoch: 200000
+  patience: 8
+  lr: 0.001
+seeds: [42, 43, 44]
+models:
+  - persistence              # 기준선 (자동 포함)
+  - ridge
+  - lightgbm
+  - name: patchtst           # 원형 PatchTST: 채널 독립 + 채널별 head (이전 O_* 설정)
+    label: patchtst_ci
+    params: {channel_mode: independent, patch_seconds: 16, stride_seconds: 8, d_model: 128, n_heads: 16,
+             n_layers: 3, d_ff: 256, dropout: 0.05}
+  - name: patchtst           # 채널 혼합 PatchTST (이전 최고 FA1과 같은 구조), 크기·patch 길이 탐색
+    label: patchtst_mix
+    params: {channel_mode: mixing, stride_seconds: 8, n_heads: 16, n_layers: 3, d_ff: 256, dropout: 0.05}
+    grid:
+      d_model: [64, 128]
+      patch_seconds: [8, 16]
+  - name: dlinear
+  - name: itransformer
+  - name: gru

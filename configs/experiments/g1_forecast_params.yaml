@@ -1,0 +1,29 @@
+# G1 예측 — 이상 감지에 중요한 파라미터들의 10·20·30초 뒤 값을 한 번에 비교한다 (VG11 실험과 같은 예측 거리).
+# 대상: 가상 센서 대상 분석(ald-analyze-params)의 1차 후보 중 공정 응답 신호.
+name: g1_forecast_params
+task: forecast
+description: 중요 파라미터의 10·20·30초 뒤 값 예측 — 대상별로 어떤 모델이 맞는지 비교
+targets: [VG11, APCValveMon, TempAct_U, TempAct_C, TempAct_L, MFCMon_L.POS, MFCMon_P.POS, AUXMon_R.PWR]
+data:
+  split: split_v2
+  sample_seconds: 1.0
+  region: all
+  inputs: all                # 상수·중복을 뺀 164개 신호
+window:
+  context_seconds: 192
+  horizons_seconds: [10, 20, 30]
+train:
+  batch_size: 1024
+  max_epochs: 40
+  windows_per_epoch: 200000
+  patience: 6
+seeds: [42]
+models:
+  - persistence
+  - ridge
+  - lightgbm
+  - name: patchtst
+    label: patchtst_mix
+    params: {channel_mode: mixing, patch_seconds: 16, stride_seconds: 8, d_model: 128, n_heads: 16, n_layers: 3, d_ff: 256}
+  - name: itransformer
+  - name: dlinear

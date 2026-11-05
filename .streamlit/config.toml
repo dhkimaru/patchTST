@@ -1,0 +1,12 @@
+[server]
+headless = true
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+
+[client]
+toolbarMode = "viewer"

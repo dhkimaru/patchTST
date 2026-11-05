@@ -1,0 +1,22 @@
+# G2 두께 예측(VM) — run 하나의 trace 요약으로 Ex-situ 49점 두께·균일도를 예측한다.
+# run이 약 70개뿐이라 run 단위 leave-one-out 교차검증으로 평가하고, 기준선은 학습 평균이다.
+# 이상 run(1·2·55·57)은 기본으로 뺀다. 먼저 ald-build-overview --exsitu 로 Ex-situ 표를 만들어야 한다.
+name: g2_thickness
+task: thickness
+description: run 단위 trace 요약으로 두께·균일도 예측 (leave-one-run-out)
+targets: [thk_mean, uf_pct_mean, wtow_pct]
+data:
+  split: split_v2
+  sample_seconds: 1.0
+  input_sets:
+    core_ab: core_ab
+    all: all
+vm:
+  exclude_runs: [standard_trace_001, standard_trace_002, standard_trace_055, standard_trace_057]
+seeds: [42]
+models:
+  - mean
+  - ridge
+  - name: pls
+    grid: {n_components: [1, 2, 3]}
+  - lightgbm

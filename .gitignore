@@ -1,0 +1,40 @@
+# Local outputs: parquet caches, overview tables, journal, checkpoints.
+work/
+*.egg-info/
+.streamlit/secrets.toml
+
+# Company data never enters Git: raw traces, metrology workbooks, exports.
+*.csv
+*.xlsx
+*.xls
+*.zip
+*.parquet
+# Machine-specific paths (copied from scripts/env.example.sh)
+scripts/env.sh
+
+# Model files and arrays (made from company data)
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+*.npy
+*.npz
+
+# Python, environments, secrets, editors
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.env.*
+*.pem
+*.key
+.vscode/
+.idea/
+.DS_Store

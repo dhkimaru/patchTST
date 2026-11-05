@@ -1,0 +1,39 @@
+# PatchTST 우선 1단계 (예측) — 대표 대상 3개에서 PatchTST 하이퍼파라미터 조합을 무작위로 16개 뽑아 짧게 학습한다.
+# 조합 16개 × 입력 세트 2개 × 대상 3개 = PatchTST 96개 (+ 기준선). 같은 16개 조합을 모든 대상·입력 세트에 쓴다.
+# 끝나면 대시보드(HTML) "하이퍼파라미터 탐색" 탭 또는 `ald-queue stage2 --task forecast`로 상위 조합을 모든 대상에 적용한다.
+# 대상: VG11(주 과제), APCValveMon·MFCMon_L.POS(이전에 PatchTST가 iTransformer에 진 대상).
+name: p1_patchtst_search_forecast
+task: forecast
+description: PatchTST 우선 1단계 — 예측 대표 대상 3개에서 하이퍼파라미터 조합 탐색 (짧은 학습)
+targets: [VG11, APCValveMon, MFCMon_L.POS]
+data:
+  split: split_v2
+  sample_seconds: 1.0
+  region: all
+  input_sets:
+    all: all                 # 상수·중복을 뺀 164개 (2단계 기본 실험과 같음)
+    A_plus: A_plus           # 중요도 A 전체 + 압력계·APC·RF 매칭 (74개) — 이전에 신호가 많을수록 PatchTST가 나빠졌다
+window:
+  context_seconds: 192
+  horizons_seconds: [10, 20, 30]
+train:                       # 탐색은 짧게: 조합끼리 순위만 가린다 (2단계에서 길게 다시 학습)
+  batch_size: 1024
+  max_epochs: 15
+  windows_per_epoch: 100000
+  patience: 4
+seeds: [42]
+models:
+  - persistence
+  - name: patchtst
+    search: {trials: 16, seed: 0}
+    grid:
+      channel_mode: [independent, mixing]
+      patch_seconds: [8, 16, 32]
+      stride_seconds: [4, 8, 16]
+      d_model: [64, 128, 256]
+      n_heads: [4, 8, 16]
+      n_layers: [2, 3, 4]
+      d_ff: [128, 256, 512]
+      dropout: [0.0, 0.05, 0.1, 0.2]
+      revin_center: [mean, last]
+      train.lr: [0.0003, 0.001, 0.002]

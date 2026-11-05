@@ -1,0 +1,29 @@
+# G3 핵심 파라미터 — 같은 가상 센서 과제를 입력 세트만 바꿔 비교한다.
+# all: 상수·중복을 뺀 164개 / core_ab: 파라미터 설명서 중요도 A·B의 대표 컬럼 / core: 중요도 A만.
+# (대상 계열 제외 규칙은 모든 세트에 똑같이 적용된다.)
+name: g3_core_vs_all
+task: virtual_sensor
+description: 핵심 파라미터만 쓸 때와 전체를 쓸 때의 가상 센서 성능 비교
+targets: [VG11, TempAct_C, APCValveMon, MFCMon_L.POS]
+data:
+  split: split_v2
+  sample_seconds: 1.0
+  region: process
+  input_sets:
+    all: all
+    core_ab: core_ab
+    core: core
+window:
+  context_seconds: 64
+train:
+  batch_size: 1024
+  max_epochs: 40
+  windows_per_epoch: 200000
+  patience: 6
+  loss: mae                  # 평가 지표(MAE)와 같은 손실: MSE는 승온 구간의 큰 오차에 끌려 사이클 구간을 망친다
+seeds: [42, 43]
+models:
+  - template
+  - ridge
+  - lightgbm
+  - name: itransformer
