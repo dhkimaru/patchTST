@@ -359,7 +359,7 @@ def lab_section(ledger: pd.DataFrame) -> str:
         '<h3>진행 상황</h3><div id="lab-queue"></div></div>'
         "<h3>탐색 결과 (설정별 영향)</h3>"
         f'<div id="lab-explore">{explore_html(ledger)}</div>'
-        "<h3>PatchTST 우선 적용 - 단계별 현황</h3>"
+        "<h3>모델 선정 단계별 현황</h3>"
         f'<div id="lab-first">{first_html(ledger)}</div>'
     )
 

@@ -124,6 +124,15 @@ VG11이 튀는 것은 DCS 밸브가 열리는 구간에 몰려 있고, 나머지
 
 모든 결과는 기준선 대비 MAE 개선율(%)로 나타낸다. MAE는 원래 단위(Torr, ℃, % 등)로 계산하고, ALD 사이클 구간과 그 외 구간(감압·승온·벤트 등)을 나눠 본다. 현재값 유지 기준선의 VG11 MAE는 전체 2.016 Torr이지만, 사이클 구간은 0.364 Torr, 그 외 구간은 2.70 Torr다. 전체 평균 하나로는 구간 전환을 잘 맞히는 모델과 사이클 내 미세 변동을 잘 맞히는 모델을 구분할 수 없다.
 
+## 전체 구조
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture_dark.svg">
+  <img src="docs/images/architecture_light.svg" width="100%" alt="ALD Lab 시스템 구성도: 1 사용자 화면(대시보드, 터미널), 2 실험 운영(대기열, 모델 선정 단계, 차수별 일괄 등록, 누적 기록), 3 학습 파이프라인(config, prepare, windows, trainer, evaluate), 4 모델, 5 데이터·설정, 오른쪽에 서버에만 있는 work/ 저장소">
+</picture>
+
+연구자가 ① 대시보드에서 조합을 넣으면 ② 대기열이 요청을 하나씩 ③ 학습 파이프라인으로 돌린다. 파이프라인은 ④ 모델과 ⑤ 데이터·설정을 가져다 쓰고, 결과는 서버의 `work/`에 쌓인다. 쌓인 결과는 ① 대시보드에 나타나고, ② 모델 선정 단계가 다음 실험을 정하는 근거가 된다. `scripts/run_all.sh`는 대기열을 거치지 않고 기준 실험 전부를 바로 돌린다. 파일 단위 흐름은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)에 있다.
+
 ## PatchTST
 
 ```
@@ -177,7 +186,7 @@ head에 함께 넣어 절대 레벨을 잃지 않게 했다. 이전 프로젝트
 | 요약 | 지금까지의 결론과 핵심 숫자 |
 | In · Out | 원본 데이터와 전처리, 모델이 내놓는 값 |
 | Function · Code Flow Chart | 모델 구조와 코드 흐름 |
-| Hyper Parameter · 하이퍼파라미터 탐색 | 조합별 결과, PatchTST 우선 단계별 현황, 학습 진행 상황 |
+| Hyper Parameter · 하이퍼파라미터 탐색 | 조합별 결과, 모델 선정 단계별 현황, 학습 진행 상황 |
 | 성능표 | 대상별 모델 순위와 기준선 대비 개선율 |
 | 가중치·실행 파일 | 대상별 최고 모델의 가중치와 실행 파일 |
 | 특이사항 · 이전 실험 · 다음 실험 | 학습 속도, 이전 프로젝트 결과, 다음 실험 후보 |
@@ -202,14 +211,22 @@ bash scripts/lab.sh                    # 실험실 대시보드 (포트 5273)
 configs/columns/       신호 200개 목록: 단위, 역할, 같은 계열 묶음 (공개본. 의미·중요도는 비공개)
 configs/splits/        run 분할 (split_v2)
 configs/experiments/   실험 계획서. YAML 하나가 대상 × 모델 × 조합 × 입력 세트 × seed로 펼쳐진다
+configs/plan/          다음 실험 후보 (보고서 '다음 실험' 탭)
 configs/history/       이전 프로젝트 집계 기록
 src/ald_lab/data/      CSV 읽기, run 카탈로그, Ex-situ 파싱
 src/ald_lab/models/    PatchTST·iTransformer·DLinear·GRU, LightGBM·Ridge, 기준선
 src/ald_lab/training/  구간 분할·정규화, GPU window, 학습, 평가, 예측
-src/ald_lab/report/    HTML 보고서
+src/ald_lab/launch.py  실험 대기열과 작업자 (ald-queue)
+src/ald_lab/stages.py  모델 선정 단계: PatchTST 조합 탐색 → 전 대상 적용 → 대안 모델
+src/ald_lab/ledger.py  누적 기록: 모든 실험의 job을 한 표로
+src/ald_lab/report/    대시보드 화면(HTML)을 그리는 코드
 src/ald_lab/server.py  실험실 대시보드
-docs/                  연구 계획(PLAN.md), 서버 학습 절차(TRAINING.md)
+scripts/               서버 설치·실행 스크립트, README 구조도 생성(readme_diagrams.py)
+tests/                 합성 trace로 도는 테스트
+docs/                  연구 계획(PLAN.md), 서버 학습 절차(TRAINING.md), 코드 구조(ARCHITECTURE.md), README 그림
 ```
+
+함수 단위 호출 관계는 보고서의 Code Flow Chart 탭에 있다. `src/ald_lab/`을 읽어 자동으로 그리므로 코드와 항상 같다.
 
 ## 데이터 취급
 

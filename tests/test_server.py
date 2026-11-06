@@ -101,7 +101,7 @@ def test_lab_server_end_to_end(lab, bases, tmp_path):  # noqa: F811
 
         server.rebuild()
         page = _http(port, "/")
-        assert "하이퍼파라미터 탐색" in page and 'id="lab-live"' in page and "PatchTST 우선" in page
+        assert "하이퍼파라미터 탐색" in page and 'id="lab-live"' in page and "모델 선정 단계" in page
         assert "<script src" not in page
     finally:
         httpd.shutdown()

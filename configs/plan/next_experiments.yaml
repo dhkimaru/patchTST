@@ -162,7 +162,7 @@ categories:
     why: "연구의 주 모델은 PatchTST다. 지금까지는 모델 9종을 처음부터 나란히 비교해 PatchTST는 대상마다 설정 하나로만 학습됐다 (VG11만 d_model·patch 일부). PatchTST의 조합을 먼저 충분히 탐색해 모든 대상에 적용하고, 그래도 기준을 못 넘는 대상만 다른 모델로 푼다. 설정끼리 영향을 주고받으므로 하나씩 바꾸지 않고 조합으로 탐색한다."
     items:
       - id: C2
-        title: PatchTST 우선 3단계 — 탐색 → 전체 적용 → 대안
+        title: 모델 선정 단계 — PatchTST 탐색 → 전체 적용 → 대안
         goal: "모든 대상을 PatchTST로, 조합을 탐색해 최고 설정을 찾고 안 되는 대상만 다른 모델"
         priority: 1
         status: 진행 중

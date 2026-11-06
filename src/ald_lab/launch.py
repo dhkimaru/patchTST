@@ -623,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     p_cancel = sub.add_parser("cancel", help="요청 취소 (실행 중이면 멈춤)")
     p_cancel.add_argument("request_id")
     sub.add_parser("worker", help="대기열이 빌 때까지 실행 (보통 자동으로 뜬다)")
-    p_first = sub.add_parser("first", help="PatchTST 우선: 대상별 PatchTST 최고 · 기준선 대비 판정 (LightGBM 참고)")
+    p_first = sub.add_parser("first", help="모델 선정 단계: 대상별 PatchTST 최고 · 기준선 대비 판정 (LightGBM 참고)")
     p_stage2 = sub.add_parser("stage2", help="1단계 탐색 상위 조합을 모든 대상에 (대기열에 넣음)")
     p_stage3 = sub.add_parser("stage3", help="PatchTST가 기준을 못 넘은 대상에 다른 모델 (대기열에 넣음)")
     for p in (p_first, p_stage2, p_stage3):

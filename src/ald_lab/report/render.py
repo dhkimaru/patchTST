@@ -1172,7 +1172,7 @@ MODULE_ROLES = {
     "report.plan": "다음 실험 후보 읽기 (configs/plan/)", "report.archs": "모델 구조 그림 (Function · Out 탭)",
     "report.player": "추론 재생기 (추론 시연 탭 · ald-predict --html)",
     "launch": "대기열·작업자: 대시보드에서 고른 설정으로 학습 (ald-queue)", "ledger": "누적 기록: 모든 실행의 설정과 결과",
-    "stages": "PatchTST 우선: 탐색 순위 · 전체 적용 · 대안 판정", "server": "실험실 서버: 보고서 + 하이퍼파라미터 탐색 (ald-lab-server)",
+    "stages": "모델 선정 단계: 탐색 순위 · 전체 적용 · 대안 판정", "server": "실험실 서버: 보고서 + 하이퍼파라미터 탐색 (ald-lab-server)",
     "report.lab": "하이퍼파라미터 탐색 탭", "report.overview": "요약 탭: 결론 문장 · 대상별 오차 · 기록 추이 그림", "models.constraints": "조합 검사 (head 수 · patch 길이)",
     "dashboard.views.launcher": "대시보드: 새 실험 실행 · 진행 상황", "dashboard.views.records": "대시보드: 누적 기록",
     "dashboard.app": "대시보드 시작·페이지 구성", "dashboard.state": "대시보드가 읽는 결과 파일",

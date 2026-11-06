@@ -1,10 +1,10 @@
-# PatchTST 우선 1단계 (가상 센서) — 대표 대상 3개에서 PatchTST 하이퍼파라미터 조합을 무작위로 16개 뽑아 짧게 학습한다.
+# 모델 선정 1단계 (가상 센서) — 대표 대상 3개에서 PatchTST 하이퍼파라미터 조합을 무작위로 16개 뽑아 짧게 학습한다.
 # 조합 16개 × 입력 세트 2개 × 대상 3개 = PatchTST 96개 (+ 레시피 평균). 대상과 같은 계열 센서는 입력에서 뺀다.
 # 끝나면 "하이퍼파라미터 탐색" 탭 또는 `ald-queue stage2 --task virtual_sensor`로 상위 조합을 16개 대상 전부에 적용한다.
 # 대상: VG11(압력계를 모두 빼 가장 어려움), TempAct_C(쉬움), MFCMon_L.POS(run 사이 변동이 큼).
 name: p1_patchtst_search_vs
 task: virtual_sensor
-description: PatchTST 우선 1단계 — 가상 센서 대표 대상 3개에서 하이퍼파라미터 조합 탐색 (짧은 학습)
+description: 모델 선정 1단계 — 가상 센서 대표 대상 3개에서 하이퍼파라미터 조합 탐색 (짧은 학습)
 targets: [VG11, TempAct_C, MFCMon_L.POS]
 data:
   split: split_v2
