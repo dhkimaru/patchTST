@@ -16,26 +16,49 @@ PEALD SiN(DCS/NH3) 배치 장비의 공정 trace 데이터를 분석하여,
 
 ## 결과 (Daily 갱신)
 
-> 매일 그날까지의 최고 기록을 전날과 비교해 갱신한다. 숫자는 검증 run 11개 기준이며, 시험 run은 아직 열지 않았다.
+> 매일 그날까지의 최고 기록을 전날과 비교해 갱신한다. 11-03까지의 숫자는 검증 run 11개 기준이고, 11-04에 최종 설정으로 시험 run 11개를 한 번 평가했다.
 
-### 11-02 · 전날 대비 오차 −1 %
+### 11-06 · 시험 run 평가 및 원인 분석 (11-03 ~ 11-06)
 
-미래값 예측 8개 대상 평균 남은 오차 8.1 → 8.0 (기준선 = 100). 미래값 예측은 seed 4개로 흔들림을 확인하며 대상별 설정을 확정하는 단계라 변화가 작았고, 가상 센서는 입력을 74개로 줄여 온도 오차가 17~43 % 줄면서 16개 대상 중 10개가 LightGBM보다 나아졌다.
+미래값 예측 8개는 처음 보는 시험 run에서도 검증과 같은 수준이었다(대상 평균 남은 오차 7.9 → 7.9).
+가상 센서는 온도 5개와 RF 반사 전력이 시험에서도 기준선 대비 86~91 % 줄었지만, 가스·밸브 6개와 RF 매처 위치 2개는 개선 폭이
+19~57 %로 줄었고, APC는 기준선과 같아졌으며(0.2 %), VG11은 기준선보다 나빠졌다(−77 %).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/results_daily_dark.svg">
-  <img src="docs/images/results_daily_light.svg" width="100%" alt="11-02 전날 대비 대상별 오차 변화">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/results_test_dark.svg">
+  <img src="docs/images/results_test_light.svg" width="100%" alt="최종 설정의 검증 run과 시험 run 남은 오차 비교">
 </picture>
+
+**가상 센서가 시험 run에서 떨어진 원인 (드리프트 · 과적합 여부 확인)**
+
+- 가스·밸브 6개는 run이 두 무리로 갈린다. 레시피 평균(기준선) 오차가 4~6배 큰 run이 따로 있고, PatchTST의 남은 오차도 이 run들에서 크다.
+- 이런 run은 학습 run에도 절반가량 있고 날짜와 상관없이 섞여 있다. 시간이 갈수록 나빠지는 드리프트는 아니다.
+- 0.5초 원본 그대로 계산하거나 step이 바뀔 때마다 1초 묶음을 새로 시작하면 두 무리의 기준선 오차 차이가 사라진다(2.6배 → 1.0배).
+  0.5초 데이터를 1초로 묶는 전처리와 step 표시 시점의 흔들림(±0.5초)이 겹쳐 생긴 차이로 본다.
+- 시험 run에는 이런 run이 11개 중 7개로 검증(4개)보다 많이 들어가 평균이 떨어졌다. 오차가 작은 run끼리는 검증 26 · 시험 30으로 비슷하다.
+  큰 run끼리는 검증 50 · 시험 73인데, 검증의 큰 run 4개 중 058 · 065는 덜 어려웠다.
+- APC · VG11은 검증 평균이 run 몇 개에 좌우됐다. VG11은 검증 run 11개 중 4개에서 이미 기준선보다 나빴고, APC는 4개 run에서 좋아지고 3개에서 나빠졌다.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/results_runs_dark.svg">
+  <img src="docs/images/results_runs_light.svg" width="100%" alt="가스·밸브 가상 센서 run별 남은 오차">
+</picture>
+
+**이어서 하는 실험 (11-06 시작)**
+
+- 가상 센서 run 단위 교차검증 (120~139차): 시험 run은 쓰지 않고, 학습·검증 run 62개를 5묶음으로 나눠 돌아가며 검증한다.
+  1묶음 결과는 8개 대상 모두 기준선보다 25~52 % 나았다(APC 25 %, VG11 30 %). 5묶음이 모두 끝나면 판정한다.
+- 미래값 예측 거리 확장 (140~146차): 30초 · 1분 · 2분 · 5분 · 10분 뒤까지 예측하고, 현재값 유지와 레시피 평균 두 기준과 비교한다.
 
 ### 지금까지의 추이
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/results_progress_dark.svg">
-  <img src="docs/images/results_progress_light.svg" width="100%" alt="날짜별 PatchTST 최고 기록">
+  <img src="docs/images/results_progress_light.svg" width="100%" alt="미래값 예측 8개 대상 평균: 탐색 단계별 검증 기록과 시험 run 결과">
 </picture>
 
 <details>
-<summary>대상별 탐색 전 → 지금 · 설정별 효과</summary>
+<summary>대상별 탐색 전 → 11-02 · 설정별 효과</summary>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/results_targets_dark.svg">
@@ -52,6 +75,7 @@ PEALD SiN(DCS/NH3) 배치 장비의 공정 trace 데이터를 분석하여,
 <details>
 <summary>지난 날짜 기록</summary>
 
+- **11-02** · 전날 대비 −1 % (8.1 → 8.0) — 미래값 예측은 seed 4개로 흔들림을 확인하며 대상별 설정을 확정하는 단계라 변화가 작았고, 가상 센서는 입력을 74개로 줄여 온도 오차가 17~43 % 줄면서 16개 대상 중 10개가 LightGBM보다 나아졌다.
 - **11-01** · 전날 대비 −17 % (9.7 → 8.1) — 층 6과 대상별 window로 8개 대상 모두 좋아졌고, VG11이 window 256초에서 LightGBM을 앞섰다.
 - **10-31** · 전날 대비 −15 % (11.4 → 9.7) — 학습량을 120 epoch로 늘린 것이 7개 대상의 오차를 9~30 % 줄였다.
 - **10-30** · 전날 대비 −14 % (13.3 → 11.4) — 손실 함수를 mse에서 mae로 바꾼 것이 가장 컸다.
