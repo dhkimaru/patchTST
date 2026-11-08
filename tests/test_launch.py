@@ -48,6 +48,17 @@ def test_values_and_combinations():
                 assert launch.parse_values(p, [p.default]) == [p.default]
 
 
+def test_build_config_keeps_recipe_mean_for_forecasting(lab, tmp_path):  # noqa: F811
+    _, split_path = lab
+    base = {**_base(tmp_path, split_path), "study": "long_horizon", "models": ["persistence", "template"]}
+    doc = launch.build_config(base, targets=["VG11"], seeds=[1], input_sets=["all"], models={"ridge": {}})
+    assert [m if isinstance(m, str) else m["name"] for m in doc["models"]] == ["template", "ridge"]
+    assert doc["study"] == "long_horizon"
+    vs = {**base, "task": "virtual_sensor"}
+    assert [m["name"] for m in launch.build_config(vs, targets=["VG11"], seeds=[1], input_sets=["all"],
+                                                   models={"ridge": {}})["models"]] == ["ridge"]
+
+
 def test_build_config_expands_like_ald_train(lab, tmp_path):  # noqa: F811
     _, split_path = lab
     base = _base(tmp_path, split_path)

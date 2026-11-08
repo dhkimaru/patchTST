@@ -1,0 +1,28 @@
+# G1 예측 거리 확장 — 같은 8개 대상의 30초 · 1분 · 2분 · 5분 · 10분 뒤 값.
+# 예측 거리가 길어지면 '현재값 유지'는 크게 틀려 기준선으로 약해지므로, 그 시점에 레시피상 나와야 할 값
+# ('레시피 평균': 학습 run에서 같은 step · 같은 위치의 평균)도 함께 돌려 비교한다.
+# study 표시가 있어 채택 판정 · 최고 기록에는 섞이지 않고 누적 기록에만 들어간다.
+name: g1_forecast_long
+study: long_horizon
+task: forecast
+description: 중요 파라미터의 30초 ~ 10분 뒤 값 예측 — 현재값 유지와 레시피 평균 대비
+targets: [VG11, APCValveMon, TempAct_U, TempAct_C, TempAct_L, MFCMon_L.POS, MFCMon_P.POS, AUXMon_R.PWR]
+data:
+  split: split_v2
+  sample_seconds: 1.0
+  region: all
+  inputs: all
+window:
+  context_seconds: 192
+  horizons_seconds: [30, 60, 120, 300, 600]
+train:
+  batch_size: 1024
+  max_epochs: 40
+  windows_per_epoch: 200000
+  patience: 6
+seeds: [42]
+models:
+  - persistence
+  - template                 # 레시피 평균: 대시보드 요청에도 함께 들어간다
+  - name: patchtst
+    params: {channel_mode: mixing, patch_seconds: 16, stride_seconds: 8, d_model: 128, n_heads: 16, n_layers: 6, d_ff: 512}

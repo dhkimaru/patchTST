@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from .launch import HP_SUFFIX
+from .ledger import main_records
 
 SEARCH_PREFIX = "p1_patchtst_search"  # base name of step-1 experiments written as files
 STAGE2_PREFIX = "p2_patchtst_all"
@@ -134,6 +135,7 @@ def patchtst_first(records: pd.DataFrame, task: str, *, noise_sd: float = NOISE_
     """Per target of ``task``: the best PatchTST configuration (any run, seeds averaged), whether it beats the
     baseline beyond the seed noise (the decision), LightGBM for reference, and the best other model."""
 
+    records = main_records(records)  # cross-validation folds and other side studies do not decide
     rows = records[(records["task"] == task) & records["mae"].notna() & ~records["smoke"].astype(bool)]
     out = []
     for target, group in rows.groupby("target", sort=True):

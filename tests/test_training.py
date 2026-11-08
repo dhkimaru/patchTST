@@ -239,6 +239,30 @@ def test_residual_template_in_forecast(lab, tmp_path):
     assert (results["status"] == "ok").all(), results.get("error")
 
 
+def test_recipe_mean_baseline_and_side_study_in_forecast(lab, tmp_path):
+    """Longer horizons compare against the recipe mean too; a side study never decides PatchTST adoption."""
+    from ald_lab import stages
+    from ald_lab.ledger import collect_ledger, main_records
+
+    paths, split_path = lab
+    config = _config(tmp_path, split_path, name="long", study="long_horizon",
+                     window={"context_seconds": 16, "horizons_seconds": [2, 8]},
+                     models=["template", {"name": "patchtst", "params": {"patch_seconds": 4, "stride_seconds": 2,
+                                                                         "d_model": 16, "n_heads": 2, "n_layers": 1,
+                                                                         "d_ff": 32}}])
+    exp_dir = run_experiment(config, paths, devices=["cpu"])
+    results = pd.read_csv(exp_dir / "results.csv")
+    assert (results["status"] == "ok").all(), results.get("error")
+    assert set(results["model"]) == {"persistence", "template", "patchtst"}
+    metrics = json.loads((exp_dir / results.loc[results["model"] == "template", "job_dir"].iloc[0]
+                          / "metrics_validation.json").read_text())["metrics"]
+    assert set(metrics["by_horizon"]) == {"2s", "8s"} and np.isfinite(metrics["mae"])
+    ledger = collect_ledger(paths.work_root)
+    assert set(ledger["study"]) == {"long_horizon"} and main_records(ledger).empty
+    assert ledger.loc[ledger["model"] == "template", ["mae_2s", "mae_8s"]].notna().all(axis=None)
+    assert stages.patchtst_first(ledger, "forecast").empty
+
+
 def test_deep_virtual_sensor_learns_template_correction(lab, tmp_path):
     paths, split_path = lab
     config = _config(tmp_path, split_path, task="virtual_sensor", name="vsdeep",

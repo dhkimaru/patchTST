@@ -15,6 +15,7 @@ from typing import Any
 import pandas as pd
 
 from .. import stages
+from ..ledger import main_records
 
 TASKS = {"forecast": ("미래값 예측", "현재값 유지"), "virtual_sensor": ("가상 센서", "레시피 평균")}
 DECISION_TEXT = {"keep": ("채택", "good"), "fallback": ("대안 필요", "bad"), "missing": ("미학습", "muted")}
@@ -61,6 +62,7 @@ def trend(ledger: pd.DataFrame, task: str, frame: pd.DataFrame) -> list[dict[str
     base = {r.target: float(r.baseline_mae) for r in frame.itertuples() if _ok(r.baseline_mae) and r.baseline_mae > 0}
     if not base or ledger is None or not len(ledger) or "when" not in ledger:
         return []
+    ledger = main_records(ledger)
     rows = ledger[(ledger["task"] == task) & (ledger["model"] == "patchtst") & ledger["mae"].notna()
                   & ledger["target"].isin(list(base))]
     if "smoke" in rows:

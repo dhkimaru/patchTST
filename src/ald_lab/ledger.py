@@ -19,7 +19,7 @@ from .launch import HP_SUFFIX, read_request
 
 BASE_COLUMNS = ("when", "experiment", "base", "stamp", "status", "source", "memo", "task", "target", "unit", "model",
                 "label", "input_set", "seed", "settings", "mae", "improvement_pct", "mae_cycle", "mae_other",
-                "test_mae", "fit_minutes", "n_params", "context_seconds", "exp_dir", "job_id")
+                "test_mae", "fit_minutes", "n_params", "context_seconds", "study", "exp_dir", "job_id")
 
 
 def _read_json(path: Path) -> Any:
@@ -88,8 +88,8 @@ def _run_rows(exp_dir: Path, request: dict[str, Any] | None) -> list[dict[str, A
             "job_status": res.get("status", "ok"), "mae": res.get("mae"), "improvement_pct": res.get("improvement_pct"),
             "mae_cycle": res.get("mae_cycle"), "mae_other": res.get("mae_other"), "test_mae": test_mae,
             "fit_minutes": float(fit) / 60 if fit is not None and not pd.isna(fit) else None, "n_params": res.get("n_params"),
-            "context_seconds": context, "exp_dir": str(exp_dir), "job_id": job_id, "smoke": name.endswith("_smoke"),
-            **{f"mae_{k}": v for k, v in res.items() if k.startswith("mae_") and k[4:].endswith("s")
+            "context_seconds": context, "study": str(config.get("study") or ""), "exp_dir": str(exp_dir), "job_id": job_id, "smoke": name.endswith("_smoke"),
+            **{k: v for k, v in res.items() if k.startswith("mae_") and k[4:].endswith("s")
                and k[4:-1].replace(".", "").isdigit()},
         })
     return rows
@@ -114,9 +114,19 @@ def collect_ledger(work_root: Path, *, include_smoke: bool = False) -> pd.DataFr
     return frame.sort_values(["when", "target", "mae"], ascending=[False, True, True]).reset_index(drop=True)
 
 
-def best_by_target(frame: pd.DataFrame) -> pd.DataFrame:
-    """Lowest validation MAE per (task, target) over every run, baselines aside."""
+def main_records(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rows of the main protocol. A side study (``study:`` in the experiment YAML, e.g. a cross-validation fold or
+    longer horizons) is scored on other runs or other horizons, so records and decisions leave it out."""
 
+    if "study" not in frame:
+        return frame
+    return frame[frame["study"].fillna("").astype(str) == ""]
+
+
+def best_by_target(frame: pd.DataFrame) -> pd.DataFrame:
+    """Lowest validation MAE per (task, target) over every run of the main protocol, baselines aside."""
+
+    frame = main_records(frame)
     ok = frame[(frame.get("job_status", "ok") == "ok") & frame["mae"].notna()]
     ok = ok[~ok["model"].isin(("persistence", "template", "mean"))]
     if not len(ok):
@@ -128,6 +138,7 @@ def best_by_target(frame: pd.DataFrame) -> pd.DataFrame:
 def best_over_time(frame: pd.DataFrame, task: str, target: str) -> pd.DataFrame:
     """Per run (time) the best MAE of ``target`` and the best so far — how the record improved."""
 
+    frame = main_records(frame)
     ok = frame[(frame["task"] == task) & (frame["target"] == target) & frame["mae"].notna()
                & ~frame["model"].isin(("persistence", "template", "mean"))]
     if not len(ok):
