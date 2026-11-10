@@ -335,6 +335,98 @@ def noncycle_vs_full() -> None:
         add(pd.DataFrame(recs).to_string(index=False))
 
 
+
+
+# 1-11) 최근 run 가중 학습 · 초기 run 포함 · 사이클 window 길이
+def recency_weighting() -> None:
+    if not len(led):
+        return
+    studies = {"lc51": "가중 없음"} | {f"rw{h}": f"반감기 {h}개" for h in (40, 20, 10)}
+    rows_ = led[st.isin([s_ for s_ in studies if s_ != "lc51"])]
+    if not len(rows_):
+        return
+    recs = []
+    for target in sorted(set(rows_["target"])):
+        rec, sds = {"대상": target}, {}
+        for study, name in studies.items():
+            s_ = summarize(study_rows(study, target))
+            rec[name] = s_["pt"] if s_ else np.nan
+            sds[name] = s_["pt_sd"] if s_ else np.nan
+        vals = {k: v for k, v in rec.items() if k != "대상" and pd.notna(v)}
+        if "가중 없음" not in vals or len(vals) < 2:
+            continue
+        best = min(vals, key=vals.get)
+        sd = float(np.sqrt(np.nanmean([sds["가중 없음"] ** 2, sds[best] ** 2])))
+        rec["가장 나은 것"] = best
+        rec["가중 없음 대비 %"] = round(100 * (vals[best] / vals["가중 없음"] - 1), 1)
+        if best == "가중 없음":
+            rec["판단"] = "가중 없음이 가장 나음"
+        else:
+            rec["판단"] = "확실히 나음" if vals["가중 없음"] - vals[best] > 2 * sd else "seed 편차 수준"
+        recs.append(rec)
+    if recs:
+        f = pd.DataFrame(recs)
+        cols = [n for n in studies.values() if n in f]
+        f[cols] = f[cols].apply(lambda col: col.map(fmt))
+        add("\n## 1-11. 최근 run 가중 학습 (학습 run 51개, 최근 run일수록 자주 뽑음 · PatchTST 검증 MAE)")
+        add(f.to_string(index=False))
+
+
+def early_plus_recent() -> None:
+    rows_ = led[st == "early_recent"] if len(led) else led
+    if not len(rows_):
+        return
+    recs = []
+    for target in sorted(set(rows_["target"])):
+        a = summarize(study_rows("early_recent", target))
+        b, c = summarize(study_rows("recent4_30", target)), summarize(study_rows("lc31", target))
+        if a:
+            recs.append({"대상": target, "초기 11개 + 최근 19개": fmt(a["pt"]), "최근 30개": fmt(b["pt"]) if b else "-",
+                         "무작위 31개": fmt(c["pt"]) if c else "-",
+                         "최근 30개 대비 %": round(100 * (a["pt"] / b["pt"] - 1), 1) if b else np.nan})
+    if recs:
+        add("\n## 1-12. 초기 run(001~011) 포함 효과 (검증 053~067, PatchTST 검증 MAE)")
+        add("음수면 초기 run을 넣는 편이 낫다. 같은 30개 안팎에서 비교한다.")
+        add(pd.DataFrame(recs).to_string(index=False))
+
+
+def cycle_windows() -> None:
+    rows_ = led[st.isin(["region_cycle", "region_cycle_win"])] if len(led) else led
+    if not len(rows_) or not (st == "region_cycle_win").any():
+        return
+    pt = rows_[rows_["model"] == "patchtst"]
+    t = pt.groupby(["target", "context_seconds"])["mae"].mean().unstack()
+    t.columns = [f"window {c:g}초" for c in t.columns]
+    t = t.loc[sorted(set(led.loc[st == "region_cycle_win", "target"]))]
+    add("\n## 1-13. 사이클만 학습 · window 길이 (PatchTST 검증 MAE, 사이클 window)")
+    add(table(t))
+
+
+# 2-2) 장기 예측 설정 탐색
+def long_search() -> None:
+    rows_ = led[st == "long_horizon_search"] if len(led) else led
+    if not len(rows_):
+        return
+    hcols = sorted([c for c in rows_.columns if c.startswith("mae_") and c.endswith("s") and c[4:-1].isdigit()
+                    and rows_[c].notna().any()], key=lambda c: int(c[4:-1]))
+    add("\n## 2-2. 장기 예측 설정 탐색 (검증 MAE, 학습 모델은 seed 평균 · 바꾼 설정만 표시)")
+    for target, g in rows_.groupby("target"):
+        parts = []
+        for model, gm in g.groupby("model"):
+            if model in ("persistence", "template", "schedule"):
+                parts.append(gm.groupby("model")[["mae", *hcols]].mean().rename(index=lambda m: NAMES.get(m, m)))
+                continue
+            pairs = gm["settings"].astype(str).map(lambda x: dict(kv.split("=", 1) for kv in x.split(" · ") if "=" in kv))
+            keys = sorted({k for d in pairs for k in d if len({str(e.get(k)) for e in pairs}) > 1})
+            label = pairs.map(lambda d, keys=keys, m=model: NAMES.get(m, m)
+                              + (" · " + " ".join(f"{k}={d.get(k)}" for k in keys) if keys else ""))
+            parts.append(gm.assign(label=label.to_numpy()).groupby("label")[["mae", *hcols]].mean())
+        t = pd.concat(parts).sort_values("mae")
+        t.columns = ["5개 거리 평균"] + [c[4:] for c in hcols]
+        add(f"\n[{target}]")
+        add(table(t))
+
+
 vs_study("cv", "1. 가상 센서 run 단위 교차검증")
 vs_study("time", "1-2. 가상 센서 시간순 검증 (앞쪽 run으로 학습 → 바로 다음 run으로 검증)")
 vs_study("single_sensor", "1-3. 가상 센서 · 센서 하나만 고장 (같은 계열 센서는 입력에 남김)")
@@ -348,20 +440,29 @@ versus_full("region_cycle", "1-7. 사이클 구간만 학습 · 평가",
 recency_sweep()
 learning_curve_draws()
 noncycle_vs_full()
+recency_weighting()
+early_plus_recent()
+cycle_windows()
 
 
 # 2) 예측 거리 확장: 모델 · window별
 def long_horizon() -> None:
-    lh = led[st == "long_horizon"] if len(led) else led
+    if not len(led):
+        return
+    dedicated = {"long_horizon_mid": "30초~2분 전용", "long_horizon_far": "5~10분 전용"}
+    lh = led[(st == "long_horizon") | (st.isin(list(dedicated)) & ~led["model"].isin(["persistence", "template", "schedule"]))]
     if not len(lh):
         return
     add("\n## 2. 미래값 예측 거리 확장 (검증 MAE, 학습 모델은 seed 평균)")
+    add("거리 전용 모델(30초~2분 · 5~10분)은 자기 거리만 학습한 모델이다. "
+        "window 수가 조금 달라(예측 거리가 짧을수록 많음) 같은 거리끼리만 비교한다.")
     hcols = sorted([c for c in lh.columns if c.startswith("mae_") and c.endswith("s") and c[4:-1].isdigit()
                     and lh[c].notna().any()], key=lambda c: int(c[4:-1]))
     cols = hcols + ["mae_cycle", "mae_other"]
     labels = [c[4:] for c in hcols] + ["사이클 안", "사이클 밖"]
-    lh = lh.assign(key=[NAMES.get(m, m) if m in ("persistence", "template", "schedule") else f"{NAMES.get(m, m)} · window {c:g}초"
-                        for m, c in zip(lh["model"], lh["context_seconds"], strict=True)])
+    lh = lh.assign(key=[NAMES.get(m, m) if m in ("persistence", "template", "schedule")
+                        else f"{NAMES.get(m, m)} · window {c:g}초" + (f" · {dedicated[s_]}" if s_ in dedicated else "")
+                        for m, c, s_ in zip(lh["model"], lh["context_seconds"], lh["study"].astype(str), strict=True)])
     for target, g in lh.groupby("target"):
         t = g.groupby("key")[cols].mean()
         base = [k for k in ("현재값 유지", "레시피 평균", "레시피 일정 평균") if k in t.index]
@@ -380,6 +481,7 @@ def long_horizon() -> None:
 
 
 long_horizon()
+long_search()
 
 
 # 3) 기본 결과(부가 실험 제외): 대상 × 모델별 최고 설정의 전체 · 사이클 안 · 사이클 밖 개선율

@@ -194,6 +194,22 @@ def offset_targets(ws: WindowSet, offset: np.ndarray, scale: float = 1.0) -> Win
     return out
 
 
+def with_recency_weights(ws: WindowSet, bundle: Bundle, halflife_runs: float) -> WindowSet:
+    """The same windows with sampling weights ``0.5 ** (age / halflife_runs)``; age 0 = the newest training run.
+
+    Runs are ordered by run id (``standard_trace_NNN`` follows time). The weights live on a shallow copy, so the
+    cached window set of the target stays unweighted for other jobs.
+    """
+
+    run = np.asarray(bundle.run_index)[ws.ends_np]
+    rank = np.argsort(np.argsort(np.asarray(bundle.run_ids)))  # position of each run in time order
+    age = (len(bundle.run_ids) - 1) - rank[run]
+    out = copy.copy(ws)
+    weights = 0.5 ** (age / float(halflife_runs))
+    out.window_weights = weights / weights.sum()
+    return out
+
+
 def residual_scale(ws: WindowSet, offset: np.ndarray) -> float:
     """Spread of ``y - offset`` over the windows' target rows (train partition)."""
 

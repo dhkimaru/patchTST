@@ -317,10 +317,15 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
     paths, split_path = lab
     tiny = {"name": "patchtst", "params": {"patch_seconds": 4, "stride_seconds": 2, "d_model": 16, "n_heads": 2,
                                            "n_layers": 1, "d_ff": 32}}
-    for study, region in (("lc51", "process"), ("lc20", "process"), ("lc20b", "process"), ("recent4", "process"),
-                          ("recent4_10", "process"), ("region_cycle", "cycle")):
+    for study, region, extra, ctx in (("lc51", "process", {}, 16), ("lc20", "process", {}, 16), ("lc20b", "process", {}, 16),
+                                      ("recent4", "process", {}, 16), ("recent4_10", "process", {}, 16),
+                                      ("region_cycle", "cycle", {}, 16), ("rw20", "process", {"recency_halflife_runs": 2}, 16),
+                                      ("early_recent", "process", {}, 16), ("recent4_30", "process", {}, 16),
+                                      ("region_cycle_win", "cycle", {}, 8)):
         config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, seeds=[1, 2],
-                         targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": 16},
+                         targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": ctx},
+                         train={"batch_size": 64, "max_epochs": 2, "windows_per_epoch": 256, "val_windows": 128,
+                                "patience": 2, **extra},
                          data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all"})
         results = pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")
         assert (results["status"] == "ok").all(), results.get("error")
@@ -332,6 +337,8 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
     assert "1-7. 사이클 구간만 학습" in text and "lc51" in text
     assert "4. 레시피 단계별 남은 오차" in text and "TempAct_C · PatchTST" in text
     assert "1-8. 학습 기간 길이" in text and "1-9. 학습 run 수 곡선 · 두 번째 추첨" in text
+    assert "1-11. 최근 run 가중 학습" in text and "반감기 20개" in text
+    assert "1-12. 초기 run(001~011) 포함 효과" in text and "1-13. 사이클만 학습 · window 길이" in text and "window 8초" in text
 
 
 def test_schedule_baseline_projects_steps_without_future_labels(lab, tmp_path):
@@ -394,3 +401,32 @@ def test_combine_predictions_script(lab, tmp_path, monkeypatch):
     assert "1. 가상 센서 · 구간 전용 모델 합치기" in text and "사이클 전용 + 사이클 밖 전용" in text
     assert "2. 가상 센서 · PatchTST와 LightGBM 예측 평균" in text
     assert "3. 미래값 30초~10분 · 예측 거리별 모델 비교와 선택" in text and "레시피 일정 평균" in text
+
+
+def test_recency_weights_favour_recent_runs(lab, tmp_path):
+    """Windows of newer training runs are drawn more often; the cached window set stays unweighted."""
+    from ald_lab.training.runner import make_window_set
+    from ald_lab.training.windows import fit_scaler, with_recency_weights
+
+    paths, split_path = lab
+    bundle = build_bundle(paths, load_split(split_path), "train", sample_seconds=1.0, columns=["VG11", "TempAct_C"])
+    ws = make_window_set(bundle, ["TempAct_C"], "VG11", fit_scaler(bundle, ["TempAct_C", "VG11"]), context=8,
+                         horizons=(0,), region="process", device="cpu")
+    weighted = with_recency_weights(ws, bundle, 1.0)
+    assert getattr(ws, "window_weights", None) is None and abs(weighted.window_weights.sum() - 1) < 1e-9
+    run = np.asarray(bundle.run_index)[ws.ends_np]
+    newest, oldest = len(bundle.run_ids) - 1, 0
+    ratio = weighted.window_weights[run == newest][0] / weighted.window_weights[run == oldest][0]
+    assert abs(ratio - 2 ** (len(bundle.run_ids) - 1)) < 1e-6
+    config = _config(tmp_path, split_path, task="virtual_sensor", name="rw", targets=["TempAct_C"],
+                     train={"batch_size": 64, "max_epochs": 2, "windows_per_epoch": 256, "val_windows": 128,
+                            "patience": 2, "recency_halflife_runs": 1},
+                     models=["template", {"name": "dlinear", "params": {"kernel": 5, "d_rep": 8}}],
+                     data={"split": str(split_path), "sample_seconds": 1.0, "region": "process", "inputs": "all"})
+    exp_dir = run_experiment(config, paths, devices=["cpu"])
+    results = pd.read_csv(exp_dir / "results.csv")
+    assert (results["status"] == "ok").all(), results.get("error")
+    doc = json.loads((exp_dir / results.loc[results["model"] == "dlinear", "job_dir"].iloc[0] / "job.json").read_text())
+    assert doc["job"]["model"] == "dlinear"
+    entries = Journal(paths.journal_dir).entries()
+    assert any(e.config and (e.config.get("train") or {}).get("recency_halflife_runs") == 1 for e in entries)

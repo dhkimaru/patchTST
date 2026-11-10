@@ -48,7 +48,8 @@ from .config import (
 from .evaluate import describe, improvement, regression_metrics
 from .prepare import POSITION_CAP_ROWS, Bundle, build_bundle, load_bundle, usable_columns
 from .trainer import TrainSettings, predict, train_model
-from .windows import Scaler, WindowSet, constant_columns, fit_scaler, offset_targets, residual_scale, window_ends
+from .windows import (Scaler, WindowSet, constant_columns, fit_scaler, offset_targets, residual_scale, window_ends,
+                      with_recency_weights)
 from .windows import near_copies as find_near_copies
 
 PREDICTION_SAMPLE_ROWS = 25_000
@@ -332,6 +333,8 @@ def run_job(
                 log(note)
             if residual == "template":
                 log("target: correction to the recipe template")
+            if settings.recency_halflife_runs > 0:
+                train_ws = with_recency_weights(train_ws, cache.train_bundle, settings.recency_halflife_runs)
             training = train_model(model, train_ws, val_ws, settings, seed=job.seed, log=log)
             fit_seconds = time.perf_counter() - started
             infer_start = time.perf_counter()

@@ -163,7 +163,7 @@ def conclusion_points(dec: dict[str, pd.DataFrame], trends: dict[str, list[dict[
 STUDY_NAMES = (  # study prefix → what the side study checks (요약 tab line)
     ("cv", "교차검증"), ("time", "시간순 검증"), ("single_sensor", "센서 하나 고장"), ("long_horizon", "예측 거리 확장"),
     ("lc", "학습 run 수"), ("recent", "최근 run 학습"), ("res_05s", "0.5초 간격"), ("region_", "구간 전용 학습"),
-    ("fc_", "미래값 구간 전용 학습"),
+    ("fc_", "미래값 구간 전용 학습"), ("rw", "최근 run 가중 학습"), ("early_recent", "초기 + 최근 run"),
 )
 
 

@@ -90,10 +90,10 @@ def pick_context(rows: pd.DataFrame, preferred: float = 192.0) -> pd.DataFrame:
 
 
 # 1) 구간 전용 모델 합치기
-def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, title: str) -> None:
+def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, title: str) -> list[dict]:
     rows_ = led[st.isin([s for s in (full, cycle, noncycle) if s])] if len(led) else led
     if not len(rows_):
-        return
+        return []
     recs = []
     for target, g in rows_.groupby("target"):
         fg, cg = g[g["study"] == full], g[g["study"] == cycle]
@@ -158,6 +158,30 @@ def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, ti
                 add(f"\n[{name}]")
                 add(frame[["대상", "모델", "기준선 MAE", *cols]].rename(columns=lambda c, n=name: c.replace(n + " ", ""))
                     .to_string(index=False))
+    return recs
+
+
+def region_hybrid_folds(folds: list[int]) -> None:
+    """Cross-validation folds: the region pair on other validation runs, then the gain per target across folds."""
+
+    by_fold = {}
+    for k in folds:
+        recs = region_hybrid(f"cv{k}", f"region_cycle_cv{k}", f"region_noncycle_cv{k}", "template",
+                             f"1-3. 가상 센서 · 구간 전용 모델 합치기 · 교차검증 {k}/5")
+        if recs:
+            by_fold[k] = recs
+    if len(by_fold) < 2:
+        return
+    rows = [{"fold": k, **r} for k, recs in by_fold.items() for r in recs]
+    frame = pd.DataFrame(rows)
+    cols = [c for c in ("전체 학습 개선율", "사이클 전용 + 전체 개선율", "사이클 전용 + 사이클 밖 전용 개선율") if c in frame]
+    summary = frame.groupby("대상")[cols].agg(["mean", "std", "count"]).round(1)
+    gain = frame.assign(차이=frame[cols[-1]] - frame[cols[0]]).groupby("대상")["차이"].agg(["mean", "std", "min"]).round(1)
+    add(f"\n## 1-4. 구간 전용 모델 합치기 · 교차검증 {len(by_fold)}묶음 요약 (개선율 %, 묶음 평균 · 표준편차 · 묶음 수)")
+    add(summary.to_string())
+    add("\n전체 학습 대비 늘어난 개선율 (%p, 묶음 평균 · 표준편차 · 가장 작은 묶음). "
+        "평균이 표준편차의 2배를 넘고 가장 작은 묶음도 0보다 크면 확실하다.")
+    add(gain.to_string())
 
 
 # 2) 모델 평균 (주 모델 + LightGBM)
@@ -248,6 +272,7 @@ def horizon_choice(study: str, context: float, title: str) -> None:
 
 region_hybrid("lc51", "region_cycle", "region_noncycle", "template",
               "1. 가상 센서 · 구간 전용 모델 합치기 (공정 전체 window에서 채점)")
+region_hybrid_folds([1, 2, 3, 4, 5])
 region_hybrid("fc_ref", "fc_region_cycle", None, "persistence",
               "1-2. 미래값 10~30초 · 사이클 전용 모델 합치기 (run 전체 window에서 채점)")
 model_average("lc51", "template", "2. 가상 센서 · PatchTST와 LightGBM 예측 평균 (학습 run 51개)")

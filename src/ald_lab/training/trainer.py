@@ -44,6 +44,9 @@ class TrainSettings:
     max_minutes: float | None = None
     compile: bool = False
     eval_batch_size: int = 2048
+    # Recent runs count more: a training window is drawn with weight 0.5 ** (age / half-life), age = how many training
+    # runs (in run order) are newer than its run. 0 = every window equally likely (the default).
+    recency_halflife_runs: float = 0.0
     # Channel-independent PatchTST runs batch × channels sequences; cap that product to fit memory.
     ci_sequence_budget: int = 8192
     # iTransformer attends across channels: batch × heads × channels² score elements per layer.
@@ -137,6 +140,12 @@ def train_model(
     generator.manual_seed(seed)
     val_idx = evenly_spaced(len(val), settings.val_windows)
     per_epoch = min(settings.windows_per_epoch, len(train))
+    weights = getattr(train, "window_weights", None)
+    draw = torch.as_tensor(weights, dtype=torch.float32, device=device) if weights is not None else None
+    if draw is not None:
+        per_epoch = settings.windows_per_epoch
+        log(f"recent runs weighted: half-life {settings.recency_halflife_runs:g} runs, "
+            f"oldest run weight {float(draw.min() / draw.max()):.3f}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -149,7 +158,10 @@ def train_model(
     for epoch in range(1, settings.max_epochs + 1):
         runner.train()
         epoch_start = time.perf_counter()
-        order = torch.randperm(len(train), device=device, generator=generator)[:per_epoch]
+        if draw is not None:  # weighted draw with replacement (windows of recent runs come up more often)
+            order = torch.multinomial(draw, per_epoch, replacement=True, generator=generator)
+        else:
+            order = torch.randperm(len(train), device=device, generator=generator)[:per_epoch]
         loss_sum = torch.zeros((), device=device)
         batches = 0
         for start in range(0, per_epoch, settings.batch_size):

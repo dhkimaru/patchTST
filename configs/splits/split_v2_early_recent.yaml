@@ -1,0 +1,64 @@
+# 초기 run + 최근 run (split_v2 기반): 001~011(11개)과 033~052(19개)로 학습하고 053~067로 검증한다 (30개).
+# 같은 30개인 최근 30개(split_v2_recent4_30, 022~052)와 비교해 초기 run(001~011)이 빠질 때 생기는 차이를 본다.
+split_id: split_v2_early_recent
+strategy: early_plus_recent
+parent: split_v2
+fold: 4
+excluded:
+  - run_id: standard_trace_071
+    reason: BACKWARD_TIMESTAMP_JUMP
+train:
+  - standard_trace_001
+  - standard_trace_002
+  - standard_trace_003
+  - standard_trace_004
+  - standard_trace_005
+  - standard_trace_006
+  - standard_trace_007
+  - standard_trace_008
+  - standard_trace_009
+  - standard_trace_010
+  - standard_trace_011
+  - standard_trace_033
+  - standard_trace_034
+  - standard_trace_035
+  - standard_trace_036
+  - standard_trace_037
+  - standard_trace_038
+  - standard_trace_039
+  - standard_trace_040
+  - standard_trace_042
+  - standard_trace_043
+  - standard_trace_044
+  - standard_trace_045
+  - standard_trace_046
+  - standard_trace_047
+  - standard_trace_048
+  - standard_trace_049
+  - standard_trace_050
+  - standard_trace_051
+  - standard_trace_052
+validation:
+  - standard_trace_053
+  - standard_trace_054
+  - standard_trace_055
+  - standard_trace_057
+  - standard_trace_058
+  - standard_trace_062
+  - standard_trace_063
+  - standard_trace_064
+  - standard_trace_065
+  - standard_trace_066
+  - standard_trace_067
+test:
+  - standard_trace_068
+  - standard_trace_069
+  - standard_trace_070
+  - standard_trace_072
+  - standard_trace_073
+  - standard_trace_074
+  - standard_trace_075
+  - standard_trace_077
+  - standard_trace_078
+  - standard_trace_079
+  - standard_trace_080

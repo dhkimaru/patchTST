@@ -72,3 +72,15 @@ def test_recent_window_lengths_and_second_draw():
         assert len(split.train) == k and previous <= set(split.train) and split.validation == base.validation
         assert set(split.train) != set(load_split(folder / f"split_v2_lc{k}.yaml").train)
         previous = set(split.train)
+
+
+def test_early_plus_recent_split():
+    from pathlib import Path
+
+    from ald_lab.data.splits import DEFAULT_SPLIT
+
+    base = load_split()
+    split = load_split(Path(DEFAULT_SPLIT).parent / "split_v2_early_recent.yaml")
+    numbers = sorted(r[-3:] for r in split.train)
+    assert len(split.train) == 30 and set(split.train) <= set(base.train) and split.validation == base.validation
+    assert numbers[:11] == [f"{i:03d}" for i in range(1, 12)] and min(n for n in numbers if n > "011") == "033"
