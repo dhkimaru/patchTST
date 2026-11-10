@@ -32,7 +32,8 @@ from .windows import REGIONS
 
 TASKS = ("forecast", "virtual_sensor", "thickness")
 BASELINES = {"forecast": "persistence", "virtual_sensor": "template", "thickness": "mean"}
-BASELINE_LABELS = {"persistence": "현재값 유지", "template": "레시피 평균", "mean": "학습 평균"}
+BASELINE_LABELS = {"persistence": "현재값 유지", "template": "레시피 평균", "schedule": "레시피 일정 평균",
+                   "mean": "학습 평균"}
 VM_MODELS = ("mean", "ridge", "pls", "lightgbm")
 # The previous project's 38-signal schema (F_PRIMARY without Step ID), kept for comparison.
 LEGACY_PRIMARY = (

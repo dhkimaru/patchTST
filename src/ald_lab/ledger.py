@@ -128,7 +128,7 @@ def best_by_target(frame: pd.DataFrame) -> pd.DataFrame:
 
     frame = main_records(frame)
     ok = frame[(frame.get("job_status", "ok") == "ok") & frame["mae"].notna()]
-    ok = ok[~ok["model"].isin(("persistence", "template", "mean"))]
+    ok = ok[~ok["model"].isin(("persistence", "template", "schedule", "mean"))]
     if not len(ok):
         return ok
     idx = ok.groupby(["task", "target"])["mae"].idxmin()
@@ -140,7 +140,7 @@ def best_over_time(frame: pd.DataFrame, task: str, target: str) -> pd.DataFrame:
 
     frame = main_records(frame)
     ok = frame[(frame["task"] == task) & (frame["target"] == target) & frame["mae"].notna()
-               & ~frame["model"].isin(("persistence", "template", "mean"))]
+               & ~frame["model"].isin(("persistence", "template", "schedule", "mean"))]
     if not len(ok):
         return ok
     per_run = ok.loc[ok.groupby("exp_dir")["mae"].idxmin()].sort_values("when")

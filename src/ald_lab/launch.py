@@ -269,7 +269,7 @@ def build_config(base: dict[str, Any], *, targets: list[str], models: dict[str, 
     # A forecasting base that lists the recipe-mean baseline (e.g. longer horizons, where "keep the current value"
     # is no longer a fair yardstick) keeps it next to the chosen models.
     kept = [m for m in doc.get("models") or [] if task == "forecast"
-            and (m if isinstance(m, str) else m.get("name")) == "template"]
+            and (m if isinstance(m, str) else m.get("name")) in ("template", "schedule")]
     doc["models"] = kept + entries
     return doc
 

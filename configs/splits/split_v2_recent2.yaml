@@ -1,0 +1,55 @@
+# 최근 run만으로 학습 2 (split_v2 기반): 검증 구간 바로 앞 run 20개(012~031)만으로 학습하고 032~043로 검증한다.
+# 같은 검증 구간의 누적 학습 결과(split_v2_time2)와 비교해, 오래된 run이 도움이 되는지 본다.
+# 시험 run과 제외 run은 split_v2와 같다 (시험 run은 쓰지 않음).
+split_id: split_v2_recent2
+strategy: recent_sliding_window
+parent: split_v2
+fold: 2
+excluded:
+  - run_id: standard_trace_071
+    reason: BACKWARD_TIMESTAMP_JUMP
+train:
+  - standard_trace_012
+  - standard_trace_013
+  - standard_trace_014
+  - standard_trace_015
+  - standard_trace_016
+  - standard_trace_017
+  - standard_trace_018
+  - standard_trace_019
+  - standard_trace_020
+  - standard_trace_021
+  - standard_trace_022
+  - standard_trace_023
+  - standard_trace_024
+  - standard_trace_025
+  - standard_trace_026
+  - standard_trace_027
+  - standard_trace_028
+  - standard_trace_029
+  - standard_trace_030
+  - standard_trace_031
+validation:
+  - standard_trace_032
+  - standard_trace_033
+  - standard_trace_034
+  - standard_trace_035
+  - standard_trace_036
+  - standard_trace_037
+  - standard_trace_038
+  - standard_trace_039
+  - standard_trace_040
+  - standard_trace_042
+  - standard_trace_043
+test:
+  - standard_trace_068
+  - standard_trace_069
+  - standard_trace_070
+  - standard_trace_072
+  - standard_trace_073
+  - standard_trace_074
+  - standard_trace_075
+  - standard_trace_077
+  - standard_trace_078
+  - standard_trace_079
+  - standard_trace_080

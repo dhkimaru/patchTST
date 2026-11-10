@@ -1,0 +1,66 @@
+# 학습 run 수 곡선 (split_v2 기반): split_v2 학습 run 51개 중 무작위 31개로 학습하고, 검증 run은 split_v2와 같다 (053~067).
+# run은 seed 20261109로 섞은 순서의 앞쪽에서 뽑아 10 ⊂ 20 ⊂ 31 ⊂ 42 ⊂ 51로 겹친다 (작은 묶음이 큰 묶음에 들어 있음).
+# 시간순 검증과 달리 검증 run이 고정이라, 개선율 차이는 학습 run 수만의 효과다. 시험 run과 제외 run은 split_v2와 같다.
+split_id: split_v2_lc31
+strategy: learning_curve_nested_random
+parent: split_v2
+fold: 31
+excluded:
+  - run_id: standard_trace_071
+    reason: BACKWARD_TIMESTAMP_JUMP
+train:
+  - standard_trace_001
+  - standard_trace_002
+  - standard_trace_003
+  - standard_trace_004
+  - standard_trace_006
+  - standard_trace_007
+  - standard_trace_009
+  - standard_trace_010
+  - standard_trace_011
+  - standard_trace_013
+  - standard_trace_014
+  - standard_trace_016
+  - standard_trace_017
+  - standard_trace_019
+  - standard_trace_020
+  - standard_trace_023
+  - standard_trace_024
+  - standard_trace_025
+  - standard_trace_027
+  - standard_trace_028
+  - standard_trace_032
+  - standard_trace_033
+  - standard_trace_035
+  - standard_trace_036
+  - standard_trace_037
+  - standard_trace_038
+  - standard_trace_043
+  - standard_trace_044
+  - standard_trace_046
+  - standard_trace_051
+  - standard_trace_052
+validation:
+  - standard_trace_053
+  - standard_trace_054
+  - standard_trace_055
+  - standard_trace_057
+  - standard_trace_058
+  - standard_trace_062
+  - standard_trace_063
+  - standard_trace_064
+  - standard_trace_065
+  - standard_trace_066
+  - standard_trace_067
+test:
+  - standard_trace_068
+  - standard_trace_069
+  - standard_trace_070
+  - standard_trace_072
+  - standard_trace_073
+  - standard_trace_074
+  - standard_trace_075
+  - standard_trace_077
+  - standard_trace_078
+  - standard_trace_079
+  - standard_trace_080

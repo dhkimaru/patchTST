@@ -99,7 +99,7 @@ NAV_ICONS = {
     "chev": "M7 10l5 5 5-5",
     "menu": "M4 7h16M4 12h16M4 17h16",
 }
-BASELINE_NAMES = {"persistence": "현재값 유지", "template": "레시피 평균", "mean": "학습 평균"}
+BASELINE_NAMES = {"persistence": "현재값 유지", "template": "레시피 평균", "schedule": "레시피 일정 평균", "mean": "학습 평균"}
 REASONS = {"BACKWARD_TIMESTAMP_JUMP": "시간 역행, 중복 블록 의심"}
 TARGET_NAMES = {"thk_mean": "두께 평균", "uf_pct_mean": "웨이퍼 내 균일도 (U/F)", "wtow_pct": "웨이퍼 간 균일도 (WtoW)",
                 "thk_center": "중심 두께", "thk_edge": "가장자리 두께", "edge_vs_center_pct": "가장자리/중심 차이"}
@@ -179,7 +179,7 @@ def target_name(target: str, unit: str = "") -> str:
 
 LABEL_BASE = {"patchtst": "PatchTST", "patchtst_mix": "PatchTST 혼합", "lightgbm": "LightGBM", "ridge": "Ridge",
               "dlinear": "DLinear", "itransformer": "iTransformer", "gru": "GRU", "pls": "PLS", "persistence": "현재값 유지",
-              "template": "레시피 평균", "mean": "학습 평균"}
+              "template": "레시피 평균", "schedule": "레시피 일정 평균", "mean": "학습 평균"}
 LABEL_KEYS = {"d_model": "d_model {}", "patch_seconds": "patch {}초", "stride_seconds": "간격 {}초", "n_heads": "head {}",
               "n_layers": "층 {}", "d_ff": "FFN {}", "dropout": "dropout {}", "revin_center": "RevIN {}", "revin": "RevIN {}",
               "train.lr": "lr {}", "channel_mode": "{}", "num_leaves": "잎 {}", "learning_rate": "학습률 {}",
@@ -287,6 +287,9 @@ def _summary(data: ReportData) -> str:
     if data.notes:
         out.append('<h3>오늘 메모</h3><ul>' + "".join(f"<li>{e(n)}</li>" for n in data.notes) + "</ul>")
     points = overview.conclusion_points(dec, trends, thickness)
+    side = overview.side_study_note(ledger)
+    if side:
+        points.append(side)
     if points:
         out.append('<h3>현재 결론</h3><div class="concl"><ul>' + "".join(f"<li>{p}</li>" for p in points)
                    + "</ul></div>")
@@ -300,7 +303,8 @@ def _summary(data: ReportData) -> str:
     if trend:
         out.append("<h3>PatchTST 최고 기록 추이 (일별)</h3>"
                    '<p class="note">날짜별로 그날까지의 PatchTST 최고 기록(같은 설정의 seed 평균)을 대상 평균으로 나타냈습니다. '
-                   "낮을수록 좋습니다.</p>" + trend)
+                   "낮을수록 좋습니다. 기록은 기본 실험으로만 갱신하고, 다른 분할 · 구간 · 예측 거리로 돈 부가 실험만 한 날은 "
+                   "빈 점과 점선으로 이어 기록이 그대로임을 표시합니다(점에 마우스를 올리면 그날 부가 실험 수).</p>" + trend)
     status = _patchtst_status(data)
     if status:
         out.append("<details><summary>PatchTST 현황 - 대상별 성능 및 채택 여부 (실험 완료 시 갱신)</summary>"
@@ -742,7 +746,8 @@ def _experiment_inputs(data: ReportData) -> str:
         data_cfg = exp.config.get("data") or {}
         rows = [
             ("샘플 간격 · 영역", f"{data_cfg.get('sample_seconds', 1.0)}초 · "
-                              + {"all": "run 전체", "process": "공정 구간(START~END)", "cycle": "ALD 사이클만"}.get(
+                              + {"all": "run 전체", "process": "공정 구간(START~END)", "cycle": "ALD 사이클만",
+                                 "noncycle": "공정 중 사이클 밖만"}.get(
                                   str(data_cfg.get("region", "all")), e(data_cfg.get("region")))),
         ]
         if exp.task != "thickness":
@@ -850,7 +855,7 @@ def _outputs(data: ReportData) -> str:
 
 
 MODEL_GROUPS = (  # (category, one line, models in display order, colour)
-    ("기준선", "학습 없음 · 성능 비교의 기준", ("persistence", "template", "mean"), "var(--muted)"),
+    ("기준선", "학습 없음 · 성능 비교의 기준", ("persistence", "template", "schedule", "mean"), "var(--muted)"),
     ("고전 ML", "window를 요약 특징으로 바꿔 학습 · CPU 수 분", ("ridge", "pls", "lightgbm"), "var(--s2)"),
     ("딥러닝", "시계열을 직접 입력하는 신경망 · GPU", ("dlinear", "gru", "patchtst", "itransformer"), "var(--s3)"),
 )
@@ -864,6 +869,8 @@ DEEP_TRAITS = {  # what a token is, how signals meet, how time is read
 BASELINE_ROWS = {  # how it predicts, the task, what beating it means
     "persistence": ("직전 값이 유지된다고 가정", "예측", "값이 변하는 시점을 예측함"),
     "template": ("같은 레시피 step·위치의 학습 run 평균", "가상 센서", "레시피 외 장비 상태를 반영함"),
+    "schedule": ("레시피 평균을 계획된 step 일정으로 읽음 (미래 step 시각은 학습 run의 보통 길이로 추정)", "장기 예측",
+                 "실제 미래 step 시각 없이 레시피 일정보다 나음"),
     "mean": ("학습 run 값의 평균", "두께", "run 간 차이를 설명함"),
 }
 TASK_LEARNING = (  # task, output, baseline, classic, deep, evaluation
@@ -2120,7 +2127,7 @@ def _weights(data: ReportData) -> str:
 # Fixed categorical order for models in the GPU timeline; baselines are grey. Named in a text legend.
 TIMELINE_COLORS = {"ridge": "var(--s1)", "lightgbm": "var(--s2)", "patchtst": "var(--s3)", "dlinear": "var(--s4)",
                    "itransformer": "var(--s5)", "gru": "var(--s6)", "pls": "var(--s7)"}
-BASELINE_MODELS = {"persistence", "template", "mean"}
+BASELINE_MODELS = {"persistence", "template", "schedule", "mean"}
 
 
 def _speed_reference(data: ReportData) -> dict[str, Any]:
@@ -2861,6 +2868,7 @@ code{{font-family:ui-monospace,Consolas,monospace;font-size:12px;background:var(
 details{{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:6px 12px;margin:8px 0}}
 .concl{{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--s1);border-radius:10px;padding:8px 16px 8px 4px}} .concl li{{margin:5px 0}}
 svg .ov-pt{{fill:var(--s1)}} svg .ov-lgb{{fill:var(--s2)}} svg .ov-ptl{{fill:none;stroke:var(--s1);stroke-width:2.2}}
+svg .ov-pt.ov-side{{fill:var(--surface);stroke:var(--s1);stroke-width:2}} svg .ov-sidel{{stroke-dasharray:5 4;opacity:.7}}
 svg .ov-lgbl{{stroke:var(--s2);stroke-width:1.6;stroke-dasharray:5 4}} svg .ov-ref{{stroke:var(--text2);stroke-width:1.2}}
 svg .ov-gh{{fill:var(--text);font-weight:700;font-size:13px}} svg .ov-val{{fill:var(--text);font-weight:600}}
 svg .ov-good{{fill:var(--good);font-weight:600}} svg .ov-bad{{fill:var(--critical);font-weight:600}} svg .ov-muted{{fill:var(--muted)}}

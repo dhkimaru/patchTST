@@ -13,6 +13,7 @@ import numpy as np
 from .prepare import Bundle
 
 TRANSITION_SECONDS = 10.0
+SHORT_TRANSITION_SECONDS = 3.0  # right after a step change (valve and MFC edges)
 
 
 def _mae(err: np.ndarray, mask: np.ndarray | None = None) -> float | None:
@@ -43,6 +44,13 @@ def regression_metrics(
     for r in np.unique(run_of):
         by_run[bundle.run_ids[int(r)]] = float(err[run_of == r].mean())
     labels = [f"{h:g}s" for h in horizons_seconds]
+    e = err.mean(axis=2)  # (n, H): one value per window and horizon
+    cyc = np.asarray(bundle.in_cycle)[rows].astype(bool)
+    pos_s = np.asarray(bundle.step_pos)[rows] * bundle.sample_seconds
+    by_horizon_region = {label: {"cycle": _mae(e[:, i], cyc[:, i]), "other": _mae(e[:, i], ~cyc[:, i])}
+                         for i, label in enumerate(labels)}
+    first = pos_s < SHORT_TRANSITION_SECONDS
+    by_transition = {f"first_{SHORT_TRANSITION_SECONDS:g}s": _mae(e, first), "later": _mae(e, ~first)}
     return {
         "mae": float(err.mean()),
         "rmse": float(np.sqrt(sq.mean())),
@@ -52,9 +60,31 @@ def regression_metrics(
         "by_region": {"cycle": _mae(err, in_cycle), "other": _mae(err, ~in_cycle)},
         "by_phase": {"transition": _mae(err, transition), "stable": _mae(err, ~transition)},
         "by_run": by_run,
+        "by_horizon_region": by_horizon_region,
+        "by_transition": by_transition,
+        "by_step": _by_step(e, rows, bundle),
         "n_windows": int(err.shape[0]),
         "transition_seconds": transition_seconds,
     }
+
+
+def _by_step(e: np.ndarray, rows: np.ndarray, bundle: Bundle) -> dict[str, list[float]]:
+    """MAE and window count per recipe step name (``[mae, n]``); empty when the bundle has no step names."""
+
+    names = (bundle.stats or {}).get("step_names") or {}
+    if not names:
+        return {}
+    keys = np.asarray(bundle.step_key)[rows]
+    uniq, inv = np.unique(keys, return_inverse=True)
+    sums = np.bincount(inv.ravel(), weights=e.ravel(), minlength=len(uniq))
+    counts = np.bincount(inv.ravel(), minlength=len(uniq))
+    total: dict[str, list[float]] = {}
+    for k, s_, c in zip(uniq, sums, counts, strict=True):
+        name = str(names.get(str(int(k)), "?"))
+        acc = total.setdefault(name, [0.0, 0])
+        acc[0] += float(s_)
+        acc[1] += int(c)
+    return {name: [v[0] / v[1], v[1]] for name, v in sorted(total.items(), key=lambda kv: -kv[1][1]) if v[1]}
 
 
 def improvement(mae: float | None, baseline_mae: float | None) -> float | None:

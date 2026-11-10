@@ -3,7 +3,12 @@
 - ``persistence``: the target's last observed value (forecast only).
 - ``template``: the recipe template — mean target per (recipe step, position
   in step) over train runs. It knows the recipe, not the equipment state,
-  so beating it means a model uses real process information.
+  so beating it means a model uses real process information. For a forecast it
+  reads the step that is actually running at the target time, i.e. it knows the
+  future step timing.
+- ``schedule``: the same template, but the step at the target time is projected
+  from the current step with the typical step durations and step order of the
+  train runs (a recipe plan known in advance), so it does not see future timing.
 - ``ridge`` and ``lightgbm``: regressors on window summary features
   (last, mean, std, min, max, recent change of every input channel). By
   default they learn the *correction* to the task baseline (the change from
@@ -29,7 +34,7 @@ from ..training.windows import WindowSet, evenly_spaced
 from . import defaults
 
 FEATURES_PER_CHANNEL = ("last", "mean", "std", "min", "max", "delta")
-CLASSIC_MODELS = ("persistence", "template", "ridge", "lightgbm")
+CLASSIC_MODELS = ("persistence", "template", "schedule", "ridge", "lightgbm")
 
 
 def window_features(x: torch.Tensor) -> torch.Tensor:
@@ -74,8 +79,13 @@ class RecipeTemplate:
         return self
 
     def values(self, bundle: Bundle) -> np.ndarray:
+        return self.lookup(np.asarray(bundle.step_key), np.asarray(bundle.step_pos))
+
+    def lookup(self, key: np.ndarray, pos: np.ndarray) -> np.ndarray:
+        """Template values ``(n, T)`` at any (step key, position) pairs, with the same fallbacks."""
+
         assert self.table is not None and self.step_mean is not None and self.overall is not None
-        keys = pd.DataFrame({"key": np.asarray(bundle.step_key), "pos": np.asarray(bundle.step_pos)})
+        keys = pd.DataFrame({"key": np.asarray(key, dtype=np.int64), "pos": np.asarray(pos).astype(np.int32)})
         exact = keys.join(self.table, on=["key", "pos"])
         cols = list(self.table.columns)
         out = exact[cols].to_numpy(np.float64)
@@ -144,6 +154,118 @@ class Template(ClassicModel):
         if template is None:
             raise ValueError("template values were not attached to this window set")
         return template[ws.target_rows(idx)]
+
+
+class StepSchedule:
+    """Typical duration and next step of every recipe step key, from the train runs.
+
+    ``future`` projects (step key, position) forward by a number of samples: the current step lasts its typical
+    duration, then the most frequent next step follows with its typical duration, and so on. A step that has
+    already run longer than typical ends now; a step never seen ending lasts forever.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = int(cap)  # step_pos is capped at this many samples in the bundles
+        self.duration: dict[int, int] = {}
+        self.next: dict[int, int] = {}
+        self.info: dict[str, Any] = {}
+
+    def fit(self, bundle: Bundle) -> StepSchedule:
+        key = np.asarray(bundle.step_key, dtype=np.int64)
+        seg = np.asarray(bundle.seg_id)
+        change = np.r_[True, (key[1:] != key[:-1]) | (seg[1:] != seg[:-1])]
+        starts = np.flatnonzero(change)
+        lengths = np.diff(np.r_[starts, len(key)])
+        rows = []
+        for i in range(len(starts) - 1):
+            a, b = starts[i], starts[i + 1]
+            if seg[a] != seg[b] or i == 0 or seg[starts[i - 1]] != seg[a]:
+                continue  # first or last step of a segment: its true length or successor is unknown
+            rows.append((int(key[a]), int(lengths[i]), int(key[b])))
+        frame = pd.DataFrame(rows, columns=["key", "length", "next"])
+        if len(frame):
+            self.duration = {int(k): int(round(v)) for k, v in frame.groupby("key")["length"].median().items()}
+            self.next = {int(k): int(g["next"].mode().iloc[0]) for k, g in frame.groupby("key")}
+            spread = frame.groupby("key")["length"].agg(lambda v: float(np.percentile(v, 90) - np.percentile(v, 10)))
+            weight = frame.groupby("key")["length"].sum()
+            fixed = spread[spread <= 1].index
+            self.info = {"steps": len(self.duration), "fixed_duration_steps": int(len(fixed)),
+                         "fixed_duration_share": round(float(weight[fixed].sum() / weight.sum()), 4)}
+        return self
+
+    def future(self, key: np.ndarray, pos: np.ndarray, ahead: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(key, pos) ``(n, H)`` after ``ahead`` ``(H,)`` samples from each (key, pos) ``(n,)``."""
+
+        key = np.asarray(key, dtype=np.int64)
+        pos = np.asarray(pos, dtype=np.int64)
+        ahead = np.asarray(ahead, dtype=np.int64)
+        span = int(ahead.max()) + 1 if len(ahead) else 1
+        known = sorted(k for k in self.duration if k in self.next)
+        index = {k: i for i, k in enumerate(known)}
+        # after_key[i, t], after_pos[i, t]: where the plan is t samples after step known[i] ends
+        after_key = np.empty((len(known), span), dtype=np.int64)
+        after_pos = np.empty((len(known), span), dtype=np.int64)
+        for i, k in enumerate(known):
+            t, cur = 0, self.next.get(k)
+            while t < span:
+                if cur is None:
+                    break
+                d = self.duration.get(cur)
+                n = span - t if d is None or cur not in self.next else min(max(d, 1), span - t)
+                after_key[i, t:t + n] = cur
+                after_pos[i, t:t + n] = np.arange(n)
+                t += n
+                cur = self.next.get(cur) if d is not None else None
+            if t < span:  # chain ended on a step never seen ending: it lasts
+                last = after_key[i, t - 1] if t else k
+                base = after_pos[i, t - 1] + 1 if t else 0
+                after_key[i, t:] = last
+                after_pos[i, t:] = base + np.arange(span - t)
+        row = pd.Series(key).map(index).to_numpy()
+        has = ~pd.isna(row)
+        d = np.full(len(key), -1, dtype=np.int64)
+        d[has] = np.asarray([self.duration[k] for k in key[has]], dtype=np.int64)
+        remaining = np.maximum(d - pos, 0)[:, None]
+        h = ahead[None, :]
+        stay = (~has)[:, None] | (h < remaining)
+        out_key = np.broadcast_to(key[:, None], stay.shape).copy()
+        out_pos = (pos[:, None] + h).copy()
+        moved = ~stay
+        if moved.any():
+            r = np.broadcast_to(np.where(has, row, 0).astype(np.int64)[:, None], stay.shape)[moved]
+            t = (h - remaining)[moved]
+            out_key[moved] = after_key[r, t]
+            out_pos[moved] = after_pos[r, t]
+        return out_key, np.minimum(out_pos, self.cap)
+
+    def save(self, directory: Path) -> None:
+        (directory / "schedule.json").write_text(json.dumps(
+            {"cap": self.cap, "duration": {str(k): v for k, v in self.duration.items()},
+             "next": {str(k): v for k, v in self.next.items()}, "info": self.info}))
+
+    @classmethod
+    def load(cls, directory: Path) -> StepSchedule:
+        doc = json.loads((directory / "schedule.json").read_text())
+        out = cls(doc["cap"])
+        out.duration = {int(k): int(v) for k, v in doc["duration"].items()}
+        out.next = {int(k): int(v) for k, v in doc["next"].items()}
+        out.info = doc.get("info", {})
+        return out
+
+
+class Schedule(ClassicModel):
+    """Recipe template at the step the recipe plan puts at the target time (no future timing from the trace)."""
+
+    name = "schedule"
+
+    def predict(self, ws: WindowSet, idx: np.ndarray, ctx: dict[str, Any]) -> np.ndarray:
+        recipe, plan = getattr(ws, "recipe", None), getattr(ws, "schedule", None)
+        if recipe is None or plan is None:
+            raise ValueError("the recipe template and step schedule were not attached to this window set")
+        ends = ws.ends_np[idx]
+        keys, pos = plan.future(np.asarray(ws.step_key)[ends], np.asarray(ws.step_pos)[ends], np.asarray(ws.horizons))
+        values = recipe.lookup(keys.reshape(-1), pos.reshape(-1))
+        return values.reshape(len(idx), len(ws.horizons), -1).astype(np.float32)
 
 
 def residual_mode(params: dict[str, Any], ws: WindowSet, ctx: dict[str, Any]) -> str:
@@ -304,6 +426,7 @@ class LightGBM(ClassicModel):
 CLASSIC_REGISTRY: dict[str, type[ClassicModel]] = {
     "persistence": Persistence,
     "template": Template,
+    "schedule": Schedule,
     "ridge": Ridge,
     "lightgbm": LightGBM,
 }

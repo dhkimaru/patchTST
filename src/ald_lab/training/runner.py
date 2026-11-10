@@ -32,7 +32,7 @@ import torch
 from ..data.columns import load_column_dictionary
 from ..data.splits import RunSplit, load_split
 from ..journal import Journal
-from ..models.classic import CLASSIC_REGISTRY, RecipeTemplate
+from ..models.classic import CLASSIC_REGISTRY, RecipeTemplate, StepSchedule
 from ..models.deep import build_deep_model, count_parameters, resolve_params
 from ..paths import LabPaths
 from .config import (
@@ -46,12 +46,13 @@ from .config import (
     resolve_inputs,
 )
 from .evaluate import describe, improvement, regression_metrics
-from .prepare import Bundle, build_bundle, load_bundle, usable_columns
+from .prepare import POSITION_CAP_ROWS, Bundle, build_bundle, load_bundle, usable_columns
 from .trainer import TrainSettings, predict, train_model
 from .windows import Scaler, WindowSet, constant_columns, fit_scaler, offset_targets, residual_scale, window_ends
 from .windows import near_copies as find_near_copies
 
 PREDICTION_SAMPLE_ROWS = 25_000
+SAVE_VALIDATION_PREDICTIONS = os.environ.get("ALD_SAVE_VAL_PREDICTIONS", "1") != "0"  # predictions_val.parquet per job
 # Window sets kept per process; jobs are ordered by target so neighbours share them.
 TARGET_CACHE = 2
 
@@ -161,6 +162,17 @@ class TargetData:
             self.val.template = self.template.values(val_bundle)
         return self.template
 
+    def attach_schedule(self, train_bundle: Bundle, val_bundle: Bundle) -> StepSchedule:
+        """Recipe template + step plan for the ``schedule`` baseline (future step timing from the plan only)."""
+
+        self.attach_template(train_bundle, val_bundle)
+        cap = POSITION_CAP_ROWS // max(1, round(train_bundle.sample_seconds / 0.5))
+        plan = StepSchedule(cap).fit(train_bundle)
+        for ws, bundle in ((self.train, train_bundle), (self.val, val_bundle)):
+            ws.recipe, ws.schedule = self.template, plan
+            ws.step_key, ws.step_pos = np.asarray(bundle.step_key), np.asarray(bundle.step_pos)
+        return plan
+
 
 class DataCache:
     """Bundles plus the most recent per-target window sets of one process."""
@@ -221,6 +233,29 @@ def _prediction_sample(bundle: Bundle, ws: WindowSet, idx: np.ndarray, y_true: n
     for i, h in enumerate(horizons):
         frame[f"true_{h:g}s"] = y_true[keep, i, 0]
         frame[f"pred_{h:g}s"] = y_pred[keep, i, 0]
+    return frame
+
+
+def _validation_predictions(bundle: Bundle, ws: WindowSet, idx: np.ndarray, y_true: np.ndarray,
+                            y_pred: np.ndarray, horizons: list[float]) -> pd.DataFrame:
+    """Every validation window, kept for later studies that combine models without retraining.
+
+    Windows are keyed by run and the row (within that run, at the job's ``sample_seconds``) that ends the
+    context, so jobs with other context lengths can be matched on the windows they share.
+    """
+
+    ends = ws.ends_np[idx]
+    run_index = np.asarray(bundle.run_index)
+    run = run_index[ends]
+    first = np.searchsorted(run_index, np.arange(len(bundle.run_ids)))
+    frame = pd.DataFrame({
+        "run_id": pd.Categorical.from_codes(run.astype(np.int32), categories=list(bundle.run_ids)),
+        "row": (ends - first[run]).astype(np.int32),
+        "in_cycle": np.asarray(bundle.in_cycle)[ends],
+    })
+    for i, h in enumerate(horizons):
+        frame[f"true_{h:g}s"] = y_true[:, i, 0].astype(np.float32)
+        frame[f"pred_{h:g}s"] = y_pred[:, i, 0].astype(np.float32)
     return frame
 
 
@@ -311,13 +346,19 @@ def run_job(
             ctx = {"seed": job.seed, "n_jobs": n_jobs, "target_channels": data.target_channels}
             if job.model == "template" or cfg.task == "virtual_sensor" or job.params.get("residual") == "template":
                 data.attach_template(cache.train_bundle, cache.val_bundle)
+            plan = data.attach_schedule(cache.train_bundle, cache.val_bundle) if job.model == "schedule" else None
             training = model.fit(data.train, data.val, ctx) or {}
+            if plan is not None:
+                model.info.update(plan.info)
+                training = {**training, **plan.info}
             fit_seconds = time.perf_counter() - started
             infer_start = time.perf_counter()
             pred = model.predict(data.val, val_idx, ctx)
             model.save(job_dir)
-            if job.model == "template" or getattr(model, "residual", None) == "template":
+            if job.model in ("template", "schedule") or getattr(model, "residual", None) == "template":
                 data.template.save(job_dir)
+            if plan is not None:
+                plan.save(job_dir)
         infer_seconds = time.perf_counter() - infer_start
         rows = data.val.target_rows(val_idx)
         t = data.scaler.columns.index(job.target)
@@ -356,6 +397,9 @@ def run_job(
              "weaknesses": weaknesses}, ensure_ascii=False, indent=1, default=str))
         _prediction_sample(cache.val_bundle, data.val, val_idx, y_true, y_pred, cfg.horizon_labels).to_parquet(
             job_dir / "predictions_sample.parquet", index=False)
+        if SAVE_VALIDATION_PREDICTIONS:
+            _validation_predictions(cache.val_bundle, data.val, val_idx, y_true, y_pred, cfg.horizon_labels).to_parquet(
+                job_dir / "predictions_val.parquet", index=False)
 
         speed = ""
         if training.get("windows_per_second"):
@@ -685,6 +729,9 @@ def predict_job(job_dir: Path, doc: dict[str, Any], model: Any, ws: WindowSet, b
     ws.template = None
     if doc["job"]["model"] == "template" or getattr(model, "residual", None) == "template":
         ws.template = RecipeTemplate.load(job_dir).values(bundle)
+    if doc["job"]["model"] == "schedule":
+        ws.recipe, ws.schedule = RecipeTemplate.load(job_dir), StepSchedule.load(job_dir)
+        ws.step_key, ws.step_pos = np.asarray(bundle.step_key), np.asarray(bundle.step_pos)
     channels = [doc["inputs"].index(target)] if target in doc["inputs"] else None
     return model.predict(ws, idx, {"target_channels": channels})
 

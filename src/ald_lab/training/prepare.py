@@ -36,7 +36,7 @@ from ..data.raw import list_trace_files, load_trace, run_id_from_path, signal_co
 from ..data.splits import RunSplit
 from ..paths import LabPaths
 
-BUNDLE_VERSION = "b1"
+BUNDLE_VERSION = "b2"  # b2: step names per step key (per-step error breakdown)
 # Template positions are shared past this many 0.5 s rows (20 min), as in the variability analysis.
 POSITION_CAP_ROWS = 2400
 ARRAYS = ("values", "run_index", "seg_id", "seg_bounds", "in_cycle", "in_process", "step_key", "step_pos")
@@ -103,6 +103,8 @@ def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int) -> dict[str
     edges = np.concatenate([[0], breaks, [len(frame)]])
 
     key = _step_key(frame["recipe"], frame["step_id"])
+    step_names = {str(int(k)): str(n) for k, n in
+                  pd.Series(frame["step_name"].to_numpy(), index=key).groupby(level=0).first().items()}
     step_change = np.r_[True, key[1:] != key[:-1]]
     group = np.cumsum(step_change)
     pos = pd.Series(np.zeros(len(frame))).groupby(group).cumcount().to_numpy()
@@ -136,6 +138,7 @@ def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int) -> dict[str
         raise PrepareError("run has no usable rows")
     out: dict[str, np.ndarray | int] = {k: np.concatenate(v) for k, v in pieces.items()}
     out["segment_lengths"] = np.asarray(lengths, dtype=np.int64)
+    out["step_names"] = step_names  # type: ignore[assignment]
     out["n_nan"] = n_nan
     out["n_segments_raw"] = len(edges) - 1
     return out
@@ -252,6 +255,7 @@ def assemble_bundle(partition: str, sample_seconds: float, columns: list[str], r
             "nan_filled": int(sum(int(p["n_nan"]) for p in parts)),
             "cycle_rows": int(sum(int(p["in_cycle"].sum()) for p in parts)),
             "process_rows": int(sum(int(p["in_process"].sum()) for p in parts)),
+            "step_names": {k: v for p in parts for k, v in dict(p.get("step_names") or {}).items()},
         },
     )
 

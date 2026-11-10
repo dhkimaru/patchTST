@@ -1,0 +1,65 @@
+# 학습 run 수 곡선 두 번째 추첨 31개 (split_v2 기반): seed 20261110으로 섞은 순서의 앞 31개. 검증 run은 split_v2와 같다.
+# 첫 추첨(split_v2_lc*, seed 20261109)과 같은 크기에서 결과가 얼마나 달라지는지(어떤 run이 들어가느냐의 영향) 본다.
+split_id: split_v2_lc31b
+strategy: learning_curve_nested_random
+parent: split_v2
+fold: 31
+excluded:
+  - run_id: standard_trace_071
+    reason: BACKWARD_TIMESTAMP_JUMP
+train:
+  - standard_trace_001
+  - standard_trace_002
+  - standard_trace_005
+  - standard_trace_006
+  - standard_trace_008
+  - standard_trace_012
+  - standard_trace_013
+  - standard_trace_014
+  - standard_trace_015
+  - standard_trace_018
+  - standard_trace_019
+  - standard_trace_020
+  - standard_trace_021
+  - standard_trace_022
+  - standard_trace_023
+  - standard_trace_025
+  - standard_trace_028
+  - standard_trace_029
+  - standard_trace_031
+  - standard_trace_032
+  - standard_trace_036
+  - standard_trace_037
+  - standard_trace_038
+  - standard_trace_039
+  - standard_trace_040
+  - standard_trace_044
+  - standard_trace_045
+  - standard_trace_046
+  - standard_trace_047
+  - standard_trace_048
+  - standard_trace_052
+validation:
+  - standard_trace_053
+  - standard_trace_054
+  - standard_trace_055
+  - standard_trace_057
+  - standard_trace_058
+  - standard_trace_062
+  - standard_trace_063
+  - standard_trace_064
+  - standard_trace_065
+  - standard_trace_066
+  - standard_trace_067
+test:
+  - standard_trace_068
+  - standard_trace_069
+  - standard_trace_070
+  - standard_trace_072
+  - standard_trace_073
+  - standard_trace_074
+  - standard_trace_075
+  - standard_trace_077
+  - standard_trace_078
+  - standard_trace_079
+  - standard_trace_080

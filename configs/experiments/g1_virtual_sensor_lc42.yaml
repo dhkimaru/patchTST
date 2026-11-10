@@ -1,0 +1,39 @@
+# 학습 run 수 곡선 42개: g1_virtual_sensor와 같고 분할만 split_v2_lc42 (학습 run 42개, 검증 run은 그대로).
+# study 표시가 있어 채택 판정·최고 기록에는 섞이지 않고 누적 기록에만 들어간다.
+# G1 가상 센서 — "이 센서를 달지 않았다면?"
+# 대상 센서와 같은 계열(예: VG11이면 압력계 전부, TempAct_C면 C zone 열전대 전부)과 복사본(|r|≥0.999)을
+# 입력에서 모두 빼고, 나머지 신호의 최근 192초로 지금 값을 추정한다.
+# 기준선은 레시피 평균(학습 run에서 같은 step·같은 위치의 평균값): 레시피만 알면 나오는 값.
+# 대상은 ald-analyze-params 1차 후보 17개 중 16개 (docs/PLAN.md 3.1). N2-3은 아래 주석 참고.
+name: g1_virtual_sensor_lc42
+study: lc42
+task: virtual_sensor
+description: 센서 하나를 같은 계열째 뺐을 때 나머지 신호로 그 값을 추정 — 레시피 평균 대비 개선
+targets: [VG11, TempAct_U, TempAct_CU, TempAct_C, TempAct_CL, TempAct_L, APCValveMon,
+          MFCMon_L.POS, MFCMon_P.POS, AUXMon_R.PWR, MFCMon_DCS, MFCMon_NH3,
+          MFCMon_N2-1, MFCMon_N2-4, ValveAct_29, ValveAct_89]
+# MFCMon_N2-3은 역할이 아직 추정(DCS 후 퍼지)이라 대상에서 뺀다. 확인되면 targets에 추가한다.
+data:
+  split: split_v2_lc42
+  sample_seconds: 1.0
+  region: process            # 공정(START~END) 구간만: 대기 중 STANDBY는 평가에서 뺀다
+  inputs: all
+  exclude_target_family: true
+window:
+  context_seconds: 64
+train:
+  batch_size: 1024
+  max_epochs: 40
+  windows_per_epoch: 200000
+  patience: 6
+  loss: mae                  # 평가 지표(MAE)와 같은 손실: MSE는 승온 구간의 큰 오차에 끌려 사이클 구간을 망친다
+seeds: [42]
+models:
+  - template                 # 기준선 (자동 포함)
+  - ridge
+  - lightgbm
+  - name: itransformer       # 채널 사이 attention: 센서 간 관계를 직접 학습
+  - name: patchtst
+    label: patchtst_mix
+    params: {channel_mode: mixing, patch_seconds: 8, stride_seconds: 4, d_model: 128, n_heads: 8, n_layers: 3, d_ff: 256}
+  - name: dlinear

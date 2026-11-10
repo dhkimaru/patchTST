@@ -34,7 +34,7 @@ STAGE3_PREFIX = "p3_fallback"
 BASE_FOR_TASK = {"forecast": "g1_forecast_params", "virtual_sensor": "g1_virtual_sensor"}
 FALLBACK_MODELS = ("itransformer", "dlinear", "lightgbm")
 NOISE_SD = 2.0  # PatchTST is kept when it beats the baseline by more than this many seed standard deviations
-BASELINES = ("persistence", "template", "mean")
+BASELINES = ("persistence", "template", "schedule", "mean")
 DECISIONS = {"keep": "PatchTST 채택", "fallback": "대안 필요", "missing": "PatchTST 미학습"}
 # Step 1 runs on a few targets that stand for the rest (the dashboard's "탐색용" preset fills these in).
 REPRESENTATIVE = {"forecast": ("VG11", "APCValveMon", "MFCMon_L.POS"),

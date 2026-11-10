@@ -17,7 +17,7 @@ from ..theme import tokens
 from ..ui import chart, empty_state, kpi_row, table
 
 TASK_LABELS = {"forecast": "미래값 예측", "virtual_sensor": "가상 센서", "thickness": "두께(VM)"}
-BASELINES = ("persistence", "template", "mean")
+BASELINES = ("persistence", "template", "schedule", "mean")
 MODEL_ORDER = ("ridge", "pls", "lightgbm", "patchtst", "itransformer", "dlinear", "gru")
 
 

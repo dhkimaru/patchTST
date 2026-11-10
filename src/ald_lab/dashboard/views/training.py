@@ -16,7 +16,8 @@ from .launcher import render_launcher, render_queue
 from .records import render_records
 
 TASK_LABELS = {"forecast": "미래값 예측", "virtual_sensor": "가상 센서", "thickness": "두께(VM)"}
-BASELINE_LABELS = {"persistence": "현재값 유지", "template": "레시피 평균", "mean": "학습 평균"}
+BASELINE_LABELS = {"persistence": "현재값 유지", "template": "레시피 평균", "schedule": "레시피 일정 평균",
+                   "mean": "학습 평균"}
 COLUMN_LABELS = {
     "label": "모델", "seeds": "seed 수", "mae": "MAE", "mae_std": "MAE 표준편차", "improvement_pct": "기준선 대비 개선(%)",
     "mae_cycle": "MAE·사이클", "mae_other": "MAE·사이클 외", "mae_transition": "MAE·step 전환 직후",

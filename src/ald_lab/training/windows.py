@@ -19,7 +19,7 @@ import torch
 
 from .prepare import Bundle
 
-REGIONS = ("all", "process", "cycle")
+REGIONS = ("all", "process", "cycle", "noncycle")  # noncycle: process rows outside ALD cycles
 
 
 @dataclass
@@ -112,6 +112,8 @@ def window_ends(bundle: Bundle, context: int, horizons: tuple[int, ...], region:
         ok &= np.asarray(bundle.in_process)
     elif region == "cycle":
         ok &= np.asarray(bundle.in_cycle)
+    elif region == "noncycle":
+        ok &= np.asarray(bundle.in_process) & ~np.asarray(bundle.in_cycle)
     return rows[ok]
 
 

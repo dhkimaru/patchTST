@@ -139,6 +139,14 @@ def test_forecast_experiment_end_to_end(lab, tmp_path):
     assert stages[0] == "preprocess" and stages[-1] == "evaluate" and "hpo" in stages and "train" in stages
     metrics = json.loads((job_dir / "metrics_validation.json").read_text())["metrics"]
     assert set(metrics["by_horizon"]) == {"2s", "4s"} and metrics["by_region"]["cycle"] is not None
+    assert set(metrics["by_horizon_region"]) == {"2s", "4s"} and metrics["by_horizon_region"]["2s"]["cycle"] is not None
+    assert set(metrics["by_transition"]) == {"first_3s", "later"}
+    steps = metrics["by_step"]  # per recipe step name: [mae, windows]
+    assert steps and sum(n for _, n in steps.values()) == metrics["n_windows"] * 2
+    saved = pd.read_parquet(job_dir / "predictions_val.parquet")
+    assert len(saved) == metrics["n_windows"]
+    assert {"run_id", "row", "in_cycle", "true_2s", "pred_2s", "true_4s", "pred_4s"} <= set(saved.columns)
+    assert abs((saved["pred_2s"] - saved["true_2s"]).abs().mean() - metrics["by_horizon"]["2s"]) < 1e-3 * (1 + metrics["mae"])
 
     test = run_final_test(exp_dir, paths, device="cpu")
     assert (exp_dir / "test_summary.md").is_file()
@@ -300,3 +308,89 @@ def test_scaler_and_template_use_train_rows_only(lab, tmp_path):
     expected = pd.DataFrame({"key": np.asarray(cache.train_bundle.step_key), "pos": np.asarray(cache.train_bundle.step_pos),
                              "y": y}).groupby(["key", "pos"])["y"].mean()
     assert np.allclose(template.table.iloc[:, 0].to_numpy(), expected.to_numpy())
+
+
+def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
+    """scripts/side_studies.py reads the learning-curve, recent-window, cycle-only and per-step results."""
+    import runpy
+
+    paths, split_path = lab
+    tiny = {"name": "patchtst", "params": {"patch_seconds": 4, "stride_seconds": 2, "d_model": 16, "n_heads": 2,
+                                           "n_layers": 1, "d_ff": 32}}
+    for study, region in (("lc51", "process"), ("lc20", "process"), ("lc20b", "process"), ("recent4", "process"),
+                          ("recent4_10", "process"), ("region_cycle", "cycle")):
+        config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, seeds=[1, 2],
+                         targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": 16},
+                         data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all"})
+        results = pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")
+        assert (results["status"] == "ok").all(), results.get("error")
+    monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "side_studies.py"), run_name="__main__")
+    text = (paths.work_root / "reports" / "side_studies.txt").read_text(encoding="utf-8")
+    assert "1-4. 학습 run 수 곡선" in text and ("줄어드는 중" in text or "포화" in text or "커짐" in text)
+    assert "1-5. 최근 run 20개만으로 학습" in text and "053~067" in text
+    assert "1-7. 사이클 구간만 학습" in text and "lc51" in text
+    assert "4. 레시피 단계별 남은 오차" in text and "TempAct_C · PatchTST" in text
+    assert "1-8. 학습 기간 길이" in text and "1-9. 학습 run 수 곡선 · 두 번째 추첨" in text
+
+
+def test_schedule_baseline_projects_steps_without_future_labels(lab, tmp_path):
+    """The recipe-schedule baseline reads the template at the planned step, and survives the final test."""
+    from ald_lab.ledger import collect_ledger, main_records
+    from ald_lab.models.classic import StepSchedule
+
+    paths, split_path = lab
+    split = load_split(split_path)
+    bundle = build_bundle(paths, split, "train", sample_seconds=1.0, columns=["VG11", "TempAct_C"])
+    plan = StepSchedule(cap=1200).fit(bundle)
+    assert plan.duration and set(plan.duration) <= set(plan.next) | set(plan.duration)
+    assert 0 <= plan.info["fixed_duration_share"] <= 1
+    keys, pos = plan.future(np.asarray(bundle.step_key[:50]), np.asarray(bundle.step_pos[:50]), np.array([0, 3, 30]))
+    assert (keys[:, 0] == np.asarray(bundle.step_key[:50])).all() and (pos[:, 0] == np.asarray(bundle.step_pos[:50])).all()
+
+    config = _config(tmp_path, split_path, name="sched", study="long_horizon",
+                     window={"context_seconds": 16, "horizons_seconds": [2, 8]}, models=["template", "schedule"])
+    exp_dir = run_experiment(config, paths, devices=["cpu"])
+    results = pd.read_csv(exp_dir / "results.csv")
+    assert (results["status"] == "ok").all(), results.get("error")
+    assert set(results["model"]) == {"persistence", "template", "schedule"}
+    job_dir = exp_dir / results.loc[results["model"] == "schedule", "job_dir"].iloc[0]
+    assert (job_dir / "schedule.json").is_file() and (job_dir / "template.parquet").is_file()
+    assert pd.read_parquet(job_dir / "predictions_val.parquet")["pred_8s"].notna().all()
+    ledger = collect_ledger(paths.work_root)
+    assert main_records(ledger).empty
+    test = run_final_test(exp_dir, paths, device="cpu", scope="all")
+    assert "schedule" in set(test["model"])
+
+
+def test_noncycle_region_keeps_process_rows_outside_cycles(lab):
+    paths, split_path = lab
+    bundle = build_bundle(paths, load_split(split_path), "train", sample_seconds=1.0, columns=["VG11"])
+    ends = window_ends(bundle, 1, (1,), "noncycle")  # synthetic runs have only a few START rows outside cycles
+    assert len(ends) and np.asarray(bundle.in_process)[ends].all() and not np.asarray(bundle.in_cycle)[ends].any()
+    both = set(window_ends(bundle, 1, (1,), "cycle")) | set(ends)
+    assert both == set(window_ends(bundle, 1, (1,), "process"))
+
+
+def test_combine_predictions_script(lab, tmp_path, monkeypatch):
+    """scripts/combine_predictions.py pairs region-specialized models, averages models and picks per horizon."""
+    import runpy
+
+    paths, split_path = lab
+    vs_models = ["template", "ridge", {"name": "lightgbm", "params": {"n_estimators": 10}}]
+    for study, region in (("lc51", "process"), ("region_cycle", "cycle"), ("region_noncycle", "noncycle")):
+        config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, targets=["TempAct_C"],
+                         models=vs_models if study == "lc51" else ["template", "ridge"], window={"context_seconds": 1},
+                         data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all"})
+        results = pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")
+        assert (results["status"] == "ok").all(), results.get("error")
+    config = _config(tmp_path, split_path, name="long", study="long_horizon",
+                     window={"context_seconds": 16, "horizons_seconds": [2, 8]},
+                     models=["template", "schedule", "ridge", {"name": "lightgbm", "params": {"n_estimators": 10}}])
+    assert (pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
+    monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "combine_predictions.py"), run_name="__main__")
+    text = (paths.work_root / "reports" / "combine_predictions.txt").read_text(encoding="utf-8")
+    assert "1. 가상 센서 · 구간 전용 모델 합치기" in text and "사이클 전용 + 사이클 밖 전용" in text
+    assert "2. 가상 센서 · PatchTST와 LightGBM 예측 평균" in text
+    assert "3. 미래값 30초~10분 · 예측 거리별 모델 비교와 선택" in text and "레시피 일정 평균" in text

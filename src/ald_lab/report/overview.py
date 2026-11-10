@@ -57,11 +57,17 @@ def remaining(mae: Any, baseline: Any) -> float:
 
 def trend(ledger: pd.DataFrame, task: str, frame: pd.DataFrame) -> list[dict[str, Any]]:
     """Per day a run started: the PatchTST record so far (seeds of one configuration averaged), as the geometric mean
-    of remaining error over the task's targets; starts on the first day every target has a record."""
+    of remaining error over the task's targets; starts on the first day every target has a record.
+
+    Days with only side studies of the task (other splits, regions, horizons) are listed too, flagged ``side`` with
+    the number of runs: the record is carried over unchanged, since those runs do not count toward it."""
 
     base = {r.target: float(r.baseline_mae) for r in frame.itertuples() if _ok(r.baseline_mae) and r.baseline_mae > 0}
     if not base or ledger is None or not len(ledger) or "when" not in ledger:
         return []
+    every_run = ledger[(ledger["task"] == task) & ledger["when"].notna()]
+    if "smoke" in every_run:
+        every_run = every_run[~every_run["smoke"].astype(bool)]
     ledger = main_records(ledger)
     rows = ledger[(ledger["task"] == task) & (ledger["model"] == "patchtst") & ledger["mae"].notna()
                   & ledger["target"].isin(list(base))]
@@ -75,13 +81,18 @@ def trend(ledger: pd.DataFrame, task: str, frame: pd.DataFrame) -> list[dict[str
     cfg["day"] = pd.to_datetime(cfg["when"]).dt.normalize()
     lgbm = [remaining(r.lgbm_mae, base[r.target]) for r in frame.itertuples() if r.target in base]
     lgbm_mean = geo_mean(lgbm) if lgbm and all(_ok(v) for v in lgbm) else None
+    main_days = set(cfg["day"].unique())
+    run_days = pd.to_datetime(every_run["when"]).dt.normalize()
+    side_runs = every_run.assign(day=run_days)[~run_days.isin(main_days)].groupby("day")["exp_dir"].nunique()
     out = []
-    for day in sorted(cfg["day"].unique()):
+    for day in sorted(main_days | set(side_runs.index)):
         best = cfg[cfg["day"] <= day].groupby("target")["mae"].min()
         if set(best.index) != set(base):
             continue
+        side = day not in main_days
         out.append({"day": pd.Timestamp(day), "mean": geo_mean([100 * best[t] / base[t] for t in base]),
-                    "lgbm": lgbm_mean, "targets": len(base)})
+                    "lgbm": lgbm_mean, "targets": len(base), "side": side,
+                    "side_runs": int(side_runs.get(day, 0)) if side else 0})
     return out
 
 
@@ -126,8 +137,13 @@ def conclusion_points(dec: dict[str, pd.DataFrame], trends: dict[str, list[dict[
             text += f" (열세: {escape(_names(behind))})" if behind else ""
         out.append(text)
     for task, points in trends.items():
-        if len(points) >= 2 and _ok(points[-1]["mean"]) and _ok(points[-2]["mean"]):
-            last, prev = points[-1], points[-2]
+        main = [pt for pt in points if not pt.get("side")]
+        if points and points[-1].get("side") and main and _ok(points[-1]["mean"]):
+            last = points[-1]
+            out.append(f"최근 실험일({last['day']:%m-%d}) {TASKS[task][0]}: 부가 실험만 진행, 기본 기록 {last['mean']:.1f} 유지 "
+                       f"(마지막 기본 실험 {main[-1]['day']:%m-%d})")
+        elif len(main) >= 2 and _ok(main[-1]["mean"]) and _ok(main[-2]["mean"]):
+            last, prev = main[-1], main[-2]
             change = 100 * (last["mean"] / prev["mean"] - 1)
             if abs(change) > 0.05:
                 out.append(f"최근 실험일({last['day']:%m-%d}) {TASKS[task][0]} 상대 오차(대상 평균) "
@@ -142,6 +158,31 @@ def conclusion_points(dec: dict[str, pd.DataFrame], trends: dict[str, list[dict[
     if dec:
         out.append("모든 수치는 검증 run 기준이며, 시험 run은 최종 후보 확정 후 1회만 평가")
     return out
+
+
+STUDY_NAMES = (  # study prefix → what the side study checks (요약 tab line)
+    ("cv", "교차검증"), ("time", "시간순 검증"), ("single_sensor", "센서 하나 고장"), ("long_horizon", "예측 거리 확장"),
+    ("lc", "학습 run 수"), ("recent", "최근 run 학습"), ("res_05s", "0.5초 간격"), ("region_", "구간 전용 학습"),
+    ("fc_", "미래값 구간 전용 학습"),
+)
+
+
+def side_study_note(ledger: pd.DataFrame) -> str | None:
+    """One line for the 요약 tab: side studies run since (date, count, kinds), which the decisions above leave out."""
+
+    if not len(ledger) or "study" not in ledger:
+        return None
+    side = ledger[ledger["study"].fillna("").astype(str) != ""]
+    if not len(side) or "when" not in side or side["when"].isna().all():
+        return None
+    kinds: list[str] = []
+    for study in side["study"].astype(str).unique():
+        name = next((n for prefix, n in STUDY_NAMES if study.startswith(prefix)), study)
+        if name not in kinds:
+            kinds.append(name)
+    last = side["when"].max()
+    return (f"부가 실험(채택 판정 · 기록 갱신에서 제외): 최근 실행 {last:%m-%d} · 실행 {side['exp_dir'].nunique()}회 "
+            f"({escape(' · '.join(kinds))}). 결과는 Hyper Parameter ⑦ 누적 기록과 하이퍼파라미터 탐색 탭의 탐색 결과에 있음")
 
 
 # ----------------------------------------------------------------------------- charts
@@ -241,6 +282,9 @@ def trend_chart(trends: dict[str, list[dict[str, Any]]]) -> str:
     p.append(f'<line class="ov-ptl" x1="{left}" y1="16" x2="{left + 22}" y2="16"/><circle class="ov-pt" cx="{left + 11}" cy="16" r="4"/>'
              + _t(left + 30, 20, "PatchTST 누적 최고 기록"))
     p.append(f'<line class="ov-lgbl" x1="{left + 260}" y1="16" x2="{left + 282}" y2="16"/>' + _t(left + 290, 20, "LightGBM (참고)"))
+    if any(pt.get("side") for _, pts in panels for pt in pts):
+        p.append(f'<circle class="ov-pt ov-side" cx="{left + 431}" cy="16" r="4"/>'
+                 + _t(left + 442, 20, "부가 실험만 한 날 (기록 유지)"))
     y0 = top
     for task, pts in panels:
         title = TASKS[task][0]
@@ -266,17 +310,23 @@ def trend_chart(trends: dict[str, list[dict[str, Any]]]) -> str:
             yl = py(pts[0]["lgbm"])
             p.append(f'<line class="ov-lgbl" x1="{left}" y1="{yl:.1f}" x2="{width - right}" y2="{yl:.1f}"/>')
             p.append(_t(width - right + 8, yl + 4, f"LightGBM {pts[0]['lgbm']:.1f}", "tick"))
-        p.append('<polyline class="ov-ptl" points="' + " ".join(f"{x:.1f},{py(pt['mean']):.1f}" for x, pt in zip(xs, pts))
-                 + '"/>')
+        for i in range(1, n):
+            dash = " ov-sidel" if pts[i].get("side") else ""
+            p.append(f'<line class="ov-ptl{dash}" x1="{xs[i - 1]:.1f}" y1="{py(pts[i - 1]["mean"]):.1f}" '
+                     f'x2="{xs[i]:.1f}" y2="{py(pts[i]["mean"]):.1f}"/>')
         every = max(1, math.ceil(n / 12))
         for i, (x, pt) in enumerate(zip(xs, pts)):
-            p.append(f'<g><title>{pt["day"]:%Y-%m-%d} · 상대 오차 {pt["mean"]:.2f}</title>'
-                     f'<circle class="ov-pt" cx="{x:.1f}" cy="{py(pt["mean"]):.1f}" r="4.5"/></g>')
+            side = pt.get("side")
+            tip = (f"{pt['day']:%Y-%m-%d} · 부가 실험 {pt.get('side_runs', 0)}회 · 기본 기록 유지 {pt['mean']:.2f}" if side
+                   else f"{pt['day']:%Y-%m-%d} · 상대 오차 {pt['mean']:.2f}")
+            p.append(f'<g><title>{tip}</title><circle class="ov-pt{" ov-side" if side else ""}" cx="{x:.1f}" '
+                     f'cy="{py(pt["mean"]):.1f}" r="4.5"/></g>')
             if i % every == 0 or i == n - 1:
-                p.append(_t(x, py(pt["mean"]) - 10, f"{pt['mean']:.1f}", "ov-val", "middle"))
+                if not side or i == n - 1:
+                    p.append(_t(x, py(pt["mean"]) - 10, f"{pt['mean']:.1f}", "ov-val", "middle"))
                 p.append(_t(x, ybot + 16, f"{pt['day']:%m-%d}", "tick", "middle"))
         y0 += ph + gap
-    p.append(_t(width - 8, height - 6, "상대 오차: 기준선 = 100, 대상 기하평균 · 날짜: 실험 시작일",
+    p.append(_t(width - 8, height - 6, "상대 오차: 기준선 = 100, 대상 기하평균 · 날짜: 실험 시작일 (부가 실험일 포함)",
                 "tick", "end"))
     p.append("</svg>")
     return "".join(p)
