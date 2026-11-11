@@ -40,6 +40,10 @@ BUNDLE_VERSION = "b2"  # b2: step names per step key (per-step error breakdown)
 # Template positions are shared past this many 0.5 s rows (20 min), as in the variability analysis.
 POSITION_CAP_ROWS = 2400
 ARRAYS = ("values", "run_index", "seg_id", "seg_bounds", "in_cycle", "in_process", "step_key", "step_pos")
+# How 0.5 s rows are grouped into blocks: "run" counts blocks from the start of each continuous segment
+# (the original pipeline); "step" restarts them at every step change, so no block mixes two steps
+# (a step with an odd number of rows ends in a single-row block).
+BIN_ALIGNS = ("run", "step")
 
 
 class PrepareError(ValueError):
@@ -88,8 +92,23 @@ def _step_key(recipe: pd.Series, step_id: pd.Series) -> np.ndarray:
     return hashed[codes]
 
 
-def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int) -> dict[str, np.ndarray | int]:
-    """Arrays for one run: contiguous segments, block-averaged by ``factor`` rows."""
+def _block_starts(a: int, b: int, factor: int, step_change: np.ndarray, align: str) -> np.ndarray:
+    """First raw row of every block in the segment [a, b)."""
+
+    if align == "run" or factor == 1:
+        n = (b - a) // factor * factor
+        return a + factor * np.arange(n // factor)
+    cuts = a + 1 + np.flatnonzero(step_change[a + 1 : b])
+    starts = [np.arange(s, e, factor) for s, e in zip(np.r_[a, cuts], np.r_[cuts, b])]
+    return np.concatenate(starts)
+
+
+def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int, align: str = "run",
+               ) -> dict[str, np.ndarray | int]:
+    """Arrays for one run: contiguous segments, block-averaged by ``factor`` rows (see ``BIN_ALIGNS``)."""
+
+    if align not in BIN_ALIGNS:
+        raise PrepareError(f"bin_align must be one of {BIN_ALIGNS}: {align!r}")
 
     missing = [c for c in columns if c not in frame.columns]
     if missing:
@@ -120,20 +139,25 @@ def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int) -> dict[str
         k: [] for k in ("values", "in_cycle", "in_process", "step_key", "step_pos", "source_rows")}
     lengths = []
     for a, b in zip(edges[:-1], edges[1:]):
-        n = (b - a) // factor * factor
-        if n <= 0:
+        starts = _block_starts(int(a), int(b), factor, step_change, align)
+        if not len(starts):
             continue
-        last = a + factor - 1 + factor * np.arange(n // factor)
-        block = values[a : a + n]
-        if factor > 1:
-            block = block.reshape(-1, factor, block.shape[1]).mean(axis=1)
+        if align == "run":
+            last = starts + factor - 1
+            block = values[starts[0] : last[-1] + 1]
+            if factor > 1:
+                block = block.reshape(-1, factor, block.shape[1]).mean(axis=1)
+        else:
+            last = np.r_[starts[1:], b] - 1
+            counts = (last - starts + 1).astype(np.float32)[:, None]
+            block = np.add.reduceat(values[a:b], starts - a, axis=0) / counts
         pieces["values"].append(block.astype(np.float32))
         pieces["in_cycle"].append(in_cycle[last])
         pieces["in_process"].append(in_process[last])
         pieces["step_key"].append(key[last])
         pieces["step_pos"].append((pos[last] // factor).astype(np.int32))
         pieces["source_rows"].append(last)  # raw row closing each block (timestamps for predictions)
-        lengths.append(n // factor)
+        lengths.append(len(starts))
     if not lengths:
         raise PrepareError("run has no usable rows")
     out: dict[str, np.ndarray | int] = {k: np.concatenate(v) for k, v in pieces.items()}
@@ -144,12 +168,12 @@ def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int) -> dict[str
     return out
 
 
-def _bundle_key(split_id: str, partition: str, run_ids: list[str], sample_seconds: float, columns: list[str]) -> str:
-    payload = json.dumps(
-        {"v": BUNDLE_VERSION, "split": split_id, "part": partition, "runs": run_ids,
-         "dt": sample_seconds, "cols": columns},
-        sort_keys=True,
-    )
+def _bundle_key(split_id: str, partition: str, run_ids: list[str], sample_seconds: float, columns: list[str],
+                bin_align: str = "run") -> str:
+    doc = {"v": BUNDLE_VERSION, "split": split_id, "part": partition, "runs": run_ids, "dt": sample_seconds, "cols": columns}
+    if bin_align != "run":  # the original grouping keeps its existing cache keys
+        doc["align"] = bin_align
+    payload = json.dumps(doc, sort_keys=True)
     return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
@@ -183,16 +207,20 @@ def build_bundle(
     include_test: bool = False,
     rebuild: bool = False,
     workers: int = 4,
+    bin_align: str = "run",
 ) -> Bundle:
     """Load (or build and cache) one partition's bundle."""
 
     factor = round(sample_seconds / EXPECTED_INTERVAL_S)
     if factor < 1 or abs(factor * EXPECTED_INTERVAL_S - sample_seconds) > 1e-9:
         raise PrepareError(f"sample_seconds must be a multiple of {EXPECTED_INTERVAL_S}: {sample_seconds}")
+    if bin_align not in BIN_ALIGNS:
+        raise PrepareError(f"bin_align must be one of {BIN_ALIGNS}: {bin_align!r}")
     run_ids = split.runs(partition, include_test=include_test)
     columns = list(columns or usable_columns())
-    key = _bundle_key(split.split_id, partition, run_ids, sample_seconds, columns)
-    directory = paths.work_root / "prepared" / f"{split.split_id}_{sample_seconds:g}s_{partition}_{key}"
+    key = _bundle_key(split.split_id, partition, run_ids, sample_seconds, columns, bin_align)
+    tag = "" if bin_align == "run" else f"_{bin_align}bin"
+    directory = paths.work_root / "prepared" / f"{split.split_id}_{sample_seconds:g}s{tag}_{partition}_{key}"
     if directory.is_dir() and not rebuild and (directory / "meta.json").is_file():
         return load_bundle(directory)
 
@@ -208,14 +236,14 @@ def build_bundle(
         absent = [c for c in columns if c not in signal_columns(frame)]
         if absent:
             raise PrepareError(f"{run_id} lacks columns {absent}")
-        return run_arrays(frame, columns, factor)
+        return run_arrays(frame, columns, factor, bin_align)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         parts = list(pool.map(one, run_ids))
 
     bundle = assemble_bundle(partition, sample_seconds, columns, run_ids, parts)
     bundle.stats.update(missing_columns=missing_columns, build_seconds=round(time.perf_counter() - started, 1),
-                        key=key)
+                        key=key, bin_align=bin_align)
     save_bundle(bundle, directory)
     return bundle
 
@@ -261,7 +289,7 @@ def assemble_bundle(partition: str, sample_seconds: float, columns: list[str], r
 
 
 def bundle_from_traces(frames: list[tuple[str, pd.DataFrame]], columns: list[str], sample_seconds: float,
-                       ) -> tuple[Bundle, pd.DataFrame, list[str]]:
+                       bin_align: str = "run") -> tuple[Bundle, pd.DataFrame, list[str]]:
     """A bundle from traces outside any split (new runs to predict), not cached.
 
     Columns a trace lacks are filled with NaN (→ 0 after the usual gap filling) and returned, so the
@@ -277,7 +305,7 @@ def bundle_from_traces(frames: list[tuple[str, pd.DataFrame]], columns: list[str
         if lacking:
             absent.update(lacking)
             frame = frame.assign(**{c: np.nan for c in lacking})
-        part = run_arrays(frame, columns, factor)
+        part = run_arrays(frame, columns, factor, bin_align)
         rows = np.asarray(part["source_rows"])
         parts.append(part)
         meta.append(pd.DataFrame({"run_id": run_id, "timestamp": frame["timestamp"].to_numpy()[rows],

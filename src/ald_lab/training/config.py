@@ -96,6 +96,7 @@ class ExperimentConfig:
     description: str = ""
     split: str = str(DEFAULT_SPLIT)
     sample_seconds: float = 1.0
+    bin_align: str = "run"  # "step": 1 s blocks restart at every step change (prepare.BIN_ALIGNS)
     region: str = "all"
     inputs: Any = "all"
     input_sets: dict[str, Any] = field(default_factory=dict)
@@ -172,6 +173,7 @@ def load_experiment(path: str | Path) -> ExperimentConfig:
         models=_models(doc.get("models") or [], task),
         split=str(data.get("split", DEFAULT_SPLIT)),
         sample_seconds=float(data.get("sample_seconds", 1.0)),
+        bin_align=str(data.get("bin_align", "run")),
         region=str(data.get("region", "all")),
         inputs=data.get("inputs", "all"),
         input_sets=dict(data.get("input_sets") or {}),
@@ -190,6 +192,8 @@ def load_experiment(path: str | Path) -> ExperimentConfig:
         cfg.models.insert(0, ModelSpec(cfg.baseline))
     if cfg.region not in REGIONS:
         raise ConfigError(f"data.region must be one of {REGIONS}")
+    if cfg.bin_align not in ("run", "step"):
+        raise ConfigError("data.bin_align must be 'run' or 'step'")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", cfg.name):
         raise ConfigError("name may use letters, digits, '_', '-', '.' only")
     if not cfg.models:

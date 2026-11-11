@@ -81,6 +81,52 @@ def test_block_average_respects_time_breaks(lab):
     assert arrays["values"][0, 0] == pytest.approx(raw[:2].mean(), rel=1e-6)
 
 
+def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
+    """bin_align "step" restarts the 1 s blocks at every step change; "run" keeps the original grouping and cache key."""
+    import hashlib
+    from itertools import pairwise
+
+    from ald_lab.training.config import ConfigError
+    from ald_lab.training.prepare import PrepareError, _bundle_key
+
+    paths, split_path = lab
+    frame = read_trace_csv(paths.data_root / "standard_trace_001.csv").iloc[1:].reset_index(drop=True)  # odd phase
+    cols = ["VG11", "ValveAct_29"]
+    by_run = run_arrays(frame, cols, factor=2)
+    by_step = run_arrays(frame, cols, factor=2, align="step")
+    names = frame["step_name"].to_numpy()
+    bounds = np.r_[np.flatnonzero(np.r_[True, names[1:] != names[:-1]]), len(names)]
+    starts = [s for a, b in pairwise(bounds) for s in range(a, b, 2)]
+    last = np.r_[starts[1:], len(frame)] - 1
+    assert np.array_equal(by_step["source_rows"], last)
+    raw = frame[cols].to_numpy()
+    for k in (0, 1, len(starts) // 2, len(starts) - 1):
+        assert np.allclose(by_step["values"][k], raw[starts[k] : last[k] + 1].mean(axis=0), atol=1e-5)
+    assert all(len(set(names[a : b + 1])) == 1 for a, b in zip(starts, last, strict=True))
+    # A valve that follows the step label: never half open in a step-aligned block, half open in run-aligned ones.
+    assert set(np.unique(by_step["values"][:, 1])) <= {0.0, 1.0} and 0.5 in set(by_run["values"][:, 1])
+    first_of_step = np.r_[True, names[last][1:] != names[last][:-1]]
+    assert (by_step["step_pos"][first_of_step] == 0).all()
+    assert np.allclose(by_run["values"][0], raw[:2].mean(axis=0))  # original grouping unchanged
+    doc = {"v": "b2", "split": "s", "part": "train", "runs": ["a"], "dt": 1.0, "cols": ["VG11"]}
+    old = hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:12]
+    assert _bundle_key("s", "train", ["a"], 1.0, ["VG11"]) == old != _bundle_key("s", "train", ["a"], 1.0, ["VG11"], "step")
+    with pytest.raises(PrepareError):
+        run_arrays(frame, cols, factor=2, align="cycle")
+    config = _config(tmp_path, split_path, task="virtual_sensor", name="stepbin", study="stepbin", targets=["TempAct_C"],
+                     models=["template", "ridge"], window={"context_seconds": 4},
+                     data={"split": str(split_path), "sample_seconds": 1.0, "bin_align": "step", "region": "process",
+                           "inputs": "all"})
+    exp_dir = run_experiment(config, paths, devices=["cpu"])
+    results = pd.read_csv(exp_dir / "results.csv")
+    assert (results["status"] == "ok").all(), results.get("error")
+    assert json.loads((exp_dir / results["job_dir"].iloc[-1] / "job.json").read_text())["bin_align"] == "step"
+    assert any("_stepbin_" in d.name for d in (paths.work_root / "prepared").iterdir())
+    bad = _config(tmp_path, split_path, name="bad_align", data={"split": str(split_path), "bin_align": "cycle"})
+    with pytest.raises(ConfigError):
+        load_experiment(bad)
+
+
 def test_windows_never_cross_segments(lab):
     paths, split_path = lab
     split = load_split(split_path)
@@ -322,17 +368,25 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
                                       ("region_cycle", "cycle", {}, 16), ("rw20", "process", {"recency_halflife_runs": 2}, 16),
                                       ("early_recent", "process", {}, 16), ("recent4_30", "process", {}, 16),
                                       ("region_cycle_win", "cycle", {}, 8), ("time1", "process", {}, 16),
-                                      ("rw10_time1", "process", {"recency_halflife_runs": 2}, 16)):
+                                      ("rw10_time1", "process", {"recency_halflife_runs": 2}, 16),
+                                      ("stepbin", "process", {}, 16), ("rtype_easy25", "process", {}, 16)):
         config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, seeds=[1, 2],
                          targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": ctx},
                          train={"batch_size": 64, "max_epochs": 2, "windows_per_epoch": 256, "val_windows": 128,
                                 "patience": 2, **extra},
-                         data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all"})
+                         data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all",
+                               "bin_align": "step" if study == "stepbin" else "run"})
         results = pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")
         assert (results["status"] == "ok").all(), results.get("error")
     monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
+    (paths.work_root / "reports").mkdir(parents=True, exist_ok=True)
+    types = {r: {"type": "hard" if r[-1] in "24" else "easy"} for r, part in RUNS.items() if part != "test"}
+    (paths.work_root / "reports" / "run_types.json").write_text(json.dumps({"runs": types}), encoding="utf-8")
     runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "side_studies.py"), run_name="__main__")
     text = (paths.work_root / "reports" / "side_studies.txt").read_text(encoding="utf-8")
+    assert "1-15. run 유형별 남은 오차" in text and "TempC" in text
+    assert "1-16. 학습 run 구성과 오차" in text and "rtype_easy25" in text
+    assert "1-17. step 맞춤 1초 묶음" in text and "기준선 어려움÷쉬움" in text
     assert "1-4. 학습 run 수 곡선" in text and ("줄어드는 중" in text or "포화" in text or "커짐" in text)
     assert "1-5. 최근 run 20개만으로 학습" in text and "053~067" in text
     assert "1-7. 사이클 구간만 학습" in text and "lc51" in text
@@ -451,8 +505,12 @@ def test_run_drift_script(lab, monkeypatch):
     paths, split_path = lab
     monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
     monkeypatch.setenv("ALD_DATA_ROOT", str(paths.data_root))
-    monkeypatch.setattr(sys, "argv", ["run_drift.py", "--split", str(split_path)])
+    monkeypatch.setattr(sys, "argv", ["run_drift.py", "--split", str(split_path), "--type-signals", "VG11,ValveAct_29"])
     runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "run_drift.py"), run_name="__main__")
     text = (paths.work_root / "reports" / "run_drift.txt").read_text(encoding="utf-8")
     assert "## 1. 변화점" in text and "VG11" in text and "레시피 평균과의 차이" in text
     assert "006" not in text  # the test run of the synthetic split stays sealed
+    assert "## 4. run 유형 (VG11, ValveAct_29의" in text and "## 5. 분할별 학습 run 구성" in text
+    types = json.loads((paths.work_root / "reports" / "run_types.json").read_text(encoding="utf-8"))["runs"]
+    assert set(types) == {r for r, part in RUNS.items() if part != "test"}
+    assert {v["type"] for v in types.values()} <= {"easy", "hard"}

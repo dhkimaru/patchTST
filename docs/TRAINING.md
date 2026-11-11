@@ -334,7 +334,8 @@ targets: [VG11]
 data:
   split: split_v2              # configs/splits/<이름>.yaml
   sample_seconds: 1.0          # 0.5(원본) 또는 그 배수 (배수면 평균)
-  region: all                  # window 끝 위치: all | process(START~END) | cycle(ALD 사이클)
+  bin_align: run               # 묶음 시작: run(구간 시작부터 2행씩, 기본) | step(step이 바뀌면 새 묶음, 두 step이 섞이지 않음)
+  region: all                  # window 끝 위치: all | process(START~END) | cycle(ALD 사이클) | noncycle(공정 중 사이클 밖)
   inputs: all                  # all | core | core_ab | A_all | A_plus | legacy_primary | [컬럼 목록]
                                # core = 중요도 A 대표 14개, A_all = A 등급 전체 62개,
                                # A_plus = A 전체 + 등급 없는 압력계·APC·RF 매칭 위치 (74개)

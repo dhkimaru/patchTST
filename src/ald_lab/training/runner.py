@@ -184,9 +184,9 @@ class DataCache:
         self.dictionary, _ = load_column_dictionary()
         columns = usable_columns(self.dictionary)
         self.train_bundle = build_bundle(paths, split, "train", sample_seconds=cfg.sample_seconds, columns=columns,
-                                         rebuild=rebuild)
+                                         rebuild=rebuild, bin_align=cfg.bin_align)
         self.val_bundle = build_bundle(paths, split, "validation", sample_seconds=cfg.sample_seconds,
-                                       columns=columns, rebuild=rebuild)
+                                       columns=columns, rebuild=rebuild, bin_align=cfg.bin_align)
         self.usable = [c for c in self.train_bundle.columns if c in set(self.val_bundle.columns)]
         # Copies (|r| ≥ COPY_THRESHOLD = 0.9999) measured on train runs only; virtual sensors drop them with the target.
         self.near_copies = find_near_copies(self.train_bundle, self.usable)
@@ -391,7 +391,7 @@ def run_job(
         (job_dir / "job.json").write_text(json.dumps({
             "job": job.to_dict(), "experiment": cfg.name, "task": cfg.task, "inputs": data.inputs,
             "removed_inputs": data.removed, "scaler": data.scaler.to_dict(), "model_config": model_config,
-            "sample_seconds": cfg.sample_seconds, "context_steps": cfg.context_steps,
+            "sample_seconds": cfg.sample_seconds, "bin_align": cfg.bin_align, "context_steps": cfg.context_steps,
             "horizon_steps": list(cfg.horizon_steps), "horizons_seconds": cfg.horizon_labels,
             "region": cfg.region, "device": cache.device,
         }, ensure_ascii=False, indent=1, default=str))
@@ -475,7 +475,7 @@ def _prepare_entry(cfg: ExperimentConfig, cache: DataCache, split: RunSplit, jou
                    exp_dir: Path) -> str:
     title = f"[{cfg.name}] 학습 데이터 준비"
     config = {"experiment": cfg.name, "task": cfg.task, "split": split.split_id,
-              "sample_seconds": cfg.sample_seconds, "region": cfg.region, "inputs": cfg.inputs,
+              "sample_seconds": cfg.sample_seconds, "bin_align": cfg.bin_align, "region": cfg.region, "inputs": cfg.inputs,
               "context_seconds": cfg.context_seconds, "horizons_seconds": cfg.horizon_labels, "smoke": cfg.smoke}
     with journal.record("preprocess", title, config=config, tags=[cfg.name, cfg.task]) as entry:
         targets = {}
@@ -768,7 +768,7 @@ def run_final_test(exp_dir: Path, paths: LabPaths, *, device: str, scope: str = 
     dictionary, _ = load_column_dictionary()
     units = _units(dictionary)
     test_bundle = build_bundle(paths, split, "test", sample_seconds=cfg.sample_seconds,
-                               columns=usable_columns(dictionary), include_test=True)
+                               columns=usable_columns(dictionary), include_test=True, bin_align=cfg.bin_align)
     rows_out = []
     # One test window set per (target, inputs): every job of that pair used the same train-fitted scaler.
     window_sets: dict[tuple[str, tuple[str, ...]], WindowSet] = {}

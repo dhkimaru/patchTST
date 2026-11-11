@@ -79,7 +79,8 @@ def predict_traces(model_dir: str | Path, files: list[Path], *, device: str = "c
 
     target = doc["job"]["target"]
     scaler = Scaler.from_dict(doc["scaler"])
-    bundle, meta, absent = bundle_from_traces(frames, scaler.columns, float(doc["sample_seconds"]))
+    bundle, meta, absent = bundle_from_traces(frames, scaler.columns, float(doc["sample_seconds"]),
+                                              str(doc.get("bin_align", "run")))
     missing_inputs = [c for c in absent if c in doc["inputs"]]
     if missing_inputs:
         raise PredictError(f"the traces lack model inputs: {missing_inputs}")

@@ -4,12 +4,14 @@
    (가상 센서: lc51 · region_cycle · region_noncycle, 미래값 10~30초: fc_ref · fc_region_cycle)
 2. 모델 평균: 주 모델(PatchTST)과 LightGBM 예측의 평균 (가상 센서 lc51, 미래값 장기 예측)
 3. 예측 거리별 모델 선택 (미래값 30초~10분): 검증 run을 절반으로 나눠 한쪽에서 고른 모델을 다른 쪽에서 채점한다
+work/reports/run_types.json(run_drift.py가 만듦)이 있으면 구간 조합의 개선율을 run 유형(쉬움 · 어려움)별로도 낸다.
 
     python scripts/combine_predictions.py      # 화면 출력 + work/reports/combine_predictions.txt
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +30,10 @@ NAMES = {"persistence": "현재값 유지", "template": "레시피 평균", "sch
          "lightgbm": "LightGBM", "itransformer": "iTransformer", "dlinear": "DLinear", "gru": "GRU", "ridge": "Ridge"}
 out: list[str] = []
 add = out.append
+_types = P.work_root / "reports" / "run_types.json"
+RUN_TYPES: dict[str, str] = ({k: v["type"] for k, v in json.loads(_types.read_text(encoding="utf-8"))["runs"].items()}
+                             if _types.is_file() else {})
+TYPE_NAMES = {"easy": "쉬움", "hard": "어려움"}
 
 
 def fmt(x: float) -> str:
@@ -134,7 +140,13 @@ def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, ti
                 pair.append(p)
             variants["사이클 전용 + 사이클 밖 전용"] = pair
         rec.update({"기준선 MAE": fmt(b_all)})
+        kinds = pd.Series(idx.get_level_values(0)).map(RUN_TYPES).to_numpy()
         for name, frames in variants.items():
+            for kind in ("easy", "hard"):
+                m = kinds == kind
+                b_k = mae(base[0].loc[idx], m) if m.any() else np.nan
+                if m.any() and b_k:
+                    rec[f"유형 {name} {TYPE_NAMES[kind]}"] = round(100 * (1 - np.mean([mae(f, m) for f in frames]) / b_k), 1)
             scores = np.array([score(f) for f in frames])
             a, c_, o = scores.mean(axis=0)
             rec[f"{name} MAE"] = fmt(a)
@@ -158,30 +170,52 @@ def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, ti
                 add(f"\n[{name}]")
                 add(frame[["대상", "모델", "기준선 MAE", *cols]].rename(columns=lambda c, n=name: c.replace(n + " ", ""))
                     .to_string(index=False))
+        kind_cols = [c for c in frame.columns if c.startswith("유형 ")]
+        if kind_cols:
+            add("\n[run 유형별 개선율 (%, run_types.json의 쉬움 · 어려움 run만 따로 채점)]")
+            add(frame[["대상", *kind_cols]].rename(columns=lambda c: c[3:]).to_string(index=False))
     return recs
 
 
-def region_hybrid_folds(folds: list[int]) -> None:
+def region_hybrid_folds(folds: list[int], cycle: str = "region_cycle_cv", noncycle: str | None = "region_noncycle_cv",
+                        label: str = "", number: str = "1-3", summary_number: str = "1-4") -> dict[int, list[dict]]:
     """Cross-validation folds: the region pair on other validation runs, then the gain per target across folds."""
 
     by_fold = {}
     for k in folds:
-        recs = region_hybrid(f"cv{k}", f"region_cycle_cv{k}", f"region_noncycle_cv{k}", "template",
-                             f"1-3. 가상 센서 · 구간 전용 모델 합치기 · 교차검증 {k}/5")
+        recs = region_hybrid(f"cv{k}", f"{cycle}{k}", f"{noncycle}{k}" if noncycle else None, "template",
+                             f"{number}. 가상 센서 · 구간 전용 모델 합치기{label} · 교차검증 {k}/5")
         if recs:
             by_fold[k] = recs
     if len(by_fold) < 2:
-        return
+        return by_fold
     rows = [{"fold": k, **r} for k, recs in by_fold.items() for r in recs]
     frame = pd.DataFrame(rows)
     cols = [c for c in ("전체 학습 개선율", "사이클 전용 + 전체 개선율", "사이클 전용 + 사이클 밖 전용 개선율") if c in frame]
     summary = frame.groupby("대상")[cols].agg(["mean", "std", "count"]).round(1)
     gain = frame.assign(차이=frame[cols[-1]] - frame[cols[0]]).groupby("대상")["차이"].agg(["mean", "std", "min"]).round(1)
-    add(f"\n## 1-4. 구간 전용 모델 합치기 · 교차검증 {len(by_fold)}묶음 요약 (개선율 %, 묶음 평균 · 표준편차 · 묶음 수)")
+    add(f"\n## {summary_number}. 구간 전용 모델 합치기{label} · 교차검증 {len(by_fold)}묶음 요약 (개선율 %, 묶음 평균 · 표준편차 · 묶음 수)")
     add(summary.to_string())
     add("\n전체 학습 대비 늘어난 개선율 (%p, 묶음 평균 · 표준편차 · 가장 작은 묶음). "
         "평균이 표준편차의 2배를 넘고 가장 작은 묶음도 0보다 크면 확실하다.")
     add(gain.to_string())
+    return by_fold
+
+
+def cycle_window_folds(short: dict[int, list[dict]], long: dict[int, list[dict]]) -> None:
+    """Same folds, cycle model with a 32 s vs 64 s window: gain of the pair (cycle + full) over the full model."""
+
+    col = "사이클 전용 + 전체 개선율"
+    rows = [{"fold": k, "대상": r["대상"], "window": w, "개선율": r.get(col)}
+            for w, src in (("32초", short), ("64초", long)) for k, recs in src.items() if k in long and k in short
+            for r in recs]
+    frame = pd.DataFrame(rows).dropna()
+    if frame.empty or frame["window"].nunique() < 2:
+        return
+    wide = frame.pivot_table(index=["대상", "fold"], columns="window", values="개선율")
+    diff = (wide["64초"] - wide["32초"]).groupby("대상").agg(["mean", "std", "min", "count"]).round(1)
+    add("\n## 1-4w. 사이클 전용 모델 window 32초 → 64초 (사이클 전용 + 전체 개선율 차이 %p, 묶음 평균 · 표준편차 · 가장 작은 묶음)")
+    add(diff.to_string())
 
 
 # 2) 모델 평균 (주 모델 + LightGBM)
@@ -306,7 +340,12 @@ def region_mix(cycle_study: str, cycle_model: str, other_study: str, other_model
 
 region_hybrid("lc51", "region_cycle", "region_noncycle", "template",
               "1. 가상 센서 · 구간 전용 모델 합치기 (공정 전체 window에서 채점)")
-region_hybrid_folds([1, 2, 3, 4, 5])
+short_win = region_hybrid_folds([1, 2, 3, 4, 5])
+long_win = region_hybrid_folds([1, 2, 3], cycle="region_cycle_win_cv", noncycle=None, label=" (사이클 window 64초)",
+                               number="1-3w", summary_number="1-4w0")
+cycle_window_folds(short_win, long_win)
+region_hybrid("stepbin", "stepbin_cycle", None, "template",
+              "1-8. 가상 센서 · step 맞춤 1초 묶음 · 구간 전용 모델 합치기 (split_v2)")
 for h in (20, 10):
     region_hybrid(f"rw{h}", f"region_cycle_rw{h}", None, "template",
                   f"1-5. 가상 센서 · 사이클 전용 + 최근 run 가중 (반감기 {h}개, 둘 다 가중)")

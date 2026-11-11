@@ -3,6 +3,7 @@
 가상 센서: 교차검증(cv1~5) · 시간순 검증(time1~3) · 센서 하나만 고장 · 학습 run 수 곡선(lc10~51) ·
 최근 run만으로 학습(recent2~4) · 0.5초 간격 · 사이클 구간만 학습. 미래값: 예측 거리 확장(모델별).
 기본 결과(부가 실험 제외)에서는 모델별 최고 설정의 사이클 안 · 밖 개선율을, 새로 돈 작업에서는 레시피 단계별 오차를 본다.
+work/reports/run_types.json(run_drift.py가 만듦)이 있으면 run 유형(쉬움 · 어려움)별 남은 오차와 학습 run 구성의 효과(1-15 ~ 1-17)도 낸다.
 
     python scripts/side_studies.py            # 화면 출력 + work/reports/side_studies.txt
 """
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from ald_lab.ledger import collect_ledger, main_records
 from ald_lab.paths import resolve_paths
@@ -31,6 +33,15 @@ NAMES = {"persistence": "현재값 유지", "template": "레시피 평균", "sch
          "lightgbm": "LightGBM",
          "itransformer": "iTransformer", "dlinear": "DLinear", "gru": "GRU", "ridge": "Ridge"}
 MODEL_ORDER = ["patchtst", "lightgbm", "itransformer", "dlinear", "gru", "ridge"]
+_types = P.work_root / "reports" / "run_types.json"
+RUN_TYPES: dict[str, str] = ({k: v["type"] for k, v in json.loads(_types.read_text(encoding="utf-8"))["runs"].items()}
+                             if _types.is_file() else {})
+TYPE_TARGETS = ["MFCMon_DCS", "MFCMon_N2-1", "MFCMon_N2-4", "MFCMon_NH3", "ValveAct_29", "ValveAct_89", "APCValveMon", "VG11",
+                "TempAct_C"]
+SHORT = {"MFCMon_DCS": "DCS", "MFCMon_N2-1": "N2-1", "MFCMon_N2-4": "N2-4", "MFCMon_NH3": "NH3", "ValveAct_29": "V29",
+         "ValveAct_89": "V89", "APCValveMon": "APC", "VG11": "VG11", "TempAct_C": "TempC"}
+SPLIT_DIR = Path(__file__).resolve().parents[1] / "configs" / "splits"
+_splits: dict[str, dict] = {}
 
 
 def fmt(x: float) -> str:
@@ -57,6 +68,48 @@ def job_metrics(row) -> dict:
 
 def by_run(row) -> dict[str, float]:
     return job_metrics(row).get("by_run") or {}
+
+
+def experiment_split(exp_dir: str) -> dict:
+    """The split document an experiment used (train / validation run lists)."""
+
+    if exp_dir not in _splits:
+        try:
+            doc = yaml.safe_load((Path(exp_dir) / "experiment.yaml").read_text(encoding="utf-8")) or {}
+            name = str((doc.get("data") or {}).get("split", "split_v2"))
+            path = Path(name) if Path(name).suffix else SPLIT_DIR / f"{name}.yaml"
+            _splits[exp_dir] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            _splits[exp_dir] = {}
+    return _splits[exp_dir]
+
+
+def per_run(g: pd.DataFrame) -> pd.DataFrame:
+    """Recipe-mean and PatchTST (seed mean) MAE per validation run, with the run type."""
+
+    base, pt = g[g["model"] == "template"], g[g["model"] == "patchtst"]
+    if base.empty or pt.empty:
+        return pd.DataFrame()
+    rb = by_run(next(base.itertuples()))
+    rp = [by_run(r) for r in pt.itertuples()]
+    rows = []
+    for run, v in rb.items():
+        vals = [d[run] for d in rp if run in d]
+        if vals and run[-3:] != "055":
+            rows.append({"run": run, "type": RUN_TYPES.get(run), "base": v, "pt": float(np.mean(vals))})
+    return pd.DataFrame(rows)
+
+
+def remaining_by_type(r: pd.DataFrame) -> dict[str, float]:
+    """PatchTST ÷ recipe mean × 100 on the summed run errors, per run type (055 left out)."""
+
+    outv = {}
+    for kind in ("easy", "hard"):
+        k = r[r["type"] == kind] if len(r) else r
+        outv[kind] = 100 * k["pt"].sum() / k["base"].sum() if len(k) and k["base"].sum() else np.nan
+        outv[f"n_{kind}"] = len(k)
+        outv[f"base_{kind}"] = k["base"].mean() if len(k) else np.nan
+    return outv
 
 
 def summarize(g: pd.DataFrame) -> dict | None:
@@ -400,6 +453,15 @@ def cycle_windows() -> None:
     t = t.loc[sorted(set(led.loc[st == "region_cycle_win", "target"]))]
     add("\n## 1-13. 사이클만 학습 · window 길이 (PatchTST 검증 MAE, 사이클 window)")
     add(table(t))
+    folds = led[st.str.fullmatch(r"region_cycle(_win)?_cv\d") & (led["model"] == "patchtst")]
+    if len(folds) and st.str.fullmatch(r"region_cycle_win_cv\d").any():
+        f = folds.assign(fold=st[folds.index].str[-1]).groupby(["target", "fold", "context_seconds"])["mae"].mean().unstack()
+        if f.shape[1] >= 2:
+            lo, hi = f.columns.min(), f.columns.max()
+            d = (100 * (f[hi] / f[lo] - 1)).dropna().unstack().round(1)
+            d["평균"] = d.mean(axis=1).round(1)
+            add(f"\n교차검증 묶음별 window {lo:g}초 → {hi:g}초 MAE 변화 % (음수면 {hi:g}초가 나음)")
+            add(d.to_string())
 
 
 # 2-2) 장기 예측 설정 탐색
@@ -457,6 +519,99 @@ def recency_over_time() -> None:
         add(f.to_string(index=False))
 
 
+# 1-15) run 유형별 남은 오차: 1초 묶음과 step 전환 흔들림이 겹치는 '어려움' run에서 PatchTST도 못 맞추는지
+def run_type_remaining() -> None:
+    if not RUN_TYPES or not len(led):
+        return
+    vs = led[(led["task"] == "virtual_sensor") & (st != "") & led["target"].isin(TYPE_TARGETS)]
+    rows = []
+    for (study, target), g in vs.groupby([st[vs.index], "target"]):
+        r = per_run(g)
+        if r.empty or r["type"].isna().all():
+            continue
+        v = remaining_by_type(r)
+        if np.isnan(v["easy"]) and np.isnan(v["hard"]):
+            continue
+        rows.append({"study": study, "target": SHORT[target],
+                     "cell": f"{v['easy']:.0f} / {v['hard']:.0f}" if v["n_easy"] and v["n_hard"]
+                     else (f"{v['easy']:.0f} / -" if v["n_easy"] else f"- / {v['hard']:.0f}"),
+                     "runs": f"{v['n_easy']} / {v['n_hard']}"})
+    f = pd.DataFrame(rows)
+    if f.empty:
+        return
+    add("\n## 1-15. run 유형별 남은 오차 (PatchTST ÷ 레시피 평균 × 100, run 오차 합 기준 · 쉬움 / 어려움, 055 제외)")
+    add("어려움 = 1초 묶음과 step 전환 시점의 흔들림이 겹쳐 레시피 평균 오차가 큰 run (run_drift.py 4절). 값이 작을수록 PatchTST가 많이 줄임.")
+    t = f.pivot_table(index="study", columns="target", values="cell", aggfunc="first")
+    t = t.reindex(columns=[SHORT[c] for c in TYPE_TARGETS if SHORT[c] in t.columns]).fillna("")
+    t["run 수 (쉬움 / 어려움)"] = f.groupby("study")["runs"].first()
+    add(t.to_string())
+
+
+# 1-16) 학습 run 구성: 검증 run(053~067)이 같은 분할끼리, 학습 run 중 '쉬움' 비율과 PatchTST 오차
+COMPOSITION = r"(lc\d+b?|recent4(_\d+)?|early_recent|rtype_.+)"
+
+
+def run_type_composition() -> None:
+    if not RUN_TYPES or not len(led):
+        return
+    rows_ = led[st.str.fullmatch(COMPOSITION) & (led["model"] == "patchtst") & led["target"].isin(TYPE_TARGETS)]
+    recs = []
+    for (study, target), g in rows_.groupby([st[rows_.index], "target"]):
+        split = experiment_split(str(g["exp_dir"].iloc[0]))
+        train = [r for r in split.get("train") or [] if r in RUN_TYPES]
+        if not train:
+            continue
+        recs.append({"study": study, "target": SHORT[target], "mae": float(g["mae"].mean()),
+                     "학습 run": len(split.get("train") or []),
+                     "쉬움 비율 %": round(100 * np.mean([RUN_TYPES[r] == "easy" for r in train]))})
+    f = pd.DataFrame(recs)
+    if f.empty or f["study"].nunique() < 3:
+        return
+    t = f.pivot_table(index=["study", "학습 run", "쉬움 비율 %"], columns="target", values="mae")
+    t = t.reindex(columns=[SHORT[c] for c in TYPE_TARGETS if SHORT[c] in t.columns]).sort_index(level=2)
+    add("\n## 1-16. 학습 run 구성과 오차 (검증 053~067, PatchTST 검증 MAE · seed 평균, 쉬움 비율 순)")
+    add(table(t))
+    big = f[f["학습 run"] >= 20]
+    judge = []
+    for target, g in big.groupby("target"):
+        if g["study"].nunique() < 5:
+            continue
+        judge.append({"대상": target, "분할 수": len(g),
+                      "쉬움 비율 ↔ 오차 (순위 상관)": round(g[["쉬움 비율 %", "mae"]].corr("spearman").iloc[0, 1], 2),
+                      "학습 run 수 ↔ 오차 (순위 상관)": round(g[["학습 run", "mae"]].corr("spearman").iloc[0, 1], 2)})
+    if judge:
+        add("\n학습 run 20개 이상 분할만: 순위 상관이 −1에 가까우면 '쉬움' run이 많을수록 오차가 작다 (run 수보다 구성이 중요한지 본다)")
+        add(pd.DataFrame(judge).set_index("대상").reindex([SHORT[c] for c in TYPE_TARGETS]).dropna(how="all").to_string())
+
+
+# 1-17) step 맞춤 1초 묶음: 묶음 경계를 step 시작에 맞추면 run 유형 차이와 PatchTST 개선율이 어떻게 되는지
+def step_binning() -> None:
+    if not len(led) or not st.str.startswith("stepbin").any():
+        return
+    pairs = [("lc51", "stepbin")] + [(f"cv{k}", f"stepbin_cv{k}") for k in range(1, 6)]
+    recs = []
+    for ref, new in pairs:
+        for target in sorted(set(led.loc[st == new, "target"])):
+            a, b = summarize(study_rows(ref, target)), summarize(study_rows(new, target))
+            if not a or not b:
+                continue
+            rec = {"분할": new.replace("stepbin_", "") if new != "stepbin" else "split_v2", "대상": SHORT.get(target, target),
+                   "기존 개선율": round(a["gain"], 1), "step 맞춤 개선율": round(b["gain"], 1),
+                   "기존 PatchTST MAE": fmt(a["pt"]), "step 맞춤 PatchTST MAE": fmt(b["pt"]),
+                   "기존 레시피 평균 MAE": fmt(a["base"]), "step 맞춤 레시피 평균 MAE": fmt(b["base"])}
+            if RUN_TYPES:
+                for name, study in (("기존", ref), ("step 맞춤", new)):
+                    v = remaining_by_type(per_run(study_rows(study, target)))
+                    if v["n_easy"] and v["n_hard"]:
+                        rec[f"{name} 기준선 어려움÷쉬움"] = round(v["base_hard"] / v["base_easy"], 2)
+                        rec[f"{name} 남은 % 쉬움/어려움"] = f"{v['easy']:.0f} / {v['hard']:.0f}"
+            recs.append(rec)
+    if recs:
+        add("\n## 1-17. step 맞춤 1초 묶음 (묶음을 step 시작에 맞춤) vs 기존 1초 묶음 (같은 분할 · 같은 설정, 각자의 레시피 평균 대비)")
+        add("기준선 어려움÷쉬움 = 어려움 run 평균 레시피 평균 오차 ÷ 쉬움 run. 1에 가까워지면 run 유형 차이가 묶음 방식에서 왔다는 뜻이다.")
+        add(pd.DataFrame(recs).to_string(index=False))
+
+
 vs_study("cv", "1. 가상 센서 run 단위 교차검증")
 vs_study("time", "1-2. 가상 센서 시간순 검증 (앞쪽 run으로 학습 → 바로 다음 run으로 검증)")
 vs_study("single_sensor", "1-3. 가상 센서 · 센서 하나만 고장 (같은 계열 센서는 입력에 남김)")
@@ -474,6 +629,9 @@ recency_weighting()
 early_plus_recent()
 cycle_windows()
 recency_over_time()
+run_type_remaining()
+run_type_composition()
+step_binning()
 
 
 # 2) 예측 거리 확장: 모델 · window별
@@ -571,15 +729,16 @@ def by_step(rows_: pd.DataFrame, title: str, base_model: str = "template", top: 
         trained = trained[[bool(job_metrics(r).get("by_step")) for r in trained.itertuples()]]
         if trained.empty:
             continue
-        model = trained.groupby("model")["mae"].mean().idxmin()
+        model = "patchtst" if "patchtst" in set(trained["model"]) else trained.groupby("model")["mae"].mean().idxmin()
         acc: dict[str, list] = {}
         for r in trained[trained["model"] == model].itertuples():
             b = g[(g["model"] == base_model) & (g["exp_dir"] == r.exp_dir)]
             if b.empty:
                 continue
+            floor = 0.02 * float(b["mae"].iloc[0])  # steps where the signal is idle: a ratio of near-zero errors says nothing
             sb, sp = job_metrics(next(b.itertuples())).get("by_step") or {}, job_metrics(r).get("by_step") or {}
             for step, (mae, n) in sp.items():
-                if step in sb and sb[step][0]:
+                if step in sb and sb[step][0] > floor:
                     a = acc.setdefault(step, [[], [], n])
                     a[0].append(sb[step][0])
                     a[1].append(mae)
@@ -593,7 +752,8 @@ def by_step(rows_: pd.DataFrame, title: str, base_model: str = "template", top: 
         blocks.append(f"\n[{target} · {NAMES.get(model, model)} ÷ {NAMES[base_model]}]\n" + t.to_string(index=False))
     if blocks:
         add(f"\n## {title}")
-        add("window 수가 많은 단계 순. 남은 오차 %가 100을 넘는 단계는 기준선보다 못한 곳이다.")
+        add("window 수가 많은 단계 순 (PatchTST가 있으면 PatchTST). 기준선 오차가 대상 전체 기준선 오차의 2 % 미만인 단계(신호가 쉬는 단계)는 뺐다. "
+            "남은 오차 %가 100을 넘는 단계는 기준선보다 못한 곳이다.")
         out.extend(blocks)
 
 
