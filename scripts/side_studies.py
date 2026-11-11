@@ -427,6 +427,36 @@ def long_search() -> None:
         add(table(t))
 
 
+
+
+# 1-14) 시간순 검증에서도 최근 run 가중이 통하는지
+def recency_over_time() -> None:
+    rows_ = led[st.str.fullmatch(r"rw\d+_time\d")] if len(led) else led
+    if not len(rows_):
+        return
+    recs = []
+    for target in sorted(set(rows_["target"])):
+        for fold in (1, 2, 3):
+            base = summarize(study_rows(f"time{fold}", target))
+            rec = {"대상": target, "구간": fold, "가중 없음": base["pt"] if base else np.nan}
+            for h in (40, 20, 10):
+                s_ = summarize(study_rows(f"rw{h}_time{fold}", target))
+                if s_:
+                    rec[f"반감기 {h}개"] = s_["pt"]
+            vals = {k: v for k, v in rec.items() if k not in ("대상", "구간") and pd.notna(v)}
+            if len(vals) >= 2 and pd.notna(rec["가중 없음"]):
+                best = min(vals, key=vals.get)
+                rec["가장 나은 것"] = best
+                rec["가중 없음 대비 %"] = round(100 * (vals[best] / rec["가중 없음"] - 1), 1)
+                recs.append(rec)
+    if recs:
+        f = pd.DataFrame(recs)
+        cols = [c for c in ("가중 없음", "반감기 40개", "반감기 20개", "반감기 10개") if c in f]
+        f[cols] = f[cols].apply(lambda col: col.map(fmt))
+        add("\n## 1-14. 시간순 검증 구간별 최근 run 가중 (PatchTST 검증 MAE, 구간 1 · 2 · 3 = 검증 021~031 · 032~043 · 044~052)")
+        add(f.to_string(index=False))
+
+
 vs_study("cv", "1. 가상 센서 run 단위 교차검증")
 vs_study("time", "1-2. 가상 센서 시간순 검증 (앞쪽 run으로 학습 → 바로 다음 run으로 검증)")
 vs_study("single_sensor", "1-3. 가상 센서 · 센서 하나만 고장 (같은 계열 센서는 입력에 남김)")
@@ -443,6 +473,7 @@ noncycle_vs_full()
 recency_weighting()
 early_plus_recent()
 cycle_windows()
+recency_over_time()
 
 
 # 2) 예측 거리 확장: 모델 · window별

@@ -270,9 +270,54 @@ def horizon_choice(study: str, context: float, title: str) -> None:
         out.extend(blocks)
 
 
+# 1-5) 구간별로 다른 모델: 사이클 window는 A, 나머지는 B (예: PatchTST 사이클 전용 + LightGBM, 장기 예측 5~10분)
+def region_mix(cycle_study: str, cycle_model: str, other_study: str, other_model: str, baseline: str, title: str) -> None:
+    if not len(led):
+        return
+    a_rows, b_rows = led[(st == cycle_study) & (led["model"] == cycle_model)], led[(st == other_study) & (led["model"] == other_model)]
+    recs = []
+    for target in sorted(set(a_rows["target"]) & set(b_rows["target"])):
+        a, b = load(a_rows[a_rows["target"] == target]), load(b_rows[b_rows["target"] == target])
+        base = load(led[(st == other_study) & (led["model"] == baseline) & (led["target"] == target)].head(1))
+        if not a or not b or not base:
+            continue
+        idx = b[0].index.intersection(base[0].index)
+        bm, basef = seed_mean(b, idx), base[0].loc[idx]
+        am = seed_mean(a, a[0].index)
+        cyc = bm["in_cycle"].astype(bool)
+        common = idx[cyc.to_numpy()].intersection(am.index)
+        mix = bm.copy()
+        for h in horizons(mix):
+            if f"pred_{h}" in am:
+                mix.loc[common, f"pred_{h}"] = am.loc[common, f"pred_{h}"]
+        b0 = mae(basef)
+        recs.append({"대상": target, "기준선 MAE": fmt(b0),
+                     f"{NAMES.get(other_model, other_model)} 개선율": round(100 * (1 - mae(bm) / b0), 1),
+                     "구간별 조합 개선율": round(100 * (1 - mae(mix) / b0), 1),
+                     "사이클 안 (조합)": round(100 * (1 - mae(mix, cyc) / mae(basef, cyc)), 1) if mae(basef, cyc) else np.nan,
+                     "사이클 밖 (조합)": round(100 * (1 - mae(mix, ~cyc) / mae(basef, ~cyc)), 1) if mae(basef, ~cyc) else np.nan,
+                     "사이클 window 중 바꾼 비율": round(len(common) / max(1, int(cyc.sum())), 2)})
+    if recs:
+        add(f"\n## {title}")
+        add(f"사이클 window는 {NAMES.get(cycle_model, cycle_model)}({cycle_study}), 나머지는 {NAMES.get(other_model, other_model)}"
+            f"({other_study}). 기준선 = {NAMES.get(baseline, baseline)}, 학습 모델은 seed 평균 예측.")
+        add(pd.DataFrame(recs).to_string(index=False))
+
+
 region_hybrid("lc51", "region_cycle", "region_noncycle", "template",
               "1. 가상 센서 · 구간 전용 모델 합치기 (공정 전체 window에서 채점)")
 region_hybrid_folds([1, 2, 3, 4, 5])
+for h in (20, 10):
+    region_hybrid(f"rw{h}", f"region_cycle_rw{h}", None, "template",
+                  f"1-5. 가상 센서 · 사이클 전용 + 최근 run 가중 (반감기 {h}개, 둘 다 가중)")
+region_hybrid("long_horizon_mid", "long_horizon_mid_cycle", None, "schedule",
+              "1-7. 미래값 30초~2분 전용 · 사이클 전용 모델 합치기 (기준선 = 레시피 일정 평균)")
+region_mix("region_cycle", "patchtst", "lc51", "lightgbm", "template",
+           "1-6. 가상 센서 · 사이클은 PatchTST 사이클 전용, 나머지는 LightGBM")
+region_mix("long_horizon_far_cycle", "patchtst", "long_horizon_far", "lightgbm", "schedule",
+           "3-2. 미래값 5~10분 · 사이클은 PatchTST 사이클 전용, 나머지는 LightGBM")
+region_mix("long_horizon_far_cycle", "patchtst", "long_horizon_far", "schedule", "schedule",
+           "3-3. 미래값 5~10분 · 사이클은 PatchTST 사이클 전용, 나머지는 레시피 일정 평균")
 region_hybrid("fc_ref", "fc_region_cycle", None, "persistence",
               "1-2. 미래값 10~30초 · 사이클 전용 모델 합치기 (run 전체 window에서 채점)")
 model_average("lc51", "template", "2. 가상 센서 · PatchTST와 LightGBM 예측 평균 (학습 run 51개)")

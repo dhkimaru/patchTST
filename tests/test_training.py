@@ -321,7 +321,8 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
                                       ("recent4", "process", {}, 16), ("recent4_10", "process", {}, 16),
                                       ("region_cycle", "cycle", {}, 16), ("rw20", "process", {"recency_halflife_runs": 2}, 16),
                                       ("early_recent", "process", {}, 16), ("recent4_30", "process", {}, 16),
-                                      ("region_cycle_win", "cycle", {}, 8)):
+                                      ("region_cycle_win", "cycle", {}, 8), ("time1", "process", {}, 16),
+                                      ("rw10_time1", "process", {"recency_halflife_runs": 2}, 16)):
         config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, seeds=[1, 2],
                          targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": ctx},
                          train={"batch_size": 64, "max_epochs": 2, "windows_per_epoch": 256, "val_windows": 128,
@@ -338,6 +339,7 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
     assert "4. 레시피 단계별 남은 오차" in text and "TempAct_C · PatchTST" in text
     assert "1-8. 학습 기간 길이" in text and "1-9. 학습 run 수 곡선 · 두 번째 추첨" in text
     assert "1-11. 최근 run 가중 학습" in text and "반감기 20개" in text
+    assert "1-14. 시간순 검증 구간별 최근 run 가중" in text
     assert "1-12. 초기 run(001~011) 포함 효과" in text and "1-13. 사이클만 학습 · window 길이" in text and "window 8초" in text
 
 
@@ -395,12 +397,21 @@ def test_combine_predictions_script(lab, tmp_path, monkeypatch):
                      window={"context_seconds": 16, "horizons_seconds": [2, 8]},
                      models=["template", "schedule", "ridge", {"name": "lightgbm", "params": {"n_estimators": 10}}])
     assert (pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
+    tiny = {"name": "patchtst", "params": {"patch_seconds": 4, "stride_seconds": 2, "d_model": 16, "n_heads": 2,
+                                           "n_layers": 1, "d_ff": 32}}
+    for study, region, models in (("long_horizon_far", "all", ["schedule", {"name": "lightgbm", "params": {"n_estimators": 10}}]),
+                                  ("long_horizon_far_cycle", "cycle", ["schedule", tiny])):
+        config = _config(tmp_path, split_path, name=f"far_{region}", study=study, models=models,
+                         window={"context_seconds": 16, "horizons_seconds": [2, 8]},
+                         data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all"})
+        assert (pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
     monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
     runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "combine_predictions.py"), run_name="__main__")
     text = (paths.work_root / "reports" / "combine_predictions.txt").read_text(encoding="utf-8")
     assert "1. 가상 센서 · 구간 전용 모델 합치기" in text and "사이클 전용 + 사이클 밖 전용" in text
     assert "2. 가상 센서 · PatchTST와 LightGBM 예측 평균" in text
     assert "3. 미래값 30초~10분 · 예측 거리별 모델 비교와 선택" in text and "레시피 일정 평균" in text
+    assert "3-2. 미래값 5~10분 · 사이클은 PatchTST 사이클 전용, 나머지는 LightGBM" in text and "구간별 조합 개선율" in text
 
 
 def test_recency_weights_favour_recent_runs(lab, tmp_path):
@@ -430,3 +441,18 @@ def test_recency_weights_favour_recent_runs(lab, tmp_path):
     assert doc["job"]["model"] == "dlinear"
     entries = Journal(paths.journal_dir).entries()
     assert any(e.config and (e.config.get("train") or {}).get("recency_halflife_runs") == 1 for e in entries)
+
+
+def test_run_drift_script(lab, monkeypatch):
+    """scripts/run_drift.py reads the prepared train and validation bundles and reports change points per signal."""
+    import runpy
+    import sys
+
+    paths, split_path = lab
+    monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
+    monkeypatch.setenv("ALD_DATA_ROOT", str(paths.data_root))
+    monkeypatch.setattr(sys, "argv", ["run_drift.py", "--split", str(split_path)])
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "run_drift.py"), run_name="__main__")
+    text = (paths.work_root / "reports" / "run_drift.txt").read_text(encoding="utf-8")
+    assert "## 1. 변화점" in text and "VG11" in text and "레시피 평균과의 차이" in text
+    assert "006" not in text  # the test run of the synthetic split stays sealed
