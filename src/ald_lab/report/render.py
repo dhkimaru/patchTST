@@ -302,8 +302,9 @@ def _summary(data: ReportData) -> str:
     trend = overview.trend_chart(trends)
     if trend:
         out.append("<h3>PatchTST 최고 기록 추이 (일별)</h3>"
-                   '<p class="note">날짜별로 그날까지의 PatchTST 최고 기록(같은 설정의 seed 평균)을 대상 평균으로 나타냈습니다. '
-                   "낮을수록 좋습니다. 기록은 기본 실험으로만 갱신하고, 다른 분할 · 구간 · 예측 거리로 돈 부가 실험만 한 날은 "
+                   '<p class="note">가로축은 실험 시작일, 세로축은 기준선 대비 상대 오차입니다. 날짜마다 그날까지의 PatchTST 최고 기록'
+                   "(같은 설정의 seed 평균) MAE를 기준선(미래값 예측: 현재값 유지, 가상 센서: 레시피 평균) MAE로 나눠 100을 곱하고, "
+                   "대상별 값을 기하평균했습니다. 100이면 기준선과 같고, 낮을수록 좋습니다. 기록은 기본 실험으로만 갱신하고, 다른 분할 · 구간 · 예측 거리로 돈 부가 실험만 한 날은 "
                    "빈 점과 점선으로 이어 기록이 그대로임을 표시합니다(점에 마우스를 올리면 그날 부가 실험 수).</p>" + trend)
     status = _patchtst_status(data)
     if status:
@@ -2870,7 +2871,7 @@ details{{background:var(--surface);border:1px solid var(--line);border-radius:10
 svg .ov-pt{{fill:var(--s1)}} svg .ov-lgb{{fill:var(--s2)}} svg .ov-ptl{{fill:none;stroke:var(--s1);stroke-width:2.2}}
 svg .ov-pt.ov-side{{fill:var(--surface);stroke:var(--s1);stroke-width:2}} svg .ov-sidel{{stroke-dasharray:5 4;opacity:.7}}
 svg .ov-lgbl{{stroke:var(--s2);stroke-width:1.6;stroke-dasharray:5 4}} svg .ov-ref{{stroke:var(--text2);stroke-width:1.2}}
-svg .ov-gh{{fill:var(--text);font-weight:700;font-size:13px}} svg .ov-val{{fill:var(--text);font-weight:600}}
+svg .ov-gh{{fill:var(--text);font-weight:700;font-size:13px}} svg .ov-axis{{fill:var(--text2)}} svg .ov-val{{fill:var(--text);font-weight:600}}
 svg .ov-good{{fill:var(--good);font-weight:600}} svg .ov-bad{{fill:var(--critical);font-weight:600}} svg .ov-muted{{fill:var(--muted)}}
 summary{{cursor:pointer;font-weight:600;padding:4px 0}}
 .sw{{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:13px}} .sw ul{{margin:4px 0;padding-left:18px}}

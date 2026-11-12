@@ -300,7 +300,10 @@ def trend_chart(trends: dict[str, list[dict[str, Any]]]) -> str:
         def py(v: float, ybot: float = ybot, ytop: float = ytop, hi: float = hi) -> float:
             return ybot - v / hi * (ybot - ytop)
 
-        p.append(_t(8, y0 + 12, f"{title} · 대상 {pts[0]['targets']}개", "ov-gh"))
+        p.append(_t(8, y0 + 12, f"{title} · 대상 {pts[0]['targets']}개 · 기준선({TASKS[task][1]}) = 100", "ov-gh"))
+        mid = (ytop + ybot) / 2
+        p.append(_t(16, mid, "상대 오차 (기준선=100)", "tick ov-axis", "middle", f'transform="rotate(-90 16 {mid:.1f})"'))
+        p.append(_t(width - right + 8, ybot + 16, "실험 시작일", "tick ov-axis"))
         v = 0
         while v <= hi + 1e-9:
             p.append(f'<line class="grid" x1="{left}" y1="{py(v):.1f}" x2="{width - right}" y2="{py(v):.1f}"/>')
@@ -326,7 +329,7 @@ def trend_chart(trends: dict[str, list[dict[str, Any]]]) -> str:
                     p.append(_t(x, py(pt["mean"]) - 10, f"{pt['mean']:.1f}", "ov-val", "middle"))
                 p.append(_t(x, ybot + 16, f"{pt['day']:%m-%d}", "tick", "middle"))
         y0 += ph + gap
-    p.append(_t(width - 8, height - 6, "상대 오차: 기준선 = 100, 대상 기하평균 · 날짜: 실험 시작일 (부가 실험일 포함)",
-                "tick", "end"))
+    p.append(_t(width - 8, height - 6, "세로: 그날까지의 PatchTST 최고 MAE ÷ 기준선 MAE × 100, 대상 기하평균 (낮을수록 좋음) · "
+                "가로: 실험 시작일 (부가 실험일 포함)", "tick", "end"))
     p.append("</svg>")
     return "".join(p)

@@ -48,6 +48,7 @@ def test_conclusion_and_charts():
     assert chart.count('class="ov-pt"') == 3 + 1 and chart.count('class="ov-lgb"') == 2 + 1  # + legend marks
     trend = overview.trend_chart(trends)
     assert "LightGBM" in trend and "10-28" in trend and "10-29" in trend
+    assert "상대 오차 (기준선=100)" in trend and "실험 시작일" in trend and "기준선(현재값 유지) = 100" in trend
 
 
 def test_empty_ledger_draws_nothing():
