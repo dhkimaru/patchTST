@@ -584,11 +584,29 @@ def run_type_composition() -> None:
         add(pd.DataFrame(judge).set_index("대상").reindex([SHORT[c] for c in TYPE_TARGETS]).dropna(how="all").to_string())
 
 
+# 1-18) step 맞춤 묶음에서 PatchTST 설정 탐색 (patch 길이 × window)
+def stepbin_search() -> None:
+    rows_ = led[(st == "stepbin_search") & (led["model"] == "patchtst")] if len(led) else led
+    if not len(rows_):
+        return
+    rows_ = rows_.assign(설정=[f"patch {(p_ or {}).get('patch_seconds', '-')}초 · window {c:g}초"
+                              for p_, c in zip(rows_["params"], rows_["context_seconds"], strict=True)])
+    t = rows_.groupby(["target", "설정"])["mae"].agg(["mean", "std", "count"]).reset_index()
+    ref = {target: summarize(study_rows("stepbin", target)) for target in t["target"].unique()}
+    t["step 맞춤 최종 설정 대비 %"] = [round(100 * (m / ref[x]["pt"] - 1), 1) if ref.get(x) else np.nan
+                                   for x, m in zip(t["target"], t["mean"], strict=True)]
+    t[["mean", "std"]] = t[["mean", "std"]].apply(lambda c: c.map(fmt))
+    add("\n## 1-18. step 맞춤 묶음 · PatchTST 설정 탐색 (검증 MAE, seed 평균 · 표준편차 · seed 수)")
+    add("음수면 지금 최종 설정(116~119차, step 맞춤 432~435차)보다 낫다.")
+    add(t.rename(columns={"target": "대상", "mean": "MAE", "std": "seed SD", "count": "seed"}).to_string(index=False))
+
+
 # 1-17) step 맞춤 1초 묶음: 묶음 경계를 step 시작에 맞추면 run 유형 차이와 PatchTST 개선율이 어떻게 되는지
 def step_binning() -> None:
     if not len(led) or not st.str.startswith("stepbin").any():
         return
-    pairs = [("lc51", "stepbin")] + [(f"cv{k}", f"stepbin_cv{k}") for k in range(1, 6)]
+    pairs = [("lc51", "stepbin")] + [(f"cv{k}", f"stepbin_cv{k}") for k in range(1, 6)] \
+        + [(f"time{k}", f"stepbin_time{k}") for k in range(1, 4)]
     recs = []
     for ref, new in pairs:
         for target in sorted(set(led.loc[st == new, "target"])):
@@ -596,6 +614,7 @@ def step_binning() -> None:
             if not a or not b:
                 continue
             rec = {"분할": new.replace("stepbin_", "") if new != "stepbin" else "split_v2", "대상": SHORT.get(target, target),
+                   "늘어난 개선율 %p": round(b["gain"] - a["gain"], 1),
                    "기존 개선율": round(a["gain"], 1), "step 맞춤 개선율": round(b["gain"], 1),
                    "기존 PatchTST MAE": fmt(a["pt"]), "step 맞춤 PatchTST MAE": fmt(b["pt"]),
                    "기존 레시피 평균 MAE": fmt(a["base"]), "step 맞춤 레시피 평균 MAE": fmt(b["base"])}
@@ -608,8 +627,15 @@ def step_binning() -> None:
             recs.append(rec)
     if recs:
         add("\n## 1-17. step 맞춤 1초 묶음 (묶음을 step 시작에 맞춤) vs 기존 1초 묶음 (같은 분할 · 같은 설정, 각자의 레시피 평균 대비)")
-        add("기준선 어려움÷쉬움 = 어려움 run 평균 레시피 평균 오차 ÷ 쉬움 run. 1에 가까워지면 run 유형 차이가 묶음 방식에서 왔다는 뜻이다.")
-        add(pd.DataFrame(recs).to_string(index=False))
+        add("기준선 어려움÷쉬움 = 어려움 run 평균 레시피 평균 오차 ÷ 쉬움 run. 1에 가까워지면 run 유형 차이가 묶음 방식에서 왔다는 뜻이다. "
+            "원본 0.5초 값으로 같은 기준에서 다시 잰 비교는 scripts/raw_scale.py에 있다.")
+        f = pd.DataFrame(recs)
+        add(f.to_string(index=False))
+        if f["분할"].nunique() >= 3:
+            g = f.groupby("대상")["늘어난 개선율 %p"].agg(["mean", "std", "min", "count"]).round(1)
+            add("\n분할 묶음 요약 (늘어난 개선율 %p, 평균 · 표준편차 · 가장 작은 분할 · 분할 수). "
+                "seed가 학습에 실패해 레시피 평균에 머문 분할(개선율 1 % 미만)이 있으면 표준편차가 커진다.")
+            add(g.to_string())
 
 
 vs_study("cv", "1. 가상 센서 run 단위 교차검증")
@@ -632,9 +658,21 @@ recency_over_time()
 run_type_remaining()
 run_type_composition()
 step_binning()
+stepbin_search()
 
 
 # 2) 예측 거리 확장: 모델 · window별
+def variant(model: str, params) -> str:
+    """Settings that tell rows of one model apart within a study (RevIN off, LightGBM leaves)."""
+
+    params = params if isinstance(params, dict) else {}
+    if model == "lightgbm" and "num_leaves" in params:
+        return f" · 잎 {params['num_leaves']} · 최소 {params.get('min_child_samples', '-')}"
+    if str(params.get("revin", True)).lower() in ("false", "0"):
+        return " · RevIN 끔"
+    return ""
+
+
 def long_horizon() -> None:
     if not len(led):
         return
@@ -651,7 +689,9 @@ def long_horizon() -> None:
     labels = [c[4:] for c in hcols] + ["사이클 안", "사이클 밖"]
     lh = lh.assign(key=[NAMES.get(m, m) if m in ("persistence", "template", "schedule")
                         else f"{NAMES.get(m, m)} · window {c:g}초" + (f" · {dedicated[s_]}" if s_ in dedicated else "")
-                        for m, c, s_ in zip(lh["model"], lh["context_seconds"], lh["study"].astype(str), strict=True)])
+                        + variant(m, p_)
+                        for m, c, s_, p_ in zip(lh["model"], lh["context_seconds"], lh["study"].astype(str), lh["params"],
+                                                strict=True)])
     for target, g in lh.groupby("target"):
         t = g.groupby("key")[cols].mean()
         base = [k for k in ("현재값 유지", "레시피 평균", "레시피 일정 평균") if k in t.index]

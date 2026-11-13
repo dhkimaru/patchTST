@@ -86,6 +86,15 @@ def split_runs(index: pd.Index) -> tuple[set[str], set[str]]:
     return set(runs[0::2]), set(runs[1::2])
 
 
+def one_setting(rows: pd.DataFrame) -> pd.DataFrame:
+    """A study can hold several settings of one model (RevIN on/off, LightGBM leaves): keep the one with the lowest
+    validation MAE instead of averaging different settings as if they were seeds."""
+
+    if rows.empty or "settings" not in rows or rows["settings"].nunique() <= 1:
+        return rows
+    return rows[rows["settings"] == rows.groupby("settings")["mae"].mean().idxmin()]
+
+
 def pick_context(rows: pd.DataFrame, preferred: float = 192.0) -> pd.DataFrame:
     """Rows of one window length: the preferred one when present, else the most common."""
 
@@ -106,8 +115,8 @@ def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, ti
         model = main_model(fg[fg["model"].isin(set(cg["model"]))])  # a model trained both ways (PatchTST first)
         if model is None:
             continue
-        f_frames, c_frames = load(fg[fg["model"] == model]), load(cg[cg["model"] == model])
-        n_frames = load(g[(g["study"] == noncycle) & (g["model"] == model)]) if noncycle else []
+        f_frames, c_frames = load(one_setting(fg[fg["model"] == model])), load(one_setting(cg[cg["model"] == model]))
+        n_frames = load(one_setting(g[(g["study"] == noncycle) & (g["model"] == model)])) if noncycle else []
         base = load(fg[fg["model"] == baseline].head(1))
         if not f_frames or not c_frames or not base:
             continue
@@ -178,12 +187,13 @@ def region_hybrid(full: str, cycle: str, noncycle: str | None, baseline: str, ti
 
 
 def region_hybrid_folds(folds: list[int], cycle: str = "region_cycle_cv", noncycle: str | None = "region_noncycle_cv",
-                        label: str = "", number: str = "1-3", summary_number: str = "1-4") -> dict[int, list[dict]]:
+                        label: str = "", number: str = "1-3", summary_number: str = "1-4",
+                        full: str = "cv") -> dict[int, list[dict]]:
     """Cross-validation folds: the region pair on other validation runs, then the gain per target across folds."""
 
     by_fold = {}
     for k in folds:
-        recs = region_hybrid(f"cv{k}", f"{cycle}{k}", f"{noncycle}{k}" if noncycle else None, "template",
+        recs = region_hybrid(f"{full}{k}", f"{cycle}{k}", f"{noncycle}{k}" if noncycle else None, "template",
                              f"{number}. 가상 센서 · 구간 전용 모델 합치기{label} · 교차검증 {k}/5")
         if recs:
             by_fold[k] = recs
@@ -311,7 +321,9 @@ def region_mix(cycle_study: str, cycle_model: str, other_study: str, other_model
     a_rows, b_rows = led[(st == cycle_study) & (led["model"] == cycle_model)], led[(st == other_study) & (led["model"] == other_model)]
     recs = []
     for target in sorted(set(a_rows["target"]) & set(b_rows["target"])):
-        a, b = load(a_rows[a_rows["target"] == target]), load(b_rows[b_rows["target"] == target])
+        b_target = b_rows[b_rows["target"] == target]
+        a = load(one_setting(a_rows[a_rows["target"] == target]))
+        b = load(b_target.head(1) if other_model in BASE else one_setting(b_target))
         base = load(led[(st == other_study) & (led["model"] == baseline) & (led["target"] == target)].head(1))
         if not a or not b or not base:
             continue
@@ -334,7 +346,8 @@ def region_mix(cycle_study: str, cycle_model: str, other_study: str, other_model
     if recs:
         add(f"\n## {title}")
         add(f"사이클 window는 {NAMES.get(cycle_model, cycle_model)}({cycle_study}), 나머지는 {NAMES.get(other_model, other_model)}"
-            f"({other_study}). 기준선 = {NAMES.get(baseline, baseline)}, 학습 모델은 seed 평균 예측.")
+            f"({other_study}). 기준선 = {NAMES.get(baseline, baseline)}, 학습 모델은 seed 평균 예측. "
+            "같은 study에 한 모델의 설정이 여러 개면 검증 MAE가 가장 낮은 설정을 썼다(같은 검증 run으로 골라 약간 낙관적).")
         add(pd.DataFrame(recs).to_string(index=False))
 
 
@@ -345,7 +358,11 @@ long_win = region_hybrid_folds([1, 2, 3], cycle="region_cycle_win_cv", noncycle=
                                number="1-3w", summary_number="1-4w0")
 cycle_window_folds(short_win, long_win)
 region_hybrid("stepbin", "stepbin_cycle", None, "template",
-              "1-8. 가상 센서 · step 맞춤 1초 묶음 · 구간 전용 모델 합치기 (split_v2)")
+              "1-8. 가상 센서 · step 맞춤 1초 묶음 · 구간 전용 모델 합치기 (split_v2, 사이클 window 32초)")
+region_hybrid("stepbin", "stepbin_cycle_win", None, "template",
+              "1-8w. 가상 센서 · step 맞춤 1초 묶음 · 구간 전용 모델 합치기 (split_v2, 사이클 window 64초)")
+region_hybrid_folds([1, 2, 3, 4, 5], full="stepbin_cv", cycle="stepbin_cycle_cv", noncycle=None, label=" (step 맞춤)",
+                    number="1-9", summary_number="1-10")
 for h in (20, 10):
     region_hybrid(f"rw{h}", f"region_cycle_rw{h}", None, "template",
                   f"1-5. 가상 센서 · 사이클 전용 + 최근 run 가중 (반감기 {h}개, 둘 다 가중)")
@@ -355,6 +372,8 @@ region_mix("region_cycle", "patchtst", "lc51", "lightgbm", "template",
            "1-6. 가상 센서 · 사이클은 PatchTST 사이클 전용, 나머지는 LightGBM")
 region_mix("long_horizon_far_cycle", "patchtst", "long_horizon_far", "lightgbm", "schedule",
            "3-2. 미래값 5~10분 · 사이클은 PatchTST 사이클 전용, 나머지는 LightGBM")
+region_mix("long_horizon_far_cycle", "patchtst", "long_horizon_far", "template", "template",
+           "3-4. 미래값 5~10분 · 사이클은 PatchTST 사이클 전용, 나머지는 레시피 평균")
 region_mix("long_horizon_far_cycle", "patchtst", "long_horizon_far", "schedule", "schedule",
            "3-3. 미래값 5~10분 · 사이클은 PatchTST 사이클 전용, 나머지는 레시피 일정 평균")
 region_hybrid("fc_ref", "fc_region_cycle", None, "persistence",

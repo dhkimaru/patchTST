@@ -136,7 +136,7 @@ def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int, align: str 
         in_process = (ts >= start).to_numpy() & ((ts < end).to_numpy() if end is not None else True)
 
     pieces: dict[str, list[np.ndarray]] = {
-        k: [] for k in ("values", "in_cycle", "in_process", "step_key", "step_pos", "source_rows")}
+        k: [] for k in ("values", "in_cycle", "in_process", "step_key", "step_pos", "source_rows", "source_starts")}
     lengths = []
     for a, b in zip(edges[:-1], edges[1:]):
         starts = _block_starts(int(a), int(b), factor, step_change, align)
@@ -157,6 +157,7 @@ def run_arrays(frame: pd.DataFrame, columns: list[str], factor: int, align: str 
         pieces["step_key"].append(key[last])
         pieces["step_pos"].append((pos[last] // factor).astype(np.int32))
         pieces["source_rows"].append(last)  # raw row closing each block (timestamps for predictions)
+        pieces["source_starts"].append(starts)  # raw row opening each block (scoring on the 0.5 s rows)
         lengths.append(len(starts))
     if not lengths:
         raise PrepareError("run has no usable rows")

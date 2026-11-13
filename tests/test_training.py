@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -98,7 +99,8 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     bounds = np.r_[np.flatnonzero(np.r_[True, names[1:] != names[:-1]]), len(names)]
     starts = [s for a, b in pairwise(bounds) for s in range(a, b, 2)]
     last = np.r_[starts[1:], len(frame)] - 1
-    assert np.array_equal(by_step["source_rows"], last)
+    assert np.array_equal(by_step["source_rows"], last) and np.array_equal(by_step["source_starts"], starts)
+    assert np.array_equal(by_run["source_starts"], by_run["source_rows"] - 1)
     raw = frame[cols].to_numpy()
     for k in (0, 1, len(starts) // 2, len(starts) - 1):
         assert np.allclose(by_step["values"][k], raw[starts[k] : last[k] + 1].mean(axis=0), atol=1e-5)
@@ -122,6 +124,22 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert (results["status"] == "ok").all(), results.get("error")
     assert json.loads((exp_dir / results["job_dir"].iloc[-1] / "job.json").read_text())["bin_align"] == "step"
     assert any("_stepbin_" in d.name for d in (paths.work_root / "prepared").iterdir())
+    # scripts/raw_scale.py scores both groupings on the same 0.5 s rows; blocks differ only around odd steps and the gap.
+    import runpy
+
+    ref = _config(tmp_path, split_path, task="virtual_sensor", name="lc51", study="lc51", targets=["TempAct_C"],
+                  models=["template", "ridge"], window={"context_seconds": 4},
+                  data={"split": str(split_path), "sample_seconds": 1.0, "region": "process", "inputs": "all"})
+    assert (pd.read_csv(run_experiment(ref, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "raw_scale.py"), run_name="__main__")
+    finally:
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    text = (paths.work_root / "reports" / "raw_scale.txt").read_text(encoding="utf-8")
+    assert "[split_v2]" in text and "step 맞춤 ÷ 기존 1초 − 1 (%)" in text
+    line = next(x for x in text.splitlines() if x.strip().startswith("TempAct_C") and len(x.split()) == 3)
+    assert abs(float(line.split()[1])) < 5
     bad = _config(tmp_path, split_path, name="bad_align", data={"split": str(split_path), "bin_align": "cycle"})
     with pytest.raises(ConfigError):
         load_experiment(bad)
@@ -369,13 +387,14 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
                                       ("early_recent", "process", {}, 16), ("recent4_30", "process", {}, 16),
                                       ("region_cycle_win", "cycle", {}, 8), ("time1", "process", {}, 16),
                                       ("rw10_time1", "process", {"recency_halflife_runs": 2}, 16),
-                                      ("stepbin", "process", {}, 16), ("rtype_easy25", "process", {}, 16)):
+                                      ("stepbin", "process", {}, 16), ("rtype_easy25", "process", {}, 16),
+                                      ("stepbin_search", "process", {}, 16)):
         config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, seeds=[1, 2],
                          targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": ctx},
                          train={"batch_size": 64, "max_epochs": 2, "windows_per_epoch": 256, "val_windows": 128,
                                 "patience": 2, **extra},
                          data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all",
-                               "bin_align": "step" if study == "stepbin" else "run"})
+                               "bin_align": "step" if study.startswith("stepbin") else "run"})
         results = pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")
         assert (results["status"] == "ok").all(), results.get("error")
     monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
@@ -387,6 +406,7 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
     assert "1-15. run 유형별 남은 오차" in text and "TempC" in text
     assert "1-16. 학습 run 구성과 오차" in text and "rtype_easy25" in text
     assert "1-17. step 맞춤 1초 묶음" in text and "기준선 어려움÷쉬움" in text
+    assert "1-18. step 맞춤 묶음 · PatchTST 설정 탐색" in text and "patch 4초 · window 16초" in text
     assert "1-4. 학습 run 수 곡선" in text and ("줄어드는 중" in text or "포화" in text or "커짐" in text)
     assert "1-5. 최근 run 20개만으로 학습" in text and "053~067" in text
     assert "1-7. 사이클 구간만 학습" in text and "lc51" in text
