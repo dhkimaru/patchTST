@@ -131,6 +131,13 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
                   models=["template", "ridge"], window={"context_seconds": 4},
                   data={"split": str(split_path), "sample_seconds": 1.0, "region": "process", "inputs": "all"})
     assert (pd.read_csv(run_experiment(ref, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
+    # 0.5 s rows and cycle-only partners: three groupings and their region pairs on the same raw rows
+    for name, region, extra in (("res_05s", "process", {"sample_seconds": 0.5}), ("region_cycle", "cycle", {}),
+                                ("stepbin_cycle", "cycle", {"bin_align": "step"}), ("res05_cycle", "cycle", {"sample_seconds": 0.5})):
+        cfg = _config(tmp_path, split_path, task="virtual_sensor", name=name, study=name, targets=["TempAct_C"],
+                      models=["template", "ridge"], window={"context_seconds": 4},
+                      data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all", **extra})
+        assert (pd.read_csv(run_experiment(cfg, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
     os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
     try:
         runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "raw_scale.py"), run_name="__main__")
@@ -138,6 +145,9 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
         del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
     text = (paths.work_root / "reports" / "raw_scale.txt").read_text(encoding="utf-8")
     assert "[split_v2]" in text and "step 맞춤 ÷ 기존 1초 − 1 (%)" in text
+    assert "0.5초 ÷ step 맞춤 − 1 (%)" in text and "[split_v2 · 사이클만]" in text
+    hybrid = text.split("## 구간 전용 조합")[1]
+    assert all(f"{name} 조합 %" in hybrid for name in ("기존 1초", "step 맞춤", "0.5초"))
     line = next(x for x in text.splitlines() if x.strip().startswith("TempAct_C") and len(x.split()) == 3)
     assert abs(float(line.split()[1])) < 5
     bad = _config(tmp_path, split_path, name="bad_align", data={"split": str(split_path), "bin_align": "cycle"})
