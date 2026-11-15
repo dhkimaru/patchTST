@@ -84,11 +84,13 @@ def final_test_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scope", choices=("per_model", "best"), default="per_model",
                         help="per_model: 모델 종류별 최고 1개씩, best: 대상별 최고 1개")
     parser.add_argument("--gpu", default="auto", help="'0' 또는 'cpu'")
+    parser.add_argument("--targets", help="이 대상만 (쉼표 구분, 기본: 실험의 모든 대상). 최종 구성이 정해진 대상만 고른다")
     parser.add_argument("--data-root", help="CSV 폴더 (기본: $ALD_DATA_ROOT)")
     parser.add_argument("--work-root", help="출력 폴더 (기본: $ALD_WORK_ROOT 또는 ald-lab/work)")
     args = parser.parse_args(argv)
     paths = resolve_paths(data_root=args.data_root, work_root=args.work_root)
-    run_final_test(Path(args.experiment_dir), paths, device=parse_devices(args.gpu)[0], scope=args.scope)
+    targets = [t.strip() for t in args.targets.split(",") if t.strip()] if args.targets else None
+    run_final_test(Path(args.experiment_dir), paths, device=parse_devices(args.gpu)[0], scope=args.scope, targets=targets)
     return 0
 
 

@@ -150,6 +150,22 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert all(f"{name} 조합 %" in hybrid for name in ("기존 1초", "step 맞춤", "0.5초"))
     line = next(x for x in text.splitlines() if x.strip().startswith("TempAct_C") and len(x.split()) == 3)
     assert abs(float(line.split()[1])) < 5
+    # scripts/pair_test.py opens the test runs only for the chosen targets and scores the 0.5 s region pair there.
+    import sys
+
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    argv = sys.argv
+    sys.argv = ["pair_test.py", "--targets", "TempAct_C", "--model", "ridge", "--gpu", "cpu"]
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "pair_test.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    pair = (paths.work_root / "reports" / "pair_test.txt").read_text(encoding="utf-8")
+    assert "[시험 run]" in pair and "[검증 run]" in pair and "시험 조합 %" in pair
+    opened = [d for d in (paths.work_root / "experiments").glob("*/*") if (d / "test_summary.csv").is_file()]
+    assert {d.parent.name for d in opened} == {"res_05s", "res05_cycle"}
+    assert set(pd.read_csv(opened[0] / "test_summary.csv")["target"]) == {"TempAct_C"}
     bad = _config(tmp_path, split_path, name="bad_align", data={"split": str(split_path), "bin_align": "cycle"})
     with pytest.raises(ConfigError):
         load_experiment(bad)

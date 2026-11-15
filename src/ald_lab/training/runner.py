@@ -739,8 +739,12 @@ def predict_job(job_dir: Path, doc: dict[str, Any], model: Any, ws: WindowSet, b
     return model.predict(ws, idx, {"target_channels": channels})
 
 
-def run_final_test(exp_dir: Path, paths: LabPaths, *, device: str, scope: str = "per_model") -> pd.DataFrame:
-    """Score the validation-selected candidates on the sealed test runs (once, at the end)."""
+def run_final_test(exp_dir: Path, paths: LabPaths, *, device: str, scope: str = "per_model",
+                   targets: list[str] | None = None) -> pd.DataFrame:
+    """Score the validation-selected candidates on the sealed test runs (once, at the end).
+
+    ``targets`` limits the evaluation to the targets whose final configuration is decided, so an experiment that also
+    holds undecided targets does not open the test runs for them."""
 
     exp_dir = Path(exp_dir)
     summary = json.loads((exp_dir / "summary.json").read_text(encoding="utf-8"))
@@ -754,6 +758,8 @@ def run_final_test(exp_dir: Path, paths: LabPaths, *, device: str, scope: str = 
     results = results[results["status"] == "ok"]
     picks = []
     for target, group in table.groupby("target"):
+        if targets is not None and target not in targets:
+            continue
         group = group.sort_values("mae")
         if scope == "best":
             chosen = pd.concat([group[group["is_baseline"]], group[~group["is_baseline"]].head(1)])
