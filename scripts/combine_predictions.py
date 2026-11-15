@@ -365,7 +365,7 @@ region_hybrid_folds([1, 2, 3, 4, 5], full="stepbin_cv", cycle="stepbin_cycle_cv"
                     number="1-9", summary_number="1-10")
 region_hybrid("res_05s", "res05_cycle", None, "template",
               "1-11. 가상 센서 · 0.5초 간격 · 구간 전용 모델 합치기 (split_v2, 0.5초 레시피 평균 대비)")
-region_hybrid_folds([1, 2, 3], full="res05_cv", cycle="res05_cycle_cv", noncycle=None, label=" (0.5초 간격)",
+region_hybrid_folds([1, 2, 3, 4, 5], full="res05_cv", cycle="res05_cycle_cv", noncycle=None, label=" (0.5초 간격)",
                     number="1-12", summary_number="1-13")
 for h in (20, 10):
     region_hybrid(f"rw{h}", f"region_cycle_rw{h}", None, "template",

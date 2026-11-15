@@ -398,13 +398,14 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
                                       ("region_cycle_win", "cycle", {}, 8), ("time1", "process", {}, 16),
                                       ("rw10_time1", "process", {"recency_halflife_runs": 2}, 16),
                                       ("stepbin", "process", {}, 16), ("rtype_easy25", "process", {}, 16),
-                                      ("stepbin_search", "process", {}, 16)):
+                                      ("stepbin_search", "process", {}, 16), ("res05_cycle", "cycle", {}, 16),
+                                      ("res05_cycle_search", "cycle", {}, 8)):
         config = _config(tmp_path, split_path, task="virtual_sensor", name=f"vs_{study}", study=study, seeds=[1, 2],
                          targets=["TempAct_C"], models=["template", tiny], window={"context_seconds": ctx},
                          train={"batch_size": 64, "max_epochs": 2, "windows_per_epoch": 256, "val_windows": 128,
                                 "patience": 2, **extra},
-                         data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all",
-                               "bin_align": "step" if study.startswith("stepbin") else "run"})
+                         data={"split": str(split_path), "sample_seconds": 0.5 if study.startswith("res05") else 1.0,
+                               "region": region, "inputs": "all", "bin_align": "step" if study.startswith("stepbin") else "run"})
         results = pd.read_csv(run_experiment(config, paths, devices=["cpu"]) / "results.csv")
         assert (results["status"] == "ok").all(), results.get("error")
     monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
@@ -417,6 +418,7 @@ def test_side_study_summary_script(lab, tmp_path, monkeypatch, capsys):
     assert "1-16. 학습 run 구성과 오차" in text and "rtype_easy25" in text
     assert "1-17. step 맞춤 1초 묶음" in text and "기준선 어려움÷쉬움" in text
     assert "1-18. step 맞춤 묶음 · PatchTST 설정 탐색" in text and "patch 4초 · window 16초" in text
+    assert "1-19. 0.5초 간격 · 사이클만 (split_v2) · PatchTST 설정 탐색" in text and "patch 4초 · window 8초" in text
     assert "1-4. 학습 run 수 곡선" in text and ("줄어드는 중" in text or "포화" in text or "커짐" in text)
     assert "1-5. 최근 run 20개만으로 학습" in text and "053~067" in text
     assert "1-7. 사이클 구간만 학습" in text and "lc51" in text

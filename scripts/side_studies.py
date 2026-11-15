@@ -584,20 +584,25 @@ def run_type_composition() -> None:
         add(pd.DataFrame(judge).set_index("대상").reindex([SHORT[c] for c in TYPE_TARGETS]).dropna(how="all").to_string())
 
 
-# 1-18) step 맞춤 묶음에서 PatchTST 설정 탐색 (patch 길이 × window)
-def stepbin_search() -> None:
-    rows_ = led[(st == "stepbin_search") & (led["model"] == "patchtst")] if len(led) else led
+# 1-18 · 1-19) PatchTST 설정 탐색 (patch 길이 × window): 탐색 study를 같은 분할의 지금 설정 study와 비교
+def settings_search(search: str, reference: str, number: str, title: str, source: str) -> None:
+    rows_ = led[(st == search) & (led["model"] == "patchtst")] if len(led) else led
     if not len(rows_):
         return
     rows_ = rows_.assign(설정=[f"patch {(p_ or {}).get('patch_seconds', '-')}초 · window {c:g}초"
                               for p_, c in zip(rows_["params"], rows_["context_seconds"], strict=True)])
     t = rows_.groupby(["target", "설정"])["mae"].agg(["mean", "std", "count"]).reset_index()
-    ref = {target: summarize(study_rows("stepbin", target)) for target in t["target"].unique()}
-    t["step 맞춤 최종 설정 대비 %"] = [round(100 * (m / ref[x]["pt"] - 1), 1) if ref.get(x) else np.nan
-                                   for x, m in zip(t["target"], t["mean"], strict=True)]
+    ref = {target: summarize(study_rows(reference, target)) for target in t["target"].unique()}
+    t["지금 설정 대비 %"] = [round(100 * (m / ref[x]["pt"] - 1), 1) if ref.get(x) else np.nan
+                         for x, m in zip(t["target"], t["mean"], strict=True)]
+    t["지금 설정 seed SD"] = [fmt(ref[x]["pt_sd"]) if ref.get(x) else "-" for x in t["target"]]
+    # a setting is clearly better when the gap exceeds twice the larger seed SD of the two
+    t["판정"] = ["확실히 나음" if ref.get(x) and m < ref[x]["pt"] - 2 * np.nanmax([s, ref[x]["pt_sd"], 0.0]) else
+               ("확실히 나쁨" if ref.get(x) and m > ref[x]["pt"] + 2 * np.nanmax([s, ref[x]["pt_sd"], 0.0]) else "seed 편차 수준")
+               for x, m, s in zip(t["target"], t["mean"], t["std"], strict=True)]
     t[["mean", "std"]] = t[["mean", "std"]].apply(lambda c: c.map(fmt))
-    add("\n## 1-18. step 맞춤 묶음 · PatchTST 설정 탐색 (검증 MAE, seed 평균 · 표준편차 · seed 수)")
-    add("음수면 지금 최종 설정(116~119차, step 맞춤 432~435차)보다 낫다.")
+    add(f"\n## {number}. {title} · PatchTST 설정 탐색 (검증 MAE, seed 평균 · 표준편차 · seed 수)")
+    add(f"음수면 지금 설정({source})보다 낫다. 차이가 두 seed 편차 중 큰 것의 2배를 넘으면 '확실히 나음'.")
     add(t.rename(columns={"target": "대상", "mean": "MAE", "std": "seed SD", "count": "seed"}).to_string(index=False))
 
 
@@ -658,7 +663,9 @@ recency_over_time()
 run_type_remaining()
 run_type_composition()
 step_binning()
-stepbin_search()
+settings_search("stepbin_search", "stepbin", "1-18", "step 맞춤 묶음", "116~119차, step 맞춤 432~435차")
+settings_search("res05_cycle_search", "res05_cycle", "1-19", "0.5초 간격 · 사이클만 (split_v2)", "548~551차")
+settings_search("res05_cycle_search_cv1", "res05_cycle_cv1", "1-19", "0.5초 간격 · 사이클만 (교차검증 1/5)", "556~559차")
 
 
 # 2) 예측 거리 확장: 모델 · window별
