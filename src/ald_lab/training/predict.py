@@ -104,6 +104,41 @@ def predict_traces(model_dir: str | Path, files: list[Path], *, device: str = "c
     return out
 
 
+def predict_pair(full_dir: str | Path, cycle_dir: str | Path, files: list[Path], *, device: str = "cpu") -> pd.DataFrame:
+    """Region pair: the cycle-only model inside ALD cycles, the full-process model everywhere else.
+
+    Both models run on the same traces through :func:`predict_traces`. Rows inside a cycle take the cycle-only
+    prediction where that model has one (its window must lie in the cycle, so the first seconds of a cycle block
+    fall back to the full-process model), the same rule as ``scripts/raw_scale.py``. ``pred_full`` and
+    ``pred_cycle`` keep both predictions and ``model_used`` says which one ``pred`` took."""
+
+    full_dir, cycle_dir = Path(full_dir), Path(cycle_dir)
+    docs = [json.loads((d / "job.json").read_text(encoding="utf-8")) for d in (full_dir, cycle_dir)
+            if (d / "job.json").is_file()]
+    if len(docs) != 2:
+        raise PredictError("both model folders need job.json")
+    if docs[0]["job"]["target"] != docs[1]["job"]["target"]:
+        raise PredictError(f"the two models predict different targets: {docs[0]['job']['target']} / {docs[1]['job']['target']}")
+    if float(docs[0]["sample_seconds"]) != float(docs[1]["sample_seconds"]) or \
+            str(docs[0].get("bin_align", "run")) != str(docs[1].get("bin_align", "run")):
+        raise PredictError("the two models use different time grids (sample_seconds or bin_align)")
+    if experiment_for(cycle_dir).region != "cycle":
+        raise PredictError(f"{cycle_dir} is not a cycle-only model (data.region: cycle)")
+    full = predict_traces(full_dir, files, device=device)
+    cyc = predict_traces(cycle_dir, files, device=device)
+    key = ["run_id", "timestamp"]
+    preds = [c for c in full.columns if c.startswith("pred")]
+    inside = cyc[cyc["in_cycle"]][key + preds].rename(columns={c: f"{c}_cycle" for c in preds})
+    out = full.merge(inside, on=key, how="left")
+    use = out[f"{preds[0]}_cycle"].notna().to_numpy()
+    for col in preds:
+        out[f"{col}_full"] = out[col]
+        out.loc[use, col] = out.loc[use, f"{col}_cycle"]
+    out["model_used"] = np.where(use, "사이클 전용", "공정 전체")
+    out.attrs.update(full.attrs, pair=True)
+    return out
+
+
 def _unit(model_dir: Path) -> str:
     path = model_dir / "metrics_validation.json"
     if not path.is_file():
@@ -158,12 +193,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="cpu", help="'cpu' 또는 'cuda:0'")
     parser.add_argument("--html", action="store_true",
                         help="예측을 시간 순서대로 재생하는 HTML도 만든다 (<출력 CSV 이름>_player.html)")
+    parser.add_argument("--cycle-model", help="사이클 전용 모델 폴더. 주면 사이클 안은 이 모델, 나머지는 model_dir 모델로 예측한다")
     args = parser.parse_args(argv)
     files = trace_files(args.csv)
-    frame = predict_traces(args.model_dir, files, device=args.device)
+    frame = (predict_pair(args.model_dir, args.cycle_model, files, device=args.device) if args.cycle_model
+             else predict_traces(args.model_dir, files, device=args.device))
     out = Path(args.out) if args.out else Path(args.model_dir) / "predictions.csv"
     frame.to_csv(out, index=False, encoding="utf-8-sig")  # BOM: Excel opens Korean text correctly
-    print(f"{frame.attrs.get('target')}: run {len(files)}개 → 예측 {len(frame):,}행 → {out}")
+    print(f"{frame.attrs.get('target')}: run {len(files)}개 → 예측 {len(frame):,}행 → {out}"
+          + (f" (사이클 전용 모델 {int((frame['model_used'] == '사이클 전용').sum()):,}행)" if "model_used" in frame else ""))
     for line in describe_errors(frame):
         print("  " + line)
     if args.html:
@@ -185,6 +223,8 @@ def write_player(frame: pd.DataFrame, model_dir: Path, out: Path) -> Path | None
     job = doc["job"]
     model = model_card(job["model"])["name"] + ("" if job.get("label", job["model"]) == job["model"]
                                                  else f" ({job['label']})")
+    if frame.attrs.get("pair"):
+        model += " + 사이클 전용"
     items = prediction_series(frame, model=model, context=float(doc["context_steps"]) * float(doc["sample_seconds"]))
     if not items:
         return None

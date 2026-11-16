@@ -166,6 +166,36 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     opened = [d for d in (paths.work_root / "experiments").glob("*/*") if (d / "test_summary.csv").is_file()]
     assert {d.parent.name for d in opened} == {"res_05s", "res05_cycle"}
     assert set(pd.read_csv(opened[0] / "test_summary.csv")["target"]) == {"TempAct_C"}
+    # scripts/export_pair.py packages the pair; ald-predict --cycle-model combines the two models by region.
+    from ald_lab.training.predict import main as predict_main
+    from ald_lab.training.predict import predict_pair, predict_traces
+
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    sys.argv = ["export_pair.py", "--targets", "TempAct_C", "--model", "ridge", "--no-zip"]
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "export_pair.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    package = next((paths.work_root / "packages").glob("pair_*")) / "TempAct_C"
+    assert {"full", "cycle", "predict.sh", "predict.bat", "README.txt"} <= {p.name for p in package.iterdir()}
+    assert "--cycle-model" in (package / "predict.sh").read_text(encoding="utf-8")
+    trace = sorted(paths.data_root.glob("standard_trace_*.csv"))[:1]
+    pair = predict_pair(package / "full", package / "cycle", trace)
+    full = predict_traces(package / "full", trace)
+    cyc = predict_traces(package / "cycle", trace)
+    assert len(pair) == len(full) and (pair["model_used"] == "사이클 전용").any() and (pair["model_used"] == "공정 전체").any()
+    inside = cyc[cyc["in_cycle"]].set_index("timestamp")["pred"]
+    took = pair[pair["model_used"] == "사이클 전용"].set_index("timestamp")["pred"]
+    assert np.allclose(took.to_numpy(), inside.loc[took.index].to_numpy())
+    assert np.allclose(pair.loc[pair["model_used"] == "공정 전체", "pred"], full.loc[pair["model_used"] == "공정 전체", "pred"])
+    assert not pair.loc[~pair["in_cycle"], "model_used"].eq("사이클 전용").any()
+    out_csv = tmp_path / "pair_pred.csv"
+    assert predict_main([str(package / "full"), "--cycle-model", str(package / "cycle"), "--csv", str(trace[0]),
+                         "--out", str(out_csv)]) == 0
+    assert "model_used" in pd.read_csv(out_csv).columns
+    with pytest.raises(ValueError):  # the full-process model is not a cycle-only model
+        predict_pair(package / "full", package / "full", trace)
     bad = _config(tmp_path, split_path, name="bad_align", data={"split": str(split_path), "bin_align": "cycle"})
     with pytest.raises(ConfigError):
         load_experiment(bad)

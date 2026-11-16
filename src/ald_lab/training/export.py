@@ -84,6 +84,60 @@ def export_models(exp_dir: str | Path, paths: LabPaths, *, scope: str = "best", 
     return package
 
 
+def _copy_job(job_dir: Path, folder: Path) -> dict[str, Any]:
+    """Copy one job's weights and settings into ``folder`` (with its experiment.yaml, so ald-predict finds it)."""
+
+    folder.mkdir(parents=True)
+    for name in PACKAGE_FILES:
+        if (job_dir / name).is_file():
+            shutil.copyfile(job_dir / name, folder / name)
+    shutil.copyfile(job_dir.parent.parent / "experiment.yaml", folder / "experiment.yaml")
+    doc = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+    (folder / "inputs.txt").write_text("\n".join(doc.get("inputs", [])) + "\n", encoding="utf-8")
+    return doc
+
+
+def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path, *, note: str = "") -> Path:
+    """Package a region pair for one virtual-sensor target: ``full/`` (full-process model) and ``cycle/``
+    (cycle-only model) plus predict.sh / predict.bat that run ``ald-predict --cycle-model``."""
+
+    full_job, cycle_job, out_dir = Path(full_job), Path(cycle_job), Path(out_dir)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    docs = {"full": _copy_job(full_job, out_dir / "full"), "cycle": _copy_job(cycle_job, out_dir / "cycle")}
+    target = docs["full"]["job"]["target"]
+    if docs["cycle"]["job"]["target"] != target:
+        raise ValueError(f"different targets: {target} / {docs['cycle']['job']['target']}")
+    if experiment_for(out_dir / "cycle").region != "cycle":
+        raise ValueError(f"{cycle_job} is not a cycle-only job (data.region: cycle)")
+    sh = _PREDICT_SH.replace("__LAB__", str(PROJECT_ROOT)).replace(
+        '"$HERE" --csv', '"$HERE/full" --cycle-model "$HERE/cycle" --csv')
+    bat = _PREDICT_BAT.replace('"%HERE%." --csv', '"%HERE%full" --cycle-model "%HERE%cycle" --csv')
+    assert "--cycle-model" in sh and "--cycle-model" in bat
+    (out_dir / "predict.sh").write_text(sh, encoding="utf-8")
+    (out_dir / "predict.sh").chmod(0o755)
+    (out_dir / "predict.bat").write_text(bat, encoding="ascii", newline="\r\n")
+    lines = [f"ALD 가상 센서 구간 전용 조합 — {target}", "",
+             "사이클 안은 사이클 전용 모델(cycle/), 나머지 구간은 공정 전체 모델(full/)의 예측을 쓴다.",
+             "사이클 전용 모델의 window가 아직 사이클 안에 다 들어오지 않은 첫 몇 초는 공정 전체 모델을 쓴다.", ""]
+    for part, job in (("full", full_job), ("cycle", cycle_job)):
+        doc = docs[part]
+        val = json.loads((job / "metrics_validation.json").read_text(encoding="utf-8")).get("result", {}) \
+            if (job / "metrics_validation.json").is_file() else {}
+        lines.append(f"- {part}/: {doc['job'].get('label', doc['job']['model'])} · seed {doc['job'].get('seed')} · "
+                     f"{float(doc['sample_seconds']):g}초 간격 · 실험 {job.parent.parent.parent.name}/{job.parent.parent.name}"
+                     + (f" · 검증 MAE {val['mae']:.4g}" if val.get("mae") is not None else ""))
+    lines += ["", "[실행]",
+              "- 서버:    bash predict.sh <trace CSV 파일 또는 폴더> [출력 CSV] [cpu|cuda:0]",
+              "- Windows: predict.bat <trace CSV 파일 또는 폴더> [출력 CSV]   (ald-lab이 설치된 Python 필요)",
+              "- 출력 CSV: pred(조합) · pred_full · pred_cycle · model_used(어느 모델을 썼는지), 실측이 있으면 actual",
+              "- 재생 화면: <출력 CSV 이름>_player.html"]
+    if note:
+        lines += ["", note]
+    (out_dir / "README.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_dir
+
+
 def _export_thickness(cfg: Any, paths: LabPaths, doc: dict[str, Any], folder: Path, *, smoke: bool) -> None:
     import joblib
 
