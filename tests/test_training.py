@@ -150,6 +150,24 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert all(f"{name} 조합 %" in hybrid for name in ("기존 1초", "step 맞춤", "0.5초"))
     line = next(x for x in text.splitlines() if x.strip().startswith("TempAct_C") and len(x.split()) == 3)
     assert abs(float(line.split()[1])) < 5
+    # CV folds where the 1 s grouping has no cycle-only partner (R.PWR, P.POS): the summary compares the 0.5 s pair with
+    # the 1 s full-process model, the final setting of those targets.
+    for k in (1, 2):
+        for name, region, extra in ((f"cv{k}", "process", {}), (f"res05_cv{k}", "process", {"sample_seconds": 0.5}),
+                                    (f"res05_cycle_cv{k}", "cycle", {"sample_seconds": 0.5})):
+            cfg = _config(tmp_path, split_path, task="virtual_sensor", name=name, study=name, targets=["TempAct_C"],
+                          models=["template", "ridge"], window={"context_seconds": 4},
+                          data={"split": str(split_path), "sample_seconds": 1.0, "region": region, "inputs": "all", **extra})
+            assert (pd.read_csv(run_experiment(cfg, paths, devices=["cpu"]) / "results.csv")["status"] == "ok").all()
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "raw_scale.py"), run_name="__main__")
+    finally:
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    text = (paths.work_root / "reports" / "raw_scale.txt").read_text(encoding="utf-8")
+    assert "[교차검증 1]" in text.split("## 구간 전용 조합")[1]
+    summary = text.split("교차검증 묶음 요약")[1]
+    assert "0.5초 조합 ÷ 1초 공정 전체 − 1 (%)" in summary and "TempAct_C" in summary
     # scripts/pair_test.py opens the test runs only for the chosen targets and scores the 0.5 s region pair there.
     import sys
 
@@ -196,6 +214,18 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert "model_used" in pd.read_csv(out_csv).columns
     with pytest.raises(ValueError):  # the full-process model is not a cycle-only model
         predict_pair(package / "full", package / "full", trace)
+    # scripts/vg11_steps.py splits the pair's error by step and run on validation and (reused) test runs, no training.
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    sys.argv = ["vg11_steps.py", "--target", "TempAct_C", "--model", "ridge", "--gpu", "cpu", "--top", "5"]
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "vg11_steps.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    steps = (paths.work_root / "reports" / "vg11_steps.txt").read_text(encoding="utf-8")
+    for part in ("[구간 요약]", "[검증 run · 사이클 밖 step별]", "[시험 run · 사이클 밖 step별]", "[검증 → 시험, 같은 step]",
+                 "[전환 직후 3초 · 사이클 밖]", "[run별 · 사이클 밖]", "순위 상관"):
+        assert part in steps, part
     bad = _config(tmp_path, split_path, name="bad_align", data={"split": str(split_path), "bin_align": "cycle"})
     with pytest.raises(ConfigError):
         load_experiment(bad)

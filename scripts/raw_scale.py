@@ -250,9 +250,9 @@ for split, entries in HYBRIDS:
             full_study, cyc_study = pick(full_slot, target), pick(cyc_slot, target)
             full_item = load_study(full_study, target) if full_study else None
             cyc_item = load_study(cyc_study, target) if cyc_study else None
-            if full_item and cyc_item:
+            if full_item:  # a grouping without a cycle-only partner still gives its full-process value
                 loaded[name] = {"full": full_item, "cycle": cyc_item}
-        if len(loaded) < 2:
+        if len(loaded) < 2 or not any(v["cycle"] for v in loaded.values()):
             continue
         common = common_rows([job for v in loaded.values() for job in (*v["full"]["model"], *v["full"]["base"])])
         if not common:
@@ -260,16 +260,17 @@ for split, entries in HYBRIDS:
         rec = {"분할": split, "대상": target}
         ref = None
         for name, v in loaded.items():
-            fulls, cycles = v["full"]["model"], v["cycle"]["model"]
-            pairs = [hybrid(fj, cycles[min(i, len(cycles) - 1)]) for i, fj in enumerate(fulls)]
+            fulls = v["full"]["model"]
+            cycles = v["cycle"]["model"] if v["cycle"] else []
+            pairs = [hybrid(fj, cycles[min(i, len(cycles) - 1)]) for i, fj in enumerate(fulls)] if cycles else []
             base = score(v["full"]["base"][0], common, target)
             ref = base if ref is None else ref
-            rec[f"{name} 조합"] = float(np.mean([score(p, common, target) for p in pairs]))
+            rec[f"{name} 조합"] = float(np.mean([score(p, common, target) for p in pairs])) if pairs else np.nan
             rec[f"{name} 공정 전체"] = float(np.mean([score(j, common, target) for j in fulls]))
             rec[f"{name} 레시피 평균"] = base
             rec[f"{name} seed"] = f"{len(fulls)}/{len(cycles)}"
-            rec[f"{name} 사이클 window"] = v["cycle"]["window"]
-            if RUN_TYPES:
+            rec[f"{name} 사이클 window"] = v["cycle"]["window"] if v["cycle"] else None
+            if RUN_TYPES and pairs:
                 for kind, kname in (("easy", "쉬움"), ("hard", "어려움")):
                     rec[f"{name} 조합 {kname}"] = float(np.mean([score(p, common, target, kind) for p in pairs]))
         rec["기준"] = ref
@@ -280,7 +281,7 @@ if hrecs:
     add("\n## 구간 전용 조합 · 원본 0.5초 값 (사이클 안은 사이클 전용 모델, 나머지는 공정 전체 모델)")
     add("묶음 방식마다 공정 전체 모델과 사이클 전용 모델을 합쳐 같은 0.5초 행에서 잰 남은 오차(%)다. 100 = 첫 묶음 방식"
         "(보통 기존 1초)의 레시피 평균. seed는 공정 전체 / 사이클 전용 seed 수(seed끼리 짝지어 합친 뒤 평균).")
-    names = [n for n in ("기존 1초", "step 맞춤", "0.5초") if f"{n} 조합" in h]
+    names = [n for n in ("기존 1초", "step 맞춤", "0.5초") if f"{n} 공정 전체" in h]
     for split, g in h.groupby("분할", sort=False):
         table = pd.DataFrame({"대상": g["대상"]})
         for name in names:
@@ -313,9 +314,18 @@ if hrecs:
                 if d.notna().sum() > 1:
                     row["0.5초 ÷ step 맞춤 − 1 (%)"] = f"{d.mean():.1f} ± {d.std():.1f}"
                     row["가장 큰 값"] = round(d.max(), 1)
+            if {"기존 1초", "0.5초"} <= set(names):
+                # Targets whose final setting is still the 1 s full-process model (R.PWR, P.POS, ...)
+                v = 100 * g["기존 1초 공정 전체"] / g["기준"]
+                row["기존 1초 공정 전체 %"] = f"{v.mean():.1f} ± {v.std():.1f}" if v.notna().sum() > 1 else "-"
+                d = 100 * (g["0.5초 조합"] / g["기존 1초 공정 전체"] - 1)
+                if d.notna().sum() > 1:
+                    row["0.5초 조합 ÷ 1초 공정 전체 − 1 (%)"] = f"{d.mean():.1f} ± {d.std():.1f}"
+                    row["가장 큰 값 (1초 대비)"] = round(d.max(), 1)
             rows.append(row)
         add("\n교차검증 묶음 요약 (조합의 남은 오차 %, 묶음 평균 ± 표준편차). 0.5초 ÷ step 맞춤 − 1이 음수이고 가장 큰 값도 "
-            "0보다 작으면 모든 묶음에서 0.5초 조합이 원본 값 기준으로 더 정확하다.")
+            "0보다 작으면 모든 묶음에서 0.5초 조합이 원본 값 기준으로 더 정확하다. 1초 공정 전체가 지금 최종 설정인 대상은 "
+            "'0.5초 조합 ÷ 1초 공정 전체 − 1'을 같은 기준으로 읽는다.")
         add(pd.DataFrame(rows).to_string(index=False))
 
 text = "\n".join(out).strip() if out else "비교할 실험(같은 분할의 기존 묶음 · step 맞춤 · 0.5초)이 아직 없습니다."
