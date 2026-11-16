@@ -92,6 +92,15 @@ PEALD SiN(DCS/NH3) 배치 장비의 공정 trace 데이터를 분석하여, 장�
 
 </details>
 
+### 실험 방향 (1~629차, 11-16 기준)
+
+차수 구간마다 확인하려는 것 · 바꿔 본 것 · 결과 · 판정을 한 행으로 모았다. 같은 주제는 다른 단계의 차수도 한 행에 있다.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/results_flow_dark.svg">
+  <img src="docs/images/results_flow_light.svg" width="100%" alt="실험 방향 한눈에 보기: 차수 구간별 확인하려는 것, 바꿔 본 것, 결과, 판정">
+</picture>
+
 ### 지금까지의 추이
 
 <picture>
