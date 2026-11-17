@@ -131,6 +131,7 @@ def test_report_is_self_contained(lab, tmp_path):  # noqa: F811
     assert "VG11" in html and "만들어짐" in html and "&lt;b&gt;escaped&lt;/b&gt;" in html
     summary = html.split('<section id="summary"')[1].split("</section>")[0]  # 요약: conclusion first, tables folded
     assert "현재 결론" in summary and "미학습 1개" in summary and "<details><summary>과제별 최고 성능" in summary
+    assert "모델을 만들며 확인한 점" in summary  # hand-written lessons (configs/plan/lessons.yaml)
     # the README roadmap, both themes inlined (CSS shows one); left out when the figure files are missing
     assert "실험 로드맵" in summary and summary.count("<svg") >= 2 and 'class="rm-light"' in summary and 'class="rm-dark"' in summary
     assert overview.roadmap_figure(tmp_path) == ""

@@ -34,15 +34,17 @@ def test_conclusion_and_charts():
     assert days == ["10-28", "10-29"]  # 10-27 has only baselines; the line starts once every target has a record
     assert trends["forecast"][0]["mean"] > trends["forecast"][1]["mean"]
     assert abs(trends["forecast"][1]["mean"] - overview.geo_mean([30, 40, 110])) < 1e-9
-    points = overview.conclusion_points(dec, trends, [("thk_mean", "LightGBM", 17.2), ("wtow_pct", "LightGBM", 28.9)])
+    points = overview.conclusion_points(dec, [("thk_mean", "LightGBM", 17.2), ("wtow_pct", "LightGBM", 28.9)])
     text = " ".join(points)
-    assert "3개 대상 중 2개 PatchTST 채택" in text and "seed 1개로 편차 미확인" in text and "다른 모델 검토 1개" in text
-    assert "LightGBM(참고) 대비 우위 1/2개 (열세: A)" in text
-    assert "최근 실험일(10-29)" in text and "(−" in text and "17~29 %" in text
+    cut = 100 - overview.geo_mean([30, 40, 110])  # remaining error of A, B, C against the baseline
+    assert f"PatchTST 2/3개 채택, 기준선(현재값 유지) 대비 오차 평균 {cut:.0f}% 감소" in text
+    assert "seed 반복 확인 필요 1개" in text and "다른 모델 검토 1개" in text
+    assert "LightGBM보다 나은 대상 1/2개" in text and "열세" not in text and "17~29%" in text
+    assert "최근 실험일" not in text and ">A<" not in text and ": A" not in text  # no target names, no day lines
     assert overview.side_study_note(ledger) is None  # no side studies in this ledger
     side = pd.concat([ledger, ledger.tail(1).assign(study="lc20", exp_dir="x", when=pd.Timestamp("2025-11-09 08:00"))])
     note = overview.side_study_note(side)
-    assert note and "최근 실행 11-09" in note and "학습 run 수" in note
+    assert note and "부가 실험 1회(최근 11-09)" in note and "lc20" not in note
     chart = overview.target_chart(dec)
     assert 'aria-label="대상별 상대 오차' in chart and "대안 필요" in chart and "seed 1개" in chart
     assert chart.count('class="ov-pt"') == 3 + 1 and chart.count('class="ov-lgb"') == 2 + 1  # + legend marks
@@ -54,11 +56,23 @@ def test_conclusion_and_charts():
 def test_empty_ledger_draws_nothing():
     empty = pd.DataFrame()
     assert overview.decisions(empty) == {} and overview.target_chart({}) == "" and overview.trend_chart({}) == ""
-    assert overview.conclusion_points({}, {}) == []
+    assert overview.conclusion_points({}) == []
+
+
+def test_lessons_file_reads_plainly():
+    """configs/plan/lessons.yaml: a date, a few short takeaways, plain names instead of signal (column) names."""
+    import re
+
+    as_of, points = overview.lessons()
+    assert as_of and 3 <= len(points) <= 6
+    for title, text in points:
+        assert title and text and len(text) <= 160, title
+        assert not re.search(r"MFCMon|TempAct|AUXMon|APCValveMon|ValveAct|VG11|PressAct|_", title + text), title
+        assert " — " not in text and " · " not in text, title
 
 
 def test_side_study_days_extend_the_trend_without_changing_the_record():
-    """Days with only side studies show on the trend (record carried over) and in the latest-day sentence."""
+    """Days with only side studies show on the trend (record carried over) but not in the conclusion lines."""
     ledger = _ledger()
     side = pd.DataFrame([_row("A", "patchtst", 0.01, "2026-10-31 08:00", exp="s1"),  # better, but a side study
                          _row("B", "template", 1.0, "2026-11-02 08:00", exp="s2")]).assign(study=["cv1", "lc20"])
@@ -68,7 +82,7 @@ def test_side_study_days_extend_the_trend_without_changing_the_record():
     assert [p["day"].strftime("%m-%d") for p in pts] == ["10-28", "10-29", "10-31", "11-02"]
     assert [p["side"] for p in pts] == [False, False, True, True] and pts[2]["side_runs"] == 1
     assert pts[2]["mean"] == pts[3]["mean"] == pts[1]["mean"]  # the side study's 0.01 does not enter the record
-    text = " ".join(overview.conclusion_points(dec, {"forecast": pts}))
-    assert "최근 실험일(11-02) 미래값 예측: 부가 실험만 진행" in text and "마지막 기본 실험 10-29" in text
+    text = " ".join(overview.conclusion_points(dec))
+    assert "PatchTST 2/3개 채택" in text  # the side study's 0.01 does not change the decision line either
     chart = overview.trend_chart({"forecast": pts})
     assert "11-02" in chart and "ov-side" in chart and "부가 실험만 한 날" in chart and "부가 실험 1회" in chart

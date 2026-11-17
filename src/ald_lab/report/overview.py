@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import yaml
 
 from .. import stages
 from ..ledger import main_records
@@ -106,86 +107,66 @@ def _names(rows: list[Any], limit: int = 4) -> str:
     return ", ".join(names) + (f" 외 {len(rows) - limit}개" if len(rows) > limit else "")
 
 
-def conclusion_points(dec: dict[str, pd.DataFrame], trends: dict[str, list[dict[str, Any]]],
-                      thickness: list[tuple[str, str, float]] = ()) -> list[str]:
-    """Plain sentences (HTML) for the top of the 요약 tab: what is decided, how large the gain is, where PatchTST
-    still trails LightGBM, and what changed on the last day."""
+def conclusion_points(dec: dict[str, pd.DataFrame], thickness: list[tuple[str, str, float]] = ()) -> list[str]:
+    """One short line per task for the top of the 요약 tab: how many targets PatchTST keeps, the average error cut
+    against the baseline (geometric mean of remaining error over the targets) and, for reference, how many targets
+    it beats LightGBM on. No target names; the per-target picture is the chart below."""
 
     out = []
     for task, frame in dec.items():
         title, base_name = TASKS[task]
-        n = len(frame)
         keep = frame[frame["decision"] == "keep"]
+        notes = []
         unsure = int((keep["patch_seeds"] < 2).sum())
         fallback, missing = int((frame["decision"] == "fallback").sum()), int((frame["decision"] == "missing").sum())
-        head = f"<b>{title}</b>: {n}개 대상 중 {len(keep)}개 PatchTST 채택"
-        tail = []
         if unsure:
-            tail.append("모두 seed 1개로 편차 미확인" if unsure == len(keep) else f"{unsure}개는 seed 1개로 편차 미확인")
+            notes.append(f"seed 반복 확인 필요 {unsure}개")
         if fallback:
-            tail.append(f"다른 모델 검토 {fallback}개")
+            notes.append(f"다른 모델 검토 {fallback}개")
         if missing:
-            tail.append(f"미학습 {missing}개")
-        text = head + (f" ({' · '.join(tail)})" if tail else "")
+            notes.append(f"미학습 {missing}개")
+        text = f"<b>{title}</b>: PatchTST {len(keep)}/{len(frame)}개 채택"
         scored = _scored(frame)
-        gains = [r.patch_gain_pct for r in scored if _ok(r.patch_gain_pct)]
-        if gains:
-            weakest = min(scored, key=lambda r: r.patch_gain_pct if _ok(r.patch_gain_pct) else math.inf)
-            text += (f"<br>기준선({base_name}) 대비 오차 {min(gains):.0f}~{max(gains):.0f} % 감소 "
-                     f"(최소: {escape(weakest.target)} {weakest.patch_gain_pct:.0f} %)")
+        left = [remaining(r.patch_mae, r.baseline_mae) for r in scored]
+        if left:
+            text += f", 기준선({base_name}) 대비 오차 평균 {100 - geo_mean(left):.0f}% 감소"
         with_lgbm = [r for r in scored if _ok(r.lgbm_mae)]
-        behind = sorted((r for r in with_lgbm if r.patch_mae > r.lgbm_mae), key=lambda r: -r.patch_mae / r.lgbm_mae)
         if with_lgbm:
-            text += f"<br>LightGBM(참고) 대비 우위 {len(with_lgbm) - len(behind)}/{len(with_lgbm)}개"
-            text += f" (열세: {escape(_names(behind))})" if behind else ""
-        out.append(text)
-    for task, points in trends.items():
-        main = [pt for pt in points if not pt.get("side")]
-        if points and points[-1].get("side") and main and _ok(points[-1]["mean"]):
-            last = points[-1]
-            out.append(f"최근 실험일({last['day']:%m-%d}) {TASKS[task][0]}: 부가 실험만 진행, 기본 기록 {last['mean']:.1f} 유지 "
-                       f"(마지막 기본 실험 {main[-1]['day']:%m-%d})")
-        elif len(main) >= 2 and _ok(main[-1]["mean"]) and _ok(main[-2]["mean"]):
-            last, prev = main[-1], main[-2]
-            change = 100 * (last["mean"] / prev["mean"] - 1)
-            if abs(change) > 0.05:
-                out.append(f"최근 실험일({last['day']:%m-%d}) {TASKS[task][0]} 상대 오차(대상 평균) "
-                           f"{prev['mean']:.1f} → {last['mean']:.1f} ({change:+.0f} %)".replace("+-", "−").replace("(-", "(−"))
-            else:
-                out.append(f"최근 실험일({last['day']:%m-%d}) {TASKS[task][0]} 기록 변동 없음 ({last['mean']:.1f})")
+            ahead = sum(1 for r in with_lgbm if r.patch_mae <= r.lgbm_mae)
+            text += f" (LightGBM보다 나은 대상 {ahead}/{len(with_lgbm)}개)"
+        out.append(text + (f". {', '.join(notes)}" if notes else ""))
     if thickness:
         best = max(thickness, key=lambda t: t[2])
         low = min(t[2] for t in thickness)
-        out.append(f"<b>두께 예측(VM)</b>: PatchTST 적용 대상 아님. 최고 모델 {escape(best[1])}, 학습 평균 대비 "
-                   f"{low:.0f}~{best[2]:.0f} % 개선 (leave-one-run-out)")
-    if dec:
-        out.append("모든 수치는 검증 run 기준이며, 시험 run은 최종 후보 확정 후 1회만 평가")
+        out.append(f"<b>두께 예측</b>: run 수가 적어 딥러닝 대신 고전 ML 사용. 최고 모델 {escape(best[1])}, "
+                   f"학습 평균 대비 {low:.0f}~{best[2]:.0f}% 개선")
     return out
 
 
-STUDY_NAMES = (  # study prefix → what the side study checks (요약 tab line)
-    ("cv", "교차검증"), ("time", "시간순 검증"), ("single_sensor", "센서 하나 고장"), ("long_horizon", "예측 거리 확장"),
-    ("lc", "학습 run 수"), ("recent", "최근 run 학습"), ("res_05s", "0.5초 간격"), ("region_", "구간 전용 학습"),
-    ("fc_", "미래값 구간 전용 학습"), ("rw", "최근 run 가중 학습"), ("early_recent", "초기 + 최근 run"),
-)
+def lessons(root: Path = PROJECT_ROOT) -> tuple[str, list[tuple[str, str]]]:
+    """'모델을 만들며 확인한 점' (``configs/plan/lessons.yaml``): hand-written takeaways, updated with the README each
+    round. Returns (as of, [(title, text)]); empty when the file is missing."""
+
+    path = root / "configs" / "plan" / "lessons.yaml"
+    if not path.is_file():
+        return "", []
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    points = [(str(p["title"]).strip(), str(p["text"]).strip()) for p in doc.get("points") or []
+              if isinstance(p, dict) and p.get("title") and p.get("text")]
+    return str(doc.get("as_of") or "").strip(), points
 
 
 def side_study_note(ledger: pd.DataFrame) -> str | None:
-    """One line for the 요약 tab: side studies run since (date, count, kinds), which the decisions above leave out."""
+    """One short line under 현재 결론: how many side-study runs there are and the latest one; they stay out of the
+    decisions and the record above."""
 
     if not len(ledger) or "study" not in ledger:
         return None
     side = ledger[ledger["study"].fillna("").astype(str) != ""]
     if not len(side) or "when" not in side or side["when"].isna().all():
         return None
-    kinds: list[str] = []
-    for study in side["study"].astype(str).unique():
-        name = next((n for prefix, n in STUDY_NAMES if study.startswith(prefix)), study)
-        if name not in kinds:
-            kinds.append(name)
-    last = side["when"].max()
-    return (f"부가 실험(채택 판정 · 기록 갱신에서 제외): 최근 실행 {last:%m-%d} · 실행 {side['exp_dir'].nunique()}회 "
-            f"({escape(' · '.join(kinds))}). 결과는 Hyper Parameter ⑦ 누적 기록과 하이퍼파라미터 탐색 탭의 탐색 결과에 있음")
+    return (f"부가 실험 {side['exp_dir'].nunique()}회(최근 {side['when'].max():%m-%d})는 채택 판정과 기록에서 빼고 "
+            "누적 기록 탭에만 넣음")
 
 
 # ----------------------------------------------------------------------------- charts

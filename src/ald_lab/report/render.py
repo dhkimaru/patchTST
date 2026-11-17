@@ -286,13 +286,22 @@ def _summary(data: ReportData) -> str:
                    f'학습 시간 {hours:.0f}시간 (대시보드 탐색 포함) · 실험이 끝날 때마다 갱신</p>')
     if data.notes:
         out.append('<h3>오늘 메모</h3><ul>' + "".join(f"<li>{e(n)}</li>" for n in data.notes) + "</ul>")
-    points = overview.conclusion_points(dec, trends, thickness)
-    side = overview.side_study_note(ledger)
-    if side:
-        points.append(side)
-    if points:
-        out.append('<h3>현재 결론</h3><div class="concl"><ul>' + "".join(f"<li>{p}</li>" for p in points)
-                   + "</ul></div>")
+    points = overview.conclusion_points(dec, thickness)
+    as_of, learned = overview.lessons()
+    if points or learned:
+        box = '<h3>현재 결론 - 성능 현황과 모델 개발에서 확인한 점</h3><div class="concl">'
+        if points:
+            box += "<ul>" + "".join(f"<li>{p}</li>" for p in points) + "</ul>"
+        if learned:
+            box += (f'<p class="sub">모델을 만들며 확인한 점{f" ({e(as_of)} 기준)" if as_of else ""}</p><ul>'
+                    + "".join(f"<li><b>{e(t)}</b>: {e(x)}</li>" for t, x in learned) + "</ul>")
+        out.append(box + "</div>")
+        notes = ["성능 수치는 검증 run 기준이고, 시험 run은 최종 후보에서만 확인"] if dec else []
+        side = overview.side_study_note(ledger)
+        if side:
+            notes.append(side)
+        if notes:
+            out.append('<p class="note">' + ". ".join(notes) + ".</p>")
     chart = overview.target_chart(dec)
     if chart:
         out.append("<h3>대상별 성능 - 기준선 대비 상대 오차</h3>"
