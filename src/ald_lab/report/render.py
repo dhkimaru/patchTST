@@ -306,6 +306,12 @@ def _summary(data: ReportData) -> str:
                    "(같은 설정의 seed 평균) MAE를 기준선(미래값 예측: 현재값 유지, 가상 센서: 레시피 평균) MAE로 나눠 100을 곱하고, "
                    "대상별 값을 기하평균했습니다. 100이면 기준선과 같고, 낮을수록 좋습니다. 기록은 기본 실험으로만 갱신하고, 다른 분할 · 구간 · 예측 거리로 돈 부가 실험만 한 날은 "
                    "빈 점과 점선으로 이어 기록이 그대로임을 표시합니다(점에 마우스를 올리면 그날 부가 실험 수).</p>" + trend)
+    roadmap = overview.roadmap_figure()
+    if roadmap:
+        out.append("<h3>실험 로드맵 - 실험별 결과와 다음 실험의 연결 (README와 함께 갱신)</h3>"
+                   '<p class="note">각 실험에서 나온 결과와, 그 결과에 따라 이어진 다음 실험을 한 장에 정리했습니다. '
+                   "화살표 위 문구는 다음 실험으로 넘어간 이유이고, 카드 오른쪽 위 표시는 그 실험의 판정입니다. "
+                   "자동 집계가 아니라 차수가 끝날 때마다 README 그림과 함께 직접 갱신합니다.</p>" + roadmap)
     status = _patchtst_status(data)
     if status:
         out.append("<details><summary>PatchTST 현황 - 대상별 성능 및 채택 여부 (실험 완료 시 갱신)</summary>"
@@ -1181,7 +1187,7 @@ MODULE_ROLES = {
     "report.player": "추론 재생기 (추론 시연 탭 · ald-predict --html)",
     "launch": "대기열·작업자: 대시보드에서 고른 설정으로 학습 (ald-queue)", "ledger": "누적 기록: 모든 실행의 설정과 결과",
     "stages": "모델 선정 단계: 탐색 순위 · 전체 적용 · 대안 판정", "server": "실험실 서버: 보고서 + 하이퍼파라미터 탐색 (ald-lab-server)",
-    "report.lab": "하이퍼파라미터 탐색 탭", "report.overview": "요약 탭: 결론 문장 · 대상별 오차 · 기록 추이 그림", "models.constraints": "조합 검사 (head 수 · patch 길이)",
+    "report.lab": "하이퍼파라미터 탐색 탭", "report.overview": "요약 탭: 결론 문장 · 대상별 오차 · 기록 추이 · 실험 로드맵 그림", "models.constraints": "조합 검사 (head 수 · patch 길이)",
     "dashboard.views.launcher": "대시보드: 새 실험 실행 · 진행 상황", "dashboard.views.records": "대시보드: 누적 기록",
     "dashboard.app": "대시보드 시작·페이지 구성", "dashboard.state": "대시보드가 읽는 결과 파일",
     "dashboard.ui": "표·차트·KPI 공통 부품", "dashboard.theme": "차트 색·글꼴", "dashboard.tokens": "색 토큰 (보고서와 공유)",

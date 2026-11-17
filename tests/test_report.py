@@ -13,7 +13,7 @@ pytest.importorskip("torch")
 
 from ald_lab.data.overview import build_data_overview  # noqa: E402
 from ald_lab.journal import Journal  # noqa: E402
-from ald_lab.report import render  # noqa: E402
+from ald_lab.report import overview, render  # noqa: E402
 from ald_lab.report.collect import collect  # noqa: E402
 from ald_lab.report.render import TABS, write_report  # noqa: E402
 from ald_lab.training.export import export_models  # noqa: E402
@@ -131,6 +131,9 @@ def test_report_is_self_contained(lab, tmp_path):  # noqa: F811
     assert "VG11" in html and "만들어짐" in html and "&lt;b&gt;escaped&lt;/b&gt;" in html
     summary = html.split('<section id="summary"')[1].split("</section>")[0]  # 요약: conclusion first, tables folded
     assert "현재 결론" in summary and "미학습 1개" in summary and "<details><summary>과제별 최고 성능" in summary
+    # the README roadmap, both themes inlined (CSS shows one); left out when the figure files are missing
+    assert "실험 로드맵" in summary and summary.count("<svg") >= 2 and 'class="rm-light"' in summary and 'class="rm-dark"' in summary
+    assert overview.roadmap_figure(tmp_path) == ""
     assert "S2 (=FA1)" in html  # previous experiments tab
     for text in ("단계별 데이터 수", "제외한 데이터", "제외한 컬럼", "run 단위 분할", 'aria-label="전처리 순서"',
                  'aria-label="window 규칙"', 'aria-label="run 번호별 분할"', "품질 점검 결과", "정규화 - 학습 run 기준"):

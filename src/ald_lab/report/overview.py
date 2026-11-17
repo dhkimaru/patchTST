@@ -1,4 +1,4 @@
-"""요약 탭: 현재 결론과 그림 두 개 (대상별 상대 오차, 기준선 = 100 · 일별 기록 추이).
+"""요약 탭: 현재 결론과 그림 세 개 (대상별 상대 오차, 기준선 = 100 · 일별 기록 추이 · 실험 로드맵).
 
 Numbers come from the ledger (every job of every run, dashboard searches included) through
 :func:`ald_lab.stages.patchtst_first`, the same per-target decision the 하이퍼파라미터 탐색 tab shows.
@@ -9,13 +9,16 @@ targets are geometric means so that one target with a large error does not hide 
 from __future__ import annotations
 
 import math
+import re
 from html import escape
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from .. import stages
 from ..ledger import main_records
+from ..paths import PROJECT_ROOT
 
 TASKS = {"forecast": ("미래값 예측", "현재값 유지"), "virtual_sensor": ("가상 센서", "레시피 평균")}
 DECISION_TEXT = {"keep": ("채택", "good"), "fallback": ("대안 필요", "bad"), "missing": ("미학습", "muted")}
@@ -333,3 +336,46 @@ def trend_chart(trends: dict[str, list[dict[str, Any]]]) -> str:
                 "가로: 실험 시작일 (부가 실험일 포함)", "tick", "end"))
     p.append("</svg>")
     return "".join(p)
+
+
+ROADMAP_CSS = (".roadmap svg{width:100%;height:auto;max-width:980px;display:block}"
+               ".roadmap .rm-dark{display:none}"
+               ':root[data-theme="dark"] .roadmap .rm-light{display:none}'
+               ':root[data-theme="dark"] .roadmap .rm-dark{display:block}'
+               '@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .roadmap .rm-light{display:none}'
+               ':root:not([data-theme="light"]) .roadmap .rm-dark{display:block}}'
+               "@media print{.roadmap .rm-light{display:block!important}.roadmap .rm-dark{display:none!important}}")
+
+
+_TEXT_TAG = re.compile(r"<text ([^>]*)>")
+
+
+def _pin_text_style(svg: str) -> str:
+    """The report styles every ``svg text`` (12 px, muted colour), which beats SVG presentation attributes; repeat
+    each label's size, weight and colour as an inline style so the figure looks the same as in the README."""
+
+    def fix(m: re.Match) -> str:
+        attrs = m.group(1)
+        found = {k: re.search(rf'{k}="([^"]+)"', attrs) for k in ("font-size", "font-weight", "fill")}
+        style = ";".join(f"{k}:{v.group(1)}{'px' if k == 'font-size' else ''}" for k, v in found.items() if v)
+        return f'<text {attrs} style="{style}">' if style else m.group(0)
+
+    return _TEXT_TAG.sub(fix, svg)
+
+
+def roadmap_figure(root: Path = PROJECT_ROOT) -> str:
+    """The experiment roadmap that the README shows (``scripts/readme_roadmap.py`` →
+    ``docs/images/results_flow_{light,dark}.svg``), inlined so the offline report needs no file next to it.
+    Both themes are inlined and CSS shows the one that matches the page; empty when the files are missing."""
+
+    files = {m: root / "docs" / "images" / f"results_flow_{m}.svg" for m in ("light", "dark")}
+    if not all(p.is_file() for p in files.values()):
+        return ""
+    # inline SVG needs no namespace, and the report keeps no external URL in it
+    svgs = {m: p.read_text(encoding="utf-8").strip().replace(' xmlns="http://www.w3.org/2000/svg"', "", 1)
+            for m, p in files.items()}
+    if not all(v.startswith("<svg") for v in svgs.values()):
+        return ""
+    body = "".join(f'<div class="rm-{m}">{_pin_text_style(v)}</div>' for m, v in svgs.items())
+    return f'<style>{ROADMAP_CSS}</style><div class="roadmap">{body}</div>'
+
