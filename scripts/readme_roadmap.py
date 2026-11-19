@@ -113,16 +113,32 @@ def draw_card(p, t, k):
         sticker(p, t, x + 14, y, "● " + left, "dead" if False else phase, "start")
 
 
-def ribbon(p, t, d, phase, dashed=False):
-    da = ' stroke-dasharray="2 11"' if dashed else ""
-    p.append(f'<path d="{d}" fill="none" stroke="{t[phase]}" stroke-width="9" stroke-linecap="round" '
-             f'stroke-linejoin="round" stroke-opacity="0.85"{da}/>')
+SHAFT, HEAD_L, HEAD_W, GAP = 6, 15, 19, 4   # arrow: shaft width, head length and width, gap before the card
+DIRS = {"r": (1, 0), "l": (-1, 0), "d": (0, 1)}
 
 
-def head(p, t, x, y, direction, phase):
-    pts = {"r": f"{x - 11},{y - 8} {x},{y} {x - 11},{y + 8}", "l": f"{x + 11},{y - 8} {x},{y} {x + 11},{y + 8}",
-           "d": f"{x - 8},{y - 11} {x},{y} {x + 8},{y - 11}"}[direction]
-    p.append(f'<polygon points="{pts}" fill="{t[phase]}"/>')
+def shaft(p, t, d, phase, dashed=False):
+    style = ' stroke-dasharray="0.1 10" stroke-linecap="round"' if dashed else ' stroke-linecap="butt"'
+    p.append(f'<path d="{d}" fill="none" stroke="{t[phase]}" stroke-width="{SHAFT}" stroke-linejoin="round"{style}/>')
+
+
+def arrow(p, t, start, tip, direction, phase, via=None, dashed=False):
+    """One arrow: the shaft stops at the base of the head and the head's point stops just before the card.
+    ``via`` holds the two control points of a curve whose last stretch already runs in the arrow's direction;
+    the second one moves back with the end so the curve meets the head straight."""
+
+    dx, dy = DIRS[direction]
+    bx, by = tip[0] - dx * HEAD_L, tip[1] - dy * HEAD_L          # base of the head
+    ex, ey = bx + dx, by + dy                                     # shaft runs 1 px under the head: no seam
+    if via:
+        (c1x, c1y), (c2x, c2y) = via
+        d = f"M{start[0]},{start[1]} C{c1x},{c1y} {c2x - dx * HEAD_L},{c2y - dy * HEAD_L} {ex},{ey}"
+    else:
+        d = f"M{start[0]},{start[1]} L{ex},{ey}"
+    shaft(p, t, d, phase, dashed)
+    nx, ny = -dy * HEAD_W / 2, dx * HEAD_W / 2
+    pts = f"{tip[0]},{tip[1]} {bx + nx:.1f},{by + ny:.1f} {bx - nx:.1f},{by - ny:.1f}"
+    p.append(f'<polygon points="{pts}" fill="{t[phase]}" stroke="{t[phase]}" stroke-width="1.5" stroke-linejoin="round"/>')
 
 
 def pill(p, t, cx, cy, text, phase, anchor="middle"):
@@ -182,30 +198,29 @@ def figure(t):
     section(p, t, 40, 436, "원인 추적 · 두 갈래", "cause")
     section(p, t, 378, 810, "해결 → 확인 → 다음", "solve")
 
-    # ribbons
+    # arrows (drawn under the cards)
     y1 = my(1)
-    ribbon(p, t, f"M{rgt(1)},{y1} L{lft(2)},{y1}", "problem"); head(p, t, lft(2) - 2, y1, "r", "problem")
-    ribbon(p, t, f"M{rgt(2)},{y1} L{lft(3)},{y1}", "cause"); head(p, t, lft(3) - 2, y1, "r", "cause")
-    ribbon(p, t, f"M{cx(3)},{bot(3)} L{cx(4)},{top(4)}", "cause"); head(p, t, cx(4), top(4) - 2, "d", "cause")
+    arrow(p, t, (rgt(1), y1), (lft(2) - GAP, y1), "r", "problem")
+    arrow(p, t, (rgt(2), y1), (lft(3) - GAP, y1), "r", "cause")
+    arrow(p, t, (cx(3), bot(3)), (cx(4), top(4) - GAP), "d", "cause")
     y4 = my(4)
     for k5, k6 in (("5a", "6a"), ("5b", "6b")):
         yk = my(k5)
-        ribbon(p, t, f"M{lft(4)},{y4} C{lft(4) - 52},{y4} {rgt(k5) + 52},{yk} {rgt(k5)},{yk}", "cause")
-        head(p, t, rgt(k5) + 2, yk, "l", "cause")
-        ribbon(p, t, f"M{lft(k5)},{yk} L{rgt(k6)},{yk}", "cause"); head(p, t, rgt(k6) + 2, yk, "l", "cause")
+        arrow(p, t, (lft(4), y4), (rgt(k5) + GAP, yk), "l", "cause", via=((lft(4) - 52, y4), (rgt(k5) + 52, yk)))
+        arrow(p, t, (lft(k5), yk), (rgt(k6) + GAP, yk), "l", "cause")
     # the two branches merge at a junction above card 9
     jx, jy = cx("6b"), (bot("6b") + top(7)) / 2
     ya = my("6a")
-    ribbon(p, t, f"M{lft('6a')},{ya} C{lft('6a') - 22},{ya} 17,{ya + 14} 17,{ya + 40} L17,{jy - 22} "
-                 f"Q17,{jy} 40,{jy} L{jx},{jy}", "solve")
-    ribbon(p, t, f"M{jx},{bot('6b')} L{jx},{top(7)}", "solve"); head(p, t, jx, top(7) - 2, "d", "solve")
+    shaft(p, t, f"M{lft('6a')},{ya} C{lft('6a') - 22},{ya} 17,{ya + 14} 17,{ya + 40} L17,{jy - 22} "
+                f"Q17,{jy} 40,{jy} L{jx},{jy}", "solve")
+    arrow(p, t, (jx, bot("6b")), (jx, top(7) - GAP), "d", "solve")
     p.append(f'<circle cx="{jx}" cy="{jy}" r="8" fill="{t["card"]}" stroke="{t["solve"]}" stroke-width="4.5"/>')
     y7 = my(7)
-    ribbon(p, t, f"M{rgt(7)},{y7} L{lft(8)},{y7}", "solve"); head(p, t, lft(8) - 2, y7, "r", "solve")
+    arrow(p, t, (rgt(7), y7), (lft(8) - GAP, y7), "r", "solve")
     for k, dashed in (("9a", False), ("9b", True)):
         yk = my(k)
-        ribbon(p, t, f"M{rgt(8)},{y7} C{rgt(8) + 52},{y7} {lft(k) - 52},{yk} {lft(k)},{yk}", "next", dashed)
-        head(p, t, lft(k) - 2, yk, "r", "next")
+        arrow(p, t, (rgt(8), y7), (lft(k) - GAP, yk), "r", "next", via=((rgt(8) + 52, y7), (lft(k) - 52, yk)),
+              dashed=dashed)
 
     for k in CARDS:
         draw_card(p, t, k)
@@ -236,7 +251,7 @@ def figure(t):
         p.append(T(x + 12, fy + 53, why, t, 11, "muted"))
     ny = fy + 92
     for i, line in enumerate([
-            "선 위 글자는 판정 → 다음 실험. 개선율은 기준선(미래값: 현재값 유지, 가상 센서: 레시피 평균) 대비, 비교 대상이 다른 숫자는 카드에 표시.",
+            "화살표 위 글자는 판정 → 다음 실험. 개선율은 기준선(미래값: 현재값 유지, 가상 센서: 레시피 평균) 대비, 비교 대상이 다른 숫자는 카드에 표시.",
             "판정: 채택 = 구성에 반영 · 일부 채택 = 일부 대상만 반영 · 유력 = 일부 분할에서 확인 · 확인 = 사실 확인 · 정정 = 앞선 결론 수정",
             "시험 run은 설정 선택에 쓰지 않은 마지막 11개 run, 11-04 · 11-16(재사용, 참고)에서만 사용."]):
         p.append(T(40, ny + 18 * i, line, t, 11.5, "muted"))

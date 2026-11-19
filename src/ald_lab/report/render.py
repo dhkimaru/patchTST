@@ -215,8 +215,15 @@ def nice_label(label: str) -> str:
 
 
 def _git_commit() -> str:
-    """The code version: from git in a checkout, else from ``COMMIT``, which ``git archive`` fills in (export-subst)."""
+    """The code version: ``COMMIT``, which ``git archive`` fills in (export-subst), so a zip shows its own commit even
+    when it is unpacked inside another git checkout; in a plain checkout (``$Format`` left as is) git itself."""
 
+    try:
+        stamp = (Path(__file__).with_name("COMMIT")).read_text(encoding="utf-8").strip()
+    except OSError:
+        stamp = ""
+    if stamp and not stamp.startswith("$Format"):
+        return stamp
     try:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5,
                              cwd=PROJECT_ROOT)
@@ -224,11 +231,7 @@ def _git_commit() -> str:
             return out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
-    try:
-        stamp = (Path(__file__).with_name("COMMIT")).read_text(encoding="utf-8").strip()
-    except OSError:
-        return "-"
-    return stamp if stamp and not stamp.startswith("$Format") else "-"
+    return "-"
 
 
 def _rel(path: Path, root: Path) -> str:
