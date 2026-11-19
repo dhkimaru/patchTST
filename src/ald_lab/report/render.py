@@ -171,10 +171,21 @@ def tile(label: str, value: str, note: str = "") -> str:
     return f'<div class="tile"><div class="tl">{e(label)}</div><div class="tv">{value}</div><div class="tn">{note}</div></div>'
 
 
-def target_name(target: str, unit: str = "") -> str:
+UNKNOWN_UNIT = "단위 미확인"
+
+
+def unit_text(unit: Any) -> str:
+    """A target's unit for display; an empty one (not in the column dictionary) is shown as unknown, never dropped."""
+
+    return str(unit) if unit is not None and str(unit).strip() and str(unit) != "nan" else UNKNOWN_UNIT
+
+
+def target_name(target: str, unit: Any = None) -> str:
+    """'VG11 [Torr]'. Pass the unit wherever error values follow; ``None`` (no unit at hand) gives the bare name."""
+
     name = TARGET_NAMES.get(target)
     text = f"{target} ({name})" if name else target
-    return f"{text} [{unit}]" if unit else text
+    return text if unit is None else f"{text} [{unit_text(unit)}]"
 
 
 LABEL_BASE = {"patchtst": "PatchTST", "patchtst_mix": "PatchTST 혼합", "lightgbm": "LightGBM", "ridge": "Ridge",
@@ -299,7 +310,9 @@ def _summary(data: ReportData) -> str:
             box += (f'<p class="sub">모델을 만들며 확인한 점{f" ({e(as_of)} 기준)" if as_of else ""}</p><ul>'
                     + "".join(f"<li><b>{e(t)}</b>: {e(x)}</li>" for t, x in learned) + "</ul>")
         out.append(box + "</div>")
-        notes = ["성능 수치는 검증 run 기준이고, 시험 run은 최종 후보에서만 확인"] if dec else []
+        notes = ["오차는 검증 run의 MAE(평균 절대 오차, 대상의 물리 단위)이고, 시험 run은 최종 후보에서만 확인",
+                 ("'오차 평균 X% 감소'는 대상마다 PatchTST MAE ÷ 기준선 MAE를 구해 기하평균한 값을 1에서 뺀 것이며, "
+                  "아래 확인한 점의 %도 MAE의 비율로 계산")] if dec else []
         side = overview.side_study_note(ledger)
         if side:
             notes.append(side)
@@ -704,7 +717,7 @@ def _example_section(data: ReportData) -> str:
         bands = [(a, b, "band-process") for a, b in ex["process"]] + [(a, b, "band-cycle") for a, b in ex["cycle"]]
         chart = series_chart([{"name": f"{ex['column']} (1초 평균)", "x": ex["t"], "y": ex["y"], "cls": "ln-pred", "kind": "line"}],
                              bands=bands, band_legend=[("band-process", "공정 구간 (START~END)"), ("band-cycle", "ALD 사이클")],
-                             log=True, unit=unit, title=f"run {run} 구간 표시")
+                             log=True, unit=unit_text(unit), title=f"run {run} 구간 표시")
         out.append(f'<div class="chartbox"><div class="ctitle">① 구간 표시: 대기(STANDBY)는 흰 배경, 공정 구간은 연한 색, '
                    f"ALD 사이클은 진한 색. 압력이 대기압(약 760 Torr)과 공정 압력(1~4 Torr) 사이를 오가므로 세로축은 로그 눈금입니다."
                    f"</div>{chart}</div>")
@@ -713,7 +726,7 @@ def _example_section(data: ReportData) -> str:
             chart = series_chart([
                 {"name": "원본 0.5초", "x": ex["zoom_raw_t"], "y": ex["zoom_raw_y"], "cls": "dot-raw", "kind": "dots"},
                 {"name": "1초 평균 (학습에 쓴 값)", "x": ex["zoom_t"], "y": ex["zoom_y"], "cls": "ln-pred", "kind": "line"},
-            ], marks=marks[:4], xlabel="시간 (초)", unit=unit, title=f"run {run} 1초 평균 확대")
+            ], marks=marks[:4], xlabel="시간 (초)", unit=unit_text(unit), title=f"run {run} 1초 평균 확대")
             raw_max, avg_max = max(ex["zoom_raw_y"]), max(ex["zoom_y"])
             out.append(f'<div class="chartbox"><div class="ctitle">② 1초 평균 (ALD 사이클 2분 확대): 점은 0.5초 원본, 선은 2개씩 '
                        f"평균한 1초 값입니다. 최댓값이 원본 {fmt(raw_max)} → 평균 {fmt(avg_max)} {e(unit)}로, 짧은 튐은 "
@@ -1079,10 +1092,10 @@ def _demo_items(data: ReportData) -> list[dict[str, Any]]:
                 name = model_card(job["model"])["name"]
                 shown = name if job["label"] == job["model"] else f"{name} ({nice_label(job['label'])})"
                 samples.append({"name": job["model"], "label": f"{rank}위 {name} · {fmt(job['mae'], 3)}",
-                                "note": f"{shown} · 검증 MAE {fmt(job['mae'])} {pick.unit}".strip(),
+                                "note": f"{shown} · 검증 MAE {fmt(job['mae'])} {unit_text(pick.unit)}".strip(),
                                 "frame": frame, "zoom": zoom})
             item = player.sample_series(f"{exp.name}/{pick.target}", group=_short(exp),
-                                        title=target_name(pick.target, pick.unit), target=pick.target, unit=pick.unit,
+                                        title=target_name(pick.target, pick.unit), target=pick.target, unit=unit_text(pick.unit),
                                         context=_context(exp), samples=samples)
             if item:
                 first = [k for k, m in enumerate(item["models"]) if m["name"] == DEMO_FIRST]
@@ -1665,10 +1678,10 @@ def _config_results(exp: Experiment, configs: pd.DataFrame) -> str:
                                        and not pd.isna(r.mae_std) else ""),
                          *([fmt(r.mae_cycle), fmt(r.mae_other)] if has_region else []),
                          minutes(r.fit_minutes), mark])
-        header = ["모델", "설정", "seed", "MAE ± seed 편차", *(["ALD 사이클", "그 외"] if has_region else []),
-                  "학습 시간", "선택"]
-        body = table(header, rows)
         unit = next((p.unit for p in exp.picks if p.target == target), "")
+        header = ["모델", "설정", "seed", f"MAE [{unit_text(unit)}] ± seed 편차",
+                  *(["ALD 사이클", "그 외"] if has_region else []), "학습 시간", "선택"]
+        body = table(header, rows)
         blocks.append(body if len(targets) == 1 else
                       f"<details><summary>{e(target_name(target, unit))} · 조합 {len(part)}개</summary>{body}</details>")
     return ('<p class="note">같은 모델에서 설정만 바꾼 조합을 모두 적었습니다. seed 편차는 같은 설정을 seed만 바꿔 돌렸을 때의 '
@@ -1693,8 +1706,9 @@ def _effects_table(exp: Experiment, effects: list[dict[str, Any]]) -> str:
             f"→ {e(setting_value(factor, lv))}: {pct(ch)}" + (' <span class="sub">(seed 흔들림 안)</span>'
                                                                if clear is False else "")
             for lv, ch, clear in ef["changes"])
-        rows.append([e(ef["target"]), e(model_card(ef["model"])["name"]), e(ef["name"]), levels, changes,
-                     spread(ef["seed_std"]), _verdict_html(ef["verdict"], ef["effect"])])
+        unit = next((p.unit for p in exp.picks if p.target == ef["target"]), "")
+        rows.append([e(target_name(ef["target"], unit)), e(model_card(ef["model"])["name"]), e(ef["name"]), levels,
+                     changes, spread(ef["seed_std"]), _verdict_html(ef["verdict"], ef["effect"])])
     return ('<p class="note">설정 하나의 값별로, 나머지 설정과 seed를 모두 평균한 MAE입니다(괄호는 작업 수, 굵은 글씨가 가장 '
             "좋은 값). 변화는 <b>기준</b> 값에서 바꿨을 때입니다. 가장 좋은 값과 다른 값의 차이가 seed 편차로 본 표준오차의 "
             f"{CLEAR_SE:g}배를 넘으면 '효과 있음', 아니면 '불분명'입니다. seed를 한 번만 돌린 설정은 다른 설정 조합에서도 같은 값이 "
@@ -1858,7 +1872,8 @@ def _prev_section(h: dict[str, Any]) -> str:
     story = h.get("hparam_story") or []
     if story:
         out.append("<h4>단계별 진행 내용</h4>"
-                   + table(["단계", "한 일", "코드", "결과 (시험 run MAE)"], [[f"<b>{e(a)}</b>", e(b), e(c), e(d)]
+                   + table(["단계", "한 일", "코드", f"결과 (시험 run MAE, {unit_text(h.get('unit'))})"],
+                           [[f"<b>{e(a)}</b>", e(b), e(c), e(d)]
                                                                    for a, b, c, d in story]))
     bars = [(f"{str(it.get('phase', '')).split(' ')[0]} · {it['short']} ({it['id']})", it["delta_pct"],
              False if it["effect"] else "불분명") for it in items if not it.get("caution")]
@@ -1876,7 +1891,8 @@ def _prev_section(h: dict[str, Any]) -> str:
                      + (f'<div class="sub">{e(it["basis"])}</div>' if it["basis"] != "-" else "")])
         last = phase
     out.append("<h4>실험 코드별 변경 내용</h4>"
-               + table(["단계", "코드", "변경 내용", "설명", "MAE 전 → 후", "변화", "판단 (근거)"], rows, cls="prevfx"))
+               + table(["단계", "코드", "변경 내용", "설명", f"MAE 전 → 후 ({unit_text(h.get('unit'))})", "변화",
+                        "판단 (근거)"], rows, cls="prevfx"))
     return "".join(out)
 
 
@@ -1960,7 +1976,8 @@ def _ledger_section(ledger: pd.DataFrame) -> str:
     if len(best):
         out.append("<h4>대상별 최고 기록 (검증 MAE)</h4>")
         out.append(table(["과제", "대상", "검증 MAE", "개선율", "모델", "설정", "입력", "언제 · 실험"], [
-            [e(TASK_SHORT.get(r.task, r.task)), e(r.target), fmt(r.mae), pct(r.improvement_pct), e(nice_label(r.label)),
+            [e(TASK_SHORT.get(r.task, r.task)), e(target_name(r.target, r.unit)), fmt(r.mae), pct(r.improvement_pct),
+             e(nice_label(r.label)),
              f'<span class="sub">{e(r.settings)}</span>', e(r.input_set),
              f"{r.when:%m-%d %H:%M}<div class='sub'>{e(r.experiment)}</div>" if r.when == r.when else e(r.experiment)]
             for r in best.itertuples()]))
@@ -1970,7 +1987,8 @@ def _ledger_section(ledger: pd.DataFrame) -> str:
         tops = []
         for target, g in group[~group["model"].isin(BASELINE_MODELS)].groupby("target", sort=False):
             top = g.loc[g["mae"].idxmin()]
-            tops.append(f"{e(target)} {fmt(top['mae'])} <span class='sub'>{e(nice_label(top['label']))} "
+            tops.append(f"{e(target)} {fmt(top['mae'])} {e(unit_text(top.get('unit')))} "
+                        f"<span class='sub'>{e(nice_label(top['label']))} "
                         f"{pct(top['improvement_pct'])}</span>")
         rows.append([f"{first['when']:%m-%d %H:%M}" if first["when"] == first["when"] else "-",
                      e(first["experiment"]) + f"<div class='sub'>{e(first['memo'])}</div>",
@@ -1979,7 +1997,8 @@ def _ledger_section(ledger: pd.DataFrame) -> str:
     out.append(table(["언제", "실험 · 메모", "출처", "학습 수", "대상별 최고 (모델 · 기준선 대비)"], rows))
     recent = ok.sort_values("when", ascending=False).head(LEDGER_ROWS)
     detail = table(["언제", "실험", "대상", "모델", "설정", "입력", "seed", "검증 MAE", "개선율", "학습"], [
-        [f"{r.when:%m-%d %H:%M}" if r.when == r.when else "-", e(r.experiment), e(r.target), e(nice_label(r.label)),
+        [f"{r.when:%m-%d %H:%M}" if r.when == r.when else "-", e(r.experiment), e(target_name(r.target, r.unit)),
+         e(nice_label(r.label)),
          f'<span class="sub">{e(r.settings)}</span>', e(r.input_set), str(r.seed), fmt(r.mae), pct(r.improvement_pct),
          minutes(r.fit_minutes)] for r in recent.itertuples()])
     out.append(f"<details><summary>학습 기록 전체 (최근 {len(recent):,}개)</summary>{detail}</details>")
@@ -1987,7 +2006,10 @@ def _ledger_section(ledger: pd.DataFrame) -> str:
 
 
 def _results(data: ReportData, examples: bool) -> str:
-    out = ["<h3>과제별 최고 성능</h3>", _purpose_table(data.experiments)]
+    out = ["<h3>과제별 최고 성능</h3>",
+           ('<p class="note">MAE는 검증 run의 평균 절대 오차로, 대상 이름 옆 [ ] 안의 물리 단위입니다(신호 사전에 단위가 없는 대상은 '
+            "'단위 미확인'). 개선율(%) = (기준선 MAE − 모델 MAE) ÷ 기준선 MAE × 100이고, 음수면 기준선보다 나쁜 것입니다.</p>"),
+           _purpose_table(data.experiments)]
     for exp in data.experiments:
         s = exp.summary
         out.append(f'<h3 id="r-{e(exp.name)}">{e(_exp_title(exp))}</h3>')
@@ -2000,8 +2022,8 @@ def _results(data: ReportData, examples: bool) -> str:
             group = group.sort_values("mae")
             pick = picks.get(target)
             unit = pick.unit if pick else ""
-            head = (f"{e(target_name(target, unit))} · 최고 {e(nice_label(pick.label))} {fmt(pick.mae)} "
-                    f"{pct(pick.improvement_pct)}" if pick else e(target))
+            head = (f"{e(target_name(target, unit))} · 최고 {e(nice_label(pick.label))} 검증 MAE {fmt(pick.mae)} "
+                    f"{e(unit_text(unit))} · 개선율 {pct(pick.improvement_pct)}" if pick else e(target))
             body = [_results_table(exp, group)]
             bars = improvement_bars([(nice_label(r.label), None if pd.isna(r.improvement_pct) else float(r.improvement_pct))
                                      for r in group.itertuples() if not r.is_baseline], title=f"{target} 개선율")
@@ -2020,7 +2042,8 @@ def _results(data: ReportData, examples: bool) -> str:
             for r in exp.test.to_dict(orient="records"):
                 th = _test_horizon_values(exp, r["target"], r["label"])
                 std = r.get("mae_std")
-                rows.append([e(r["target"]), e(nice_label(r["label"])),
+                unit = next((p.unit for p in exp.picks if p.target == r["target"]), "")
+                rows.append([e(target_name(r["target"], unit)), e(nice_label(r["label"])),
                              fmt(r["mae"]) + (f' <span class="sub">± {spread(std)}</span>'
                                               if std is not None and not pd.isna(std) else ""),
                              pct(None if pd.isna(r.get("improvement_pct")) else r.get("improvement_pct")),
@@ -2087,7 +2110,7 @@ def _example_chart(exp: Experiment, pick: Pick) -> str:
                  + ("" if h == "0s" else f", {h} 뒤 값"))
         chart = line_chart(t, [("실측", frame[col].to_numpy(float), "ln-true"),
                                (f"예측 ({nice_label(pick.label)})", frame[f"pred_{h}"].to_numpy(float), "ln-pred")],
-                           unit=pick.unit, shade=shade, title=title)
+                           unit=unit_text(pick.unit), shade=shade, title=title)
         if chart:
             out.append(f'<div class="chartbox"><div class="ctitle">{e(title)}</div>{chart}</div>')
     return "".join(out)
@@ -2543,7 +2566,8 @@ def _history_records(h: dict[str, Any], runs: list[dict[str, Any]], base: dict[s
                 f"{int(r['params']):,}" if r.get("params") else "-",
             ])
         parts.append("<h4>주요 모델 성능표 (시험 run 179,169 window)</h4>"
-                     + table(["단계", "모델", "입력", "바꾼 점", "MAE", "현재값 유지 대비", "10 / 20 / 30초", "안정 / 전환",
+                     + table(["단계", "모델", "입력", "바꾼 점", f"MAE ({unit_text(h.get('unit'))})", "현재값 유지 대비",
+                              "10 / 20 / 30초", "안정 / 전환",
                               "best/epoch", "학습 시간", "파라미터"], rows))
     if h.get("tests"):
         base_mae = base["mae"] if base else None
@@ -2564,17 +2588,20 @@ def _history_records(h: dict[str, Any], runs: list[dict[str, Any]], base: dict[s
                      '<p class="note">시험 run MAE(10·20·30초 평균, Torr). 개선율은 모두 현재값 유지(2.092) 대비이고, '
                      "결론 열은 각 단계의 기준(직전 단계·A02·FA1)과 비교한 것입니다. GR1은 급변 구간만 따로 잰 값이라 "
                      "개선율을 붙이지 않았습니다.</p>"
-                     + table(["단계", "테스트", "바꾼 점", "MAE", "10 / 20 / 30초", "현재값 유지 대비", "결론"], rows))
+                     + table(["단계", "테스트", "바꾼 점", f"MAE ({unit_text(h.get('unit'))})", "10 / 20 / 30초",
+                              "현재값 유지 대비", "결론"], rows))
     if h.get("ablations"):
         parts.append("<h4>원인 분석·추가 실험 요약</h4>" + kv([(k, e(v)) for k, v in h["ablations"]]))
     if h.get("stats"):
         parts.append("<h4>통계 검정</h4>"
                      '<p class="note">run(파일) 11개별 MAE로 한 Wilcoxon 부호순위 검정, seed 42. p=0.001은 run 11개로 '
                      "나올 수 있는 가장 작은 값.</p>"
-                     + table(["비교", "MAE 차이", "p", "판단"], [[e(c) for c in row] for row in h["stats"]]))
+                     + table(["비교", f"MAE 차이 ({unit_text(h.get('unit'))})", "p", "판단"],
+                             [[e(c) for c in row] for row in h["stats"]]))
     if h.get("slices"):
         parts.append("<h4>레시피별 오차 (O_UNIVARIATE)</h4>"
-                     + table(["레시피", "시험 window", "MAE 10 / 20 / 30초"], [[e(c) for c in row] for row in h["slices"]]))
+                     + table(["레시피", "시험 window", f"MAE 10 / 20 / 30초 ({unit_text(h.get('unit'))})"],
+                             [[e(c) for c in row] for row in h["slices"]]))
     if h.get("data_checks"):
         parts.append("<h4>데이터 점검</h4>" + kv([(k, e(v)) for k, v in h["data_checks"]]))
     w = h.get("weights") or {}

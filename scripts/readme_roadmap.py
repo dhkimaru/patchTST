@@ -251,10 +251,11 @@ def figure(t):
     ny = fy + 92
     for i, line in enumerate([
             "화살표 위 글자는 판정 → 다음 실험. 개선율은 기준선(미래값: 현재값 유지, 가상 센서: 레시피 평균) 대비, 비교 대상이 다른 숫자는 카드에 표시.",
+            "오차는 모두 MAE(평균 절대 오차). 개선율 = 1 - MAE ÷ 기준선 MAE, 오차 감소 = 1 - MAE ÷ 비교 대상 MAE, 배 = MAE끼리의 비, %p = 개선율끼리의 차이.",
             "판정: 채택 = 구성에 반영 · 일부 채택 = 일부 대상만 반영 · 유력 = 일부 분할에서 확인 · 확인 = 사실 확인 · 정정 = 앞선 결론 수정",
             "시험 run은 설정 선택에 쓰지 않은 마지막 11개 run, 11-04 · 11-16(재사용, 참고)에서만 사용."]):
         p.append(T(40, ny + 18 * i, line, t, 11.5, "muted"))
-    H = ny + 52
+    H = ny + 70
     title = "실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이기까지 (1~648차)"
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
             f'aria-label="{escape(title)}" font-family="{FONT}"><title>{escape(title)}</title>{"".join(p)}</svg>')

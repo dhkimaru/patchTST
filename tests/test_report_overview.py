@@ -86,3 +86,11 @@ def test_side_study_days_extend_the_trend_without_changing_the_record():
     assert "PatchTST 2/3개 채택" in text  # the side study's 0.01 does not change the decision line either
     chart = overview.trend_chart({"forecast": pts})
     assert "11-02" in chart and "ov-side" in chart and "부가 실험만 한 날" in chart and "부가 실험 1회" in chart
+
+
+def test_units_are_never_dropped():
+    """An error value always carries its unit; a target whose unit the column dictionary lacks says so."""
+    from ald_lab.report.render import target_name, unit_text
+
+    assert target_name("VG11", "Torr").endswith("[Torr]") and target_name("X", "") == "X [단위 미확인]"
+    assert target_name("X") == "X" and unit_text(None) == unit_text("nan") == unit_text(" ") == "단위 미확인"

@@ -228,8 +228,13 @@ def target_chart(dec: dict[str, pd.DataFrame]) -> str:
         for r in rows:
             cy = y + row_h / 2
             pt = remaining(r.patch_mae, r.baseline_mae)
-            tip = (f"{r.target} · PatchTST {r.patch_mae:.4g} (상대 오차 {pt:.1f}) · 기준선 {r.baseline_mae:.4g}"
-                   + (f" · LightGBM {r.lgbm_mae:.4g} ({remaining(r.lgbm_mae, r.baseline_mae):.1f})" if _ok(r.lgbm_mae) else "")
+            from .render import unit_text  # render imports this module at load time
+
+            u = unit_text(getattr(r, "unit", ""))
+            tip = (f"{r.target} · PatchTST MAE {r.patch_mae:.4g} {u} (상대 오차 {pt:.1f} = MAE ÷ 기준선 MAE × 100) · "
+                   f"기준선 MAE {r.baseline_mae:.4g} {u}"
+                   + (f" · LightGBM MAE {r.lgbm_mae:.4g} {u} ({remaining(r.lgbm_mae, r.baseline_mae):.1f})"
+                      if _ok(r.lgbm_mae) else "")
                    + f" · seed {int(r.patch_seeds)}개")
             p.append(f'<g><title>{escape(tip)}</title>')
             p.append(f'<line class="grid" x1="{x0}" y1="{cy:.1f}" x2="{x1}" y2="{cy:.1f}" stroke-dasharray="2 4"/>')

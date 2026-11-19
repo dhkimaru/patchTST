@@ -104,19 +104,21 @@ def _suggestion(g: dict[str, Any]) -> str:
     return '<p class="lab-next"><b>다음 실험 제안</b>: ' + _h().e("; ".join(parts)) + ".</p>"
 
 
-def _ranking_block(g: dict[str, Any]) -> str:
+def _ranking_block(g: dict[str, Any], units: dict[str, str] | None = None) -> str:
     r = _h()
+    units = units or {}
     rows = []
     for rank, c in enumerate(g["ranking"][:RANKING_ROWS], start=1):
         sd = f" <span class='sub'>± {c['sd']:.1f}</span>" if c["sd"] is not None else ""
         cycle = f"{c['cycle']:+.1f} %" if c["cycle"] is not None else "-"
-        maes = " · ".join(f"{t} {r.fmt(v, 3)}" for t, v in c["mae_by_target"].items())
+        maes = " · ".join(f"{t} {r.fmt(v, 3)} {r.unit_text(units.get(t))}" for t, v in c["mae_by_target"].items())
         size = f"{c['n_params'] / 1e6:.2f}M" if c["n_params"] else "-"
         rows.append([f"<b>{rank}</b>", r.e(settings_text(c["settings"])), f"<b>{c['improvement']:+.1f} %</b>{sd}", cycle,
                      f'<span class="sub">{r.e(maes)}</span>', r.minutes(c["fit_minutes"]) if c["fit_minutes"] else "-",
                      size])
     more = f'<p class="sub">조합 {g["combos"]}개 중 상위 {min(RANKING_ROWS, g["combos"])}개.</p>' if g["combos"] > RANKING_ROWS else ""
-    return (r.table(["순위", "조합 (바꾼 설정)", "개선율 (평균 ± seed 편차)", "사이클 안", "대상별 MAE", "작업당 학습", "파라미터"],
+    return (r.table(["순위", "조합 (바꾼 설정)", "개선율 (평균 ± seed 편차)", "사이클 안", "대상별 검증 MAE (물리 단위)",
+                     "작업당 학습", "파라미터"],
                     rows, cls="lab-rank") + more)
 
 
@@ -134,6 +136,8 @@ def explore_html(ledger: pd.DataFrame) -> str:
            "효과가 그 표준오차의 2배를 넘고 1 %p 이상이면 <b>확실</b>, 2배를 넘지만 1 %p 미만이면 <b>작음</b>, 2배 이내면 "
            "<b>잡음 수준</b>입니다. 탐색(대시보드 실행과 1단계 실험 파일)은 "
            "요청(메모)별로 따로 집계합니다.</p>")]
+    units = (ledger.dropna(subset=["unit"]).groupby("target")["unit"].first().to_dict()
+             if "unit" in ledger else {})
     rows, panels = [], []
     for i, g in enumerate(groups[:EXPLORE_GROUPS]):
         key = "x" + hashlib.sha1(f"{g['task']}|{g['title']}".encode()).hexdigest()[:10]
@@ -152,7 +156,7 @@ def explore_html(ledger: pd.DataFrame) -> str:
                       f'<div class="cath"><i></i><b>{r.e(g["title"])}</b>{running} '
                       f'<span class="sub">{r.e(TASKS.get(g["task"], g["task"]))} · {r.e(when)} · 조합 {g["combos"]}개 × '
                       f'대상 {len(g["targets"])}개 × seed {len(g["seeds"])}개 · {r.e(sigma)}</span></div>'
-                      + _suggestion(g) + _effects_block(g) + "<h4>조합 순위</h4>" + _ranking_block(g) + "</div>")
+                      + _suggestion(g) + _effects_block(g) + "<h4>조합 순위</h4>" + _ranking_block(g, units) + "</div>")
     more = (f'<p class="sub">최근 {EXPLORE_GROUPS}개만 표시합니다. 이전 탐색 {len(groups) - EXPLORE_GROUPS}개는 '
             "Hyper Parameter 탭 ⑦ 누적 기록에 있습니다.</p>" if len(groups) > EXPLORE_GROUPS else "")
     listing = r.table(["탐색 (메모)", "과제", "언제", "조합 × 대상 × seed", "최고 개선율", "확실한 효과"], [], cls="lab-xlist")
