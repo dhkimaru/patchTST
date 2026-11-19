@@ -97,9 +97,13 @@ def _copy_job(job_dir: Path, folder: Path) -> dict[str, Any]:
     return doc
 
 
-def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path, *, note: str = "") -> Path:
+def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path, *, note: str = "",
+                recipe_steps: dict[str, Any] | None = None) -> Path:
     """Package a region pair for one virtual-sensor target: ``full/`` (full-process model) and ``cycle/``
-    (cycle-only model) plus predict.sh / predict.bat that run ``ald-predict --cycle-model``."""
+    (cycle-only model) plus predict.sh / predict.bat that run ``ald-predict --cycle-model``.
+
+    ``recipe_steps`` (one target's entry of ``step_choice.json``) adds ``recipe_steps.json`` and ``--recipe-steps``:
+    in those steps the package predicts the train runs' recipe mean."""
 
     full_job, cycle_job, out_dir = Path(full_job), Path(cycle_job), Path(out_dir)
     if out_dir.exists():
@@ -110,9 +114,15 @@ def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path
         raise ValueError(f"different targets: {target} / {docs['cycle']['job']['target']}")
     if experiment_for(out_dir / "cycle").region != "cycle":
         raise ValueError(f"{cycle_job} is not a cycle-only job (data.region: cycle)")
+    steps = list((recipe_steps or {}).get("steps") or [])
+    sh_steps, bat_steps = ('--recipe-steps "$HERE/recipe_steps.json" ', '--recipe-steps "%HERE%recipe_steps.json" ') \
+        if steps else ("", "")
+    if steps:
+        (out_dir / "recipe_steps.json").write_text(json.dumps({**recipe_steps, "target": target, "steps": steps},
+                                                              ensure_ascii=False, indent=1), encoding="utf-8")
     sh = _PREDICT_SH.replace("__LAB__", str(PROJECT_ROOT)).replace(
-        '"$HERE" --csv', '"$HERE/full" --cycle-model "$HERE/cycle" --csv')
-    bat = _PREDICT_BAT.replace('"%HERE%." --csv', '"%HERE%full" --cycle-model "%HERE%cycle" --csv')
+        '"$HERE" --csv', f'"$HERE/full" --cycle-model "$HERE/cycle" {sh_steps}--csv')
+    bat = _PREDICT_BAT.replace('"%HERE%." --csv', f'"%HERE%full" --cycle-model "%HERE%cycle" {bat_steps}--csv')
     assert "--cycle-model" in sh and "--cycle-model" in bat
     (out_dir / "predict.sh").write_text(sh, encoding="utf-8")
     (out_dir / "predict.sh").chmod(0o755)
@@ -120,6 +130,15 @@ def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path
     lines = [f"ALD 가상 센서 구간 전용 조합 — {target}", "",
              "사이클 안은 사이클 전용 모델(cycle/), 나머지 구간은 공정 전체 모델(full/)의 예측을 쓴다.",
              "사이클 전용 모델의 window가 아직 사이클 안에 다 들어오지 않은 첫 몇 초는 공정 전체 모델을 쓴다.", ""]
+    if steps:
+        rule = recipe_steps or {}
+        nan = float("nan")
+        lines[4:4] = [(f"step {len(steps)}개(recipe_steps.json)에서는 두 모델 대신 학습 run의 레시피 평균을 쓴다. "
+                       "교차검증에서 고른 step으로, 대상이 거의 일정한 구간(밸브 닫힘, 가스 꺼짐 등)이다."),
+                      (f"  교차검증 변화(규칙 MAE ÷ 조합 MAE - 1): {rule.get('change_mean', nan):.1f} ± "
+                       f"{rule.get('change_sd', nan):.1f}%, 가장 큰 값 {rule.get('change_max', nan):.1f}%, "
+                       f"바꾼 step의 행 몫 {rule.get('rows_share', nan):.1f}%"),
+                      "  이 step 안에서 생긴 이상은 예측에 나타나지 않는다."]
     for part, job in (("full", full_job), ("cycle", cycle_job)):
         doc = docs[part]
         val = json.loads((job / "metrics_validation.json").read_text(encoding="utf-8")).get("result", {}) \
@@ -130,7 +149,8 @@ def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path
     lines += ["", "[실행]",
               "- 서버:    bash predict.sh <trace CSV 파일 또는 폴더> [출력 CSV] [cpu|cuda:0]",
               "- Windows: predict.bat <trace CSV 파일 또는 폴더> [출력 CSV]   (ald-lab이 설치된 Python 필요)",
-              "- 출력 CSV: pred(조합) · pred_full · pred_cycle · model_used(어느 모델을 썼는지), 실측이 있으면 actual",
+              "- 출력 CSV: pred(조합) · pred_full · pred_cycle · recipe(레시피 평균) · model_used(어느 모델을 썼는지), "
+              "실측이 있으면 actual" + (", pred_model(규칙 적용 전 예측)" if steps else ""),
               "- 재생 화면: <출력 CSV 이름>_player.html"]
     if note:
         lines += ["", note]

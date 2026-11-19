@@ -91,6 +91,11 @@ def predict_traces(model_dir: str | Path, files: list[Path], *, device: str = "c
     t = scaler.columns.index(target)
     y_pred = scaler.inverse(pred, [t])
     rows = ws.target_rows(idx)
+    recipe = None
+    if (model_dir / "template.parquet").is_file():  # virtual sensors keep the train runs' recipe mean
+        from ..models.classic import RecipeTemplate
+
+        recipe = scaler.inverse(RecipeTemplate.load(model_dir).values(bundle)[rows], [t])
     y_true = None if target in absent else scaler.inverse(ws.y.cpu().numpy()[rows], [t])
     ends = ws.ends_np
     out = meta.iloc[ends][["run_id", "timestamp", "step_name"]].reset_index(drop=True)
@@ -100,17 +105,22 @@ def predict_traces(model_dir: str | Path, files: list[Path], *, device: str = "c
         if y_true is not None:
             out[f"actual{suffix}"] = y_true[:, i, 0]
         out[f"pred{suffix}"] = y_pred[:, i, 0]
+        if recipe is not None:
+            out[f"recipe{suffix}"] = recipe[:, i, 0]
     out.attrs.update(target=target, unit=_unit(model_dir), has_actual=y_true is not None)
     return out
 
 
-def predict_pair(full_dir: str | Path, cycle_dir: str | Path, files: list[Path], *, device: str = "cpu") -> pd.DataFrame:
+def predict_pair(full_dir: str | Path, cycle_dir: str | Path, files: list[Path], *, device: str = "cpu",
+                 recipe_steps: list[str] | None = None) -> pd.DataFrame:
     """Region pair: the cycle-only model inside ALD cycles, the full-process model everywhere else.
 
     Both models run on the same traces through :func:`predict_traces`. Rows inside a cycle take the cycle-only
     prediction where that model has one (its window must lie in the cycle, so the first seconds of a cycle block
     fall back to the full-process model), the same rule as ``scripts/raw_scale.py``. ``pred_full`` and
-    ``pred_cycle`` keep both predictions and ``model_used`` says which one ``pred`` took."""
+    ``pred_cycle`` keep both predictions and ``model_used`` says which one ``pred`` took. ``recipe_steps`` (from
+    ``scripts/step_choice.py``) are recipe steps where the train runs' recipe mean replaces both models
+    (:func:`use_recipe_steps`)."""
 
     full_dir, cycle_dir = Path(full_dir), Path(cycle_dir)
     docs = [json.loads((d / "job.json").read_text(encoding="utf-8")) for d in (full_dir, cycle_dir)
@@ -136,6 +146,39 @@ def predict_pair(full_dir: str | Path, cycle_dir: str | Path, files: list[Path],
         out.loc[use, col] = out.loc[use, f"{col}_cycle"]
     out["model_used"] = np.where(use, "사이클 전용", "공정 전체")
     out.attrs.update(full.attrs, pair=True)
+    return use_recipe_steps(out, recipe_steps) if recipe_steps else out
+
+
+def load_recipe_steps(path: str | Path) -> list[str]:
+    """Step names from a ``recipe_steps.json`` (written by ``scripts/export_pair.py``) or a plain list."""
+
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    steps = doc.get("steps", []) if isinstance(doc, dict) else doc
+    if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
+        raise PredictError(f"{path}: expected a list of step names")
+    return steps
+
+
+def use_recipe_steps(frame: pd.DataFrame, steps: list[str]) -> pd.DataFrame:
+    """In the given recipe steps, predict the train runs' recipe mean instead of the model.
+
+    ``scripts/step_choice.py`` picks these steps on cross-validation folds: steps where the target barely moves
+    (a closed valve, a gas that is off), so the model only adds noise around the recipe value. Rows in them get
+    ``pred = recipe`` and ``model_used = 레시피 평균``; ``pred_model`` keeps what the model said. Anything that
+    happens inside these steps (a fault, an unusual run) is not seen there."""
+
+    preds = [c for c in frame.columns if c == "pred" or (c.startswith("pred_+") and not c.endswith(("_full", "_cycle")))]
+    if not preds or f"recipe{preds[0][4:]}" not in frame:
+        raise PredictError("the model folder has no recipe mean (template.parquet); step rule needs a virtual-sensor model")
+    out = frame.copy()
+    mask = out["step_name"].astype(str).isin(set(steps)).to_numpy()
+    for col in preds:
+        out[f"{col}_model"] = out[col]
+        out.loc[mask, col] = out.loc[mask, f"recipe{col[4:]}"]
+    used = out["model_used"].to_numpy(dtype=object) if "model_used" in out else np.full(len(out), "모델", dtype=object)
+    used[mask] = "레시피 평균"
+    out["model_used"] = used
+    out.attrs.update(frame.attrs, recipe_steps=list(steps))
     return out
 
 
@@ -194,14 +237,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--html", action="store_true",
                         help="예측을 시간 순서대로 재생하는 HTML도 만든다 (<출력 CSV 이름>_player.html)")
     parser.add_argument("--cycle-model", help="사이클 전용 모델 폴더. 주면 사이클 안은 이 모델, 나머지는 model_dir 모델로 예측한다")
+    parser.add_argument("--recipe-steps", help="recipe_steps.json. 여기 적힌 step에서는 모델 대신 학습 run의 레시피 평균을 쓴다")
     args = parser.parse_args(argv)
     files = trace_files(args.csv)
-    frame = (predict_pair(args.model_dir, args.cycle_model, files, device=args.device) if args.cycle_model
-             else predict_traces(args.model_dir, files, device=args.device))
+    steps = load_recipe_steps(args.recipe_steps) if args.recipe_steps else None
+    if args.cycle_model:
+        frame = predict_pair(args.model_dir, args.cycle_model, files, device=args.device, recipe_steps=steps)
+    else:
+        frame = predict_traces(args.model_dir, files, device=args.device)
+        frame = use_recipe_steps(frame, steps) if steps else frame
     out = Path(args.out) if args.out else Path(args.model_dir) / "predictions.csv"
     frame.to_csv(out, index=False, encoding="utf-8-sig")  # BOM: Excel opens Korean text correctly
     print(f"{frame.attrs.get('target')}: run {len(files)}개 → 예측 {len(frame):,}행 → {out}"
-          + (f" (사이클 전용 모델 {int((frame['model_used'] == '사이클 전용').sum()):,}행)" if "model_used" in frame else ""))
+          + (f" (사이클 전용 모델 {int((frame['model_used'] == '사이클 전용').sum()):,}행)" if "model_used" in frame else "")
+          + (f" (레시피 평균 {int((frame['model_used'] == '레시피 평균').sum()):,}행)" if steps else ""))
     for line in describe_errors(frame):
         print("  " + line)
     if args.html:

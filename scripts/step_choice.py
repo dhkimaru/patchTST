@@ -4,14 +4,17 @@
 같은 실험의 레시피 평균 예측(predictions_val.parquet)을 step 이름별로 모은다. 묶음 k에서 어떤 step을 레시피 평균으로 바꿀지는
 나머지 묶음에서만 정하고(그 step의 레시피 평균 오차 합이 조합보다 작으면 바꿈), 묶음 k에서 채점해 조합만 쓴 경우와 비교한다.
 학습 모델은 seed별 오차의 평균이다. 학습 없음, 시험 run 미사용.
+step_choice.json에는 대상마다 채택 여부(모든 묶음에서 나아짐: 변화 평균 < 0, 가장 큰 값 < 0)와 바꾼 step을 남긴다.
+scripts/export_pair.py가 이 파일을 읽어 채택된 대상의 패키지에 recipe_steps.json을 넣는다(ald-predict --recipe-steps).
 
-    python scripts/step_choice.py                 # → work/reports/step_choice.txt
+    python scripts/step_choice.py                 # → work/reports/step_choice.txt, step_choice.json
     python scripts/step_choice.py --model ridge   # 다른 모델로 확인할 때
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -97,7 +100,7 @@ lines: list[str] = ["## step별 레시피 평균 사용 · 0.5초 조합 · 교�
                     "묶음 k의 step 선택은 나머지 묶음의 오차 합으로만 정한다. 변화는 '선택 MAE ÷ 조합 MAE − 1'(음수면 나아짐), "
                     "바꾼 step은 묶음의 절반을 넘게 레시피 평균으로 고른 step, 행 %는 그 step들이 차지하는 행의 몫이다."]
 targets = sorted(set(led.loc[st.str.match(r"^res05_cv\d+$"), "target"])) if len(led) else []
-summary, detail = [], []
+summary, detail, decisions = [], [], {}
 for target in targets:
     folds = {k: e for k in range(1, args.folds + 1) if (e := fold_errors(k, target)) is not None}
     if len(folds) < 2:
@@ -121,6 +124,10 @@ for target in targets:
     summary.append({"대상": target, "묶음 수": len(folds), "조합 MAE": f"{np.mean(pair_mae):.4g}",
                     "step 선택 MAE": f"{np.mean(pick_mae):.4g}", "변화 (%)": f"{ch.mean():.1f} ± {ch.std():.1f}",
                     "가장 큰 값": round(ch.max(), 1), "바꾼 step 수": len(steady), "바꾼 step 행 %": round(share, 1)})
+    decisions[target] = {"adopt": bool(ch.mean() < 0 and ch.max() < 0), "steps": steady, "folds": len(folds),
+                         "change_mean": round(float(ch.mean()), 2), "change_sd": round(float(ch.std()), 2),
+                         "change_max": round(float(ch.max()), 2), "rows_share": round(float(share), 1),
+                         "model": args.model}
     for s in steady:
         r = pooled.loc[s]
         detail.append({"대상": target, "step": s, "행 %": round(100 * r["n"] / pooled["n"].sum(), 1),
@@ -136,4 +143,5 @@ if detail:
 text = "\n".join(lines) if summary else "비교할 실험(교차검증 묶음의 0.5초 공정 전체 · 사이클 전용 · 레시피 평균)이 아직 없습니다."
 (P.work_root / "reports").mkdir(parents=True, exist_ok=True)
 (P.work_root / "reports" / "step_choice.txt").write_text(text, encoding="utf-8")
+(P.work_root / "reports" / "step_choice.json").write_text(json.dumps(decisions, ensure_ascii=False, indent=1), encoding="utf-8")
 print(text)

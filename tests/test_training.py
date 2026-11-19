@@ -182,6 +182,8 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     choice = (paths.work_root / "reports" / "step_choice.txt").read_text(encoding="utf-8")
     line = next(x for x in choice.split("[대상별 요약]")[1].splitlines() if x.strip().startswith("TempAct_C"))
     assert line.split()[1] == "2" and "±" in line  # two folds, change as mean ± SD
+    decision = json.loads((paths.work_root / "reports" / "step_choice.json").read_text(encoding="utf-8"))["TempAct_C"]
+    assert decision["folds"] == 2 and decision["adopt"] == (decision["change_mean"] < 0 and decision["change_max"] < 0)
     # scripts/pair_test.py opens the test runs only for the chosen targets and scores the 0.5 s region pair there.
     import sys
 
@@ -203,6 +205,9 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     from ald_lab.training.predict import predict_pair, predict_traces
 
     os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    rule = {"adopt": True, "steps": ["SI-FL1", "END"], "folds": 2, "change_mean": -3.0, "change_sd": 1.0,
+            "change_max": -1.0, "rows_share": 20.0, "model": "ridge"}
+    (paths.work_root / "reports" / "step_choice.json").write_text(json.dumps({"TempAct_C": rule}), encoding="utf-8")
     sys.argv = ["export_pair.py", "--targets", "TempAct_C", "--model", "ridge", "--no-zip"]
     try:
         runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "export_pair.py"), run_name="__main__")
@@ -212,8 +217,17 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     package = next((paths.work_root / "packages").glob("pair_*")) / "TempAct_C"
     assert {"full", "cycle", "predict.sh", "predict.bat", "README.txt"} <= {p.name for p in package.iterdir()}
     assert "--cycle-model" in (package / "predict.sh").read_text(encoding="utf-8")
+    for script in ("predict.sh", "predict.bat"):  # the step rule chosen on CV folds travels with the package
+        assert "--recipe-steps" in (package / script).read_text(encoding="utf-8")
+    assert json.loads((package / "recipe_steps.json").read_text(encoding="utf-8"))["steps"] == ["SI-FL1", "END"]
+    assert "레시피 평균" in (package / "README.txt").read_text(encoding="utf-8")
     trace = sorted(paths.data_root.glob("standard_trace_*.csv"))[:1]
     pair = predict_pair(package / "full", package / "cycle", trace)
+    ruled = predict_pair(package / "full", package / "cycle", trace, recipe_steps=["SI-FL1", "END"])
+    hit = ruled["step_name"].isin(["SI-FL1", "END"])
+    assert hit.any() and (~hit).any() and "recipe" in pair
+    assert np.allclose(ruled.loc[hit, "pred"], ruled.loc[hit, "recipe"]) and ruled.loc[hit, "model_used"].eq("레시피 평균").all()
+    assert np.allclose(ruled.loc[~hit, "pred"], pair.loc[~hit, "pred"]) and np.allclose(ruled["pred_model"], pair["pred"])
     full = predict_traces(package / "full", trace)
     cyc = predict_traces(package / "cycle", trace)
     assert len(pair) == len(full) and (pair["model_used"] == "사이클 전용").any() and (pair["model_used"] == "공정 전체").any()
@@ -226,6 +240,19 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert predict_main([str(package / "full"), "--cycle-model", str(package / "cycle"), "--csv", str(trace[0]),
                          "--out", str(out_csv)]) == 0
     assert "model_used" in pd.read_csv(out_csv).columns
+    assert predict_main([str(package / "full"), "--cycle-model", str(package / "cycle"), "--csv", str(trace[0]),
+                         "--recipe-steps", str(package / "recipe_steps.json"), "--out", str(out_csv)]) == 0
+    assert pd.read_csv(out_csv)["model_used"].eq("레시피 평균").any()
+    # scripts/step_rule_test.py scores pair, pair + step rule and the recipe mean on validation and (reused) test runs.
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    sys.argv = ["step_rule_test.py", "--model", "ridge", "--gpu", "cpu"]
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "step_rule_test.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    rule_text = (paths.work_root / "reports" / "step_rule_test.txt").read_text(encoding="utf-8")
+    assert "[검증 run]" in rule_text and "[시험 run]" in rule_text and "TempAct_C" in rule_text and "규칙 MAE" in rule_text
     with pytest.raises(ValueError):  # the full-process model is not a cycle-only model
         predict_pair(package / "full", package / "full", trace)
     # scripts/vg11_steps.py splits the pair's error by step and run on validation and (reused) test runs, no training.
