@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import pytest
@@ -129,3 +131,31 @@ def test_queue_worker_and_records(lab, tmp_path, monkeypatch):  # noqa: F811
     assert data.experiments == [] and len(data.ledger) == len(jobs)
     html = render(data, examples=False)
     assert "⑦ 누적 기록" in html and "LightGBM 잎 수" in html and "num_leaves=15" in html
+
+
+def test_worker_runs_the_result_summaries_after_each_batch(tmp_path, monkeypatch):
+    """When the queue drains the worker runs the result scripts once; requests queued meanwhile run next."""
+    calls, queue = [], iter(["a", None, "b", None, None])
+    monkeypatch.setattr(launch, "_next", lambda work_root: next(queue))
+    monkeypatch.setattr(launch, "run_request", lambda folder: calls.append(folder))
+    monkeypatch.setattr(launch, "run_result_scripts", lambda work_root: calls.append("results"))
+    monkeypatch.setenv("ALD_AUTO_RESULTS", "1")
+    assert launch.run_worker(tmp_path) == 2 and calls == ["a", "results", "b", "results"]
+    calls.clear()
+    queue = iter(["c", None])
+    monkeypatch.setenv("ALD_AUTO_RESULTS", "0")
+    assert launch.run_worker(tmp_path) == 1 and calls == ["c"]
+
+
+def test_result_scripts_run_one_after_another_and_record_each(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "ok.py").write_text("import os, pathlib\n"
+                                   "pathlib.Path(os.environ['ALD_WORK_ROOT'], 'reports', 'ok.txt').write_text('done')\n")
+    (scripts / "bad.py").write_text("raise SystemExit(3)\n")
+    work = tmp_path / "work"
+    status = launch.run_result_scripts(work, (scripts / "bad.py", scripts / "ok.py"))
+    assert [(s["name"], s["returncode"]) for s in status["scripts"]] == [("bad.py", 3), ("ok.py", 0)]
+    assert status["finished"] and (work / "reports" / "ok.txt").read_text() == "done"  # a failure does not stop the rest
+    assert json.loads(launch.results_status_path(work).read_text(encoding="utf-8")) == status
+    assert "== ok.py" in (work / "reports" / "results_run.log").read_text(encoding="utf-8")

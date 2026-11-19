@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import threading
 import time
 from http import HTTPStatus
@@ -29,6 +30,8 @@ from . import launch
 from .paths import LabPaths, resolve_paths
 
 REBUILD_CHECK_SECONDS = 15
+REPORT_NAME = re.compile(r"^[A-Za-z0-9_.-]+\.(txt|log)$")  # result files under work/reports/, no folders
+REPORT_MAX_BYTES = 8_000_000
 TASK_NAMES = {"forecast": "미래값 예측", "virtual_sensor": "가상 센서", "thickness": "두께 예측"}
 LOADING = ("<!doctype html><html lang='ko'><meta charset='utf-8'><meta http-equiv='refresh' content='5'>"
            "<body style='font:15px sans-serif;padding:40px;background:#111;color:#eee'>보고서를 만드는 중입니다… "
@@ -85,6 +88,33 @@ class Lab:
             except OSError as exc:  # a file vanishing mid-scan must not stop the watcher
                 print(f"보고서 확인 건너뜀: {exc}", flush=True)
             time.sleep(REBUILD_CHECK_SECONDS)
+
+    # -- result summaries (work/reports/*.txt, read-only) ----------------------------------------------------
+    def report_list(self) -> dict[str, Any]:
+        """The result files the summaries wrote, newest first, and the last automatic run (launch.run_result_scripts)."""
+
+        root = self.paths.work_root / "reports"
+        files = sorted((p for p in root.glob("*") if REPORT_NAME.match(p.name) and p.is_file()),
+                       key=lambda p: p.stat().st_mtime, reverse=True) if root.is_dir() else []
+        status = launch.results_status_path(self.paths.work_root)
+        return {"files": [{"name": p.name, "bytes": p.stat().st_size,
+                           "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p.stat().st_mtime))}
+                          for p in files],
+                "results": json.loads(status.read_text(encoding="utf-8")) if status.is_file() else None}
+
+    def report_text(self, name: str) -> str | None:
+        """One result file by name (no folders); the view-only address masks server paths as the page does."""
+
+        path = self.paths.work_root / "reports" / name
+        if not REPORT_NAME.match(name) or not path.is_file() or path.stat().st_size > REPORT_MAX_BYTES:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if not launch_enabled():
+            for raw, label in ((self.paths.work_root, "<work>"), (launch.PROJECT_ROOT, "<ald-lab>"),
+                               (self.paths.data_root, "<data>"), (Path.home(), "<home>")):
+                if raw:
+                    text = text.replace(str(raw), label)
+        return text
 
     def ledger(self):
         from .ledger import collect_ledger
@@ -274,7 +304,9 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                 elif url.path == "/api/meta":
                     self._json(lab.meta())
                 elif url.path == "/api/status":
-                    self._json({"built_at": lab.built_at, "error": lab.build_error,
+                    from .report.render import _git_commit
+
+                    self._json({"built_at": lab.built_at, "error": lab.build_error, "code": _git_commit(),
                                 "worker": launch.worker_running(lab.paths.work_root)})
                 elif url.path == "/api/fragment/queue":
                     from .report.lab import queue_html
@@ -288,6 +320,14 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                     from .report.lab import first_html
 
                     self._html(first_html(lab.ledger(), live=launch_enabled()))
+                elif url.path == "/api/reports":
+                    self._json(lab.report_list())
+                elif url.path == "/api/report":
+                    text = lab.report_text((parse_qs(url.query).get("name") or [""])[0])
+                    if text is None:
+                        self._send(404, "없는 결과 파일입니다".encode("utf-8"), "text/plain; charset=utf-8")
+                    else:
+                        self._send(200, text.encode("utf-8"), "text/plain; charset=utf-8")
                 elif url.path == "/api/log":
                     request_id = (parse_qs(url.query).get("id") or [""])[0]
                     self._send(200, launch.log_tail(lab.paths.work_root, request_id, 80).encode("utf-8"),

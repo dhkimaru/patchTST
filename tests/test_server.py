@@ -125,6 +125,18 @@ def test_view_only_server_refuses_runs(lab, bases, monkeypatch):  # noqa: F811
         server.rebuild()
         page = _http(port, "/")
         assert "보기 전용" in page and str(paths.work_root) not in page
+        # result summaries are readable here too (GET only), with server paths masked as on the page
+        reports = paths.work_root / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        (reports / "raw_scale.txt").write_text(f"표 1\n{paths.work_root}/experiments/x\n", encoding="utf-8")
+        assert _http(port, "/api/status")["code"]  # which code the server runs, readable from outside
+        listing = _http(port, "/api/reports")
+        assert "raw_scale.txt" in [f["name"] for f in listing["files"]] and listing["results"] is None
+        text = _http(port, "/api/report?name=raw_scale.txt")
+        assert "표 1" in text and "<work>/experiments/x" in text and str(paths.work_root) not in text
+        for bad in ("../raw_scale.txt", "ald_report_latest.html", "nothing.txt"):
+            with pytest.raises(urllib.error.HTTPError):
+                _http(port, f"/api/report?name={bad}")
     finally:
         httpd.shutdown()
         httpd.server_close()

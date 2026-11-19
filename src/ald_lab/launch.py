@@ -592,8 +592,51 @@ def run_request(folder: Path, *, poll: float = 3.0) -> dict[str, Any]:
     return record
 
 
+# Result summaries (no training) the worker runs when the queue drains; run_drift goes first because side_studies and
+# combine_predictions read the run types it writes. Their txt files land in work/reports/ (served by /api/report).
+RESULT_SCRIPTS = ("run_drift.py", "side_studies.py", "combine_predictions.py", "raw_scale.py", "accuracy.py")
+
+
+def auto_results_enabled() -> bool:
+    return os.environ.get("ALD_AUTO_RESULTS", "1") != "0"
+
+
+def results_status_path(work_root: Path) -> Path:
+    return Path(work_root) / "reports" / "results_status.json"
+
+
+def run_result_scripts(work_root: Path, scripts: tuple[str | Path, ...] | None = None) -> dict[str, Any]:
+    """Run the result summaries one after another. Exit code and time per script go to reports/results_status.json,
+    their output to reports/results_run.log; a failing script does not stop the others."""
+
+    work_root = Path(work_root)
+    reports = work_root / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    paths = [Path(s) if Path(s).is_absolute() else PROJECT_ROOT / "scripts" / str(s) for s in (scripts or RESULT_SCRIPTS)]
+    status: dict[str, Any] = {"started": _now().isoformat(timespec="seconds"), "finished": None, "scripts": []}
+
+    def save() -> None:
+        results_status_path(work_root).write_text(json.dumps(status, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    save()
+    env = {**os.environ, "ALD_WORK_ROOT": str(work_root)}
+    with (reports / "results_run.log").open("ab") as log:
+        for path in paths:
+            log.write(f"\n== {path.name} {_now():%Y-%m-%d %H:%M:%S}\n".encode("utf-8"))
+            log.flush()
+            begin = time.time()
+            code = subprocess.call([sys.executable, str(path)], stdout=log, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL, cwd=str(PROJECT_ROOT), env=env)
+            status["scripts"].append({"name": path.name, "returncode": code, "seconds": round(time.time() - begin, 1)})
+            save()
+    status["finished"] = _now().isoformat(timespec="seconds")
+    save()
+    return status
+
+
 def run_worker(work_root: Path) -> int:
-    """Run queued requests one after another until the queue is empty (one worker at a time)."""
+    """Run queued requests one after another until the queue is empty (one worker at a time). When a batch has
+    finished, the result summaries run too (ALD_AUTO_RESULTS=0 turns that off); requests queued meanwhile run next."""
 
     work_root = Path(work_root)
     handle = _lock(work_root)
@@ -605,10 +648,15 @@ def run_worker(work_root: Path) -> int:
             if doc and doc.get("status") == "running":
                 update_request(folder, status="failed", pid=None, error="작업자가 중간에 멈춤")
         count = 0
-        while (folder := _next(work_root)) is not None:
-            run_request(folder)
-            count += 1
-        return count
+        while True:
+            ran = 0
+            while (folder := _next(work_root)) is not None:
+                run_request(folder)
+                ran += 1
+            count += ran
+            if not ran or not auto_results_enabled():
+                return count
+            run_result_scripts(work_root)
     finally:
         handle.close()
 
@@ -627,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
     p_cancel = sub.add_parser("cancel", help="요청 취소 (실행 중이면 멈춤)")
     p_cancel.add_argument("request_id")
     sub.add_parser("worker", help="대기열이 빌 때까지 실행 (보통 자동으로 뜬다)")
+    sub.add_parser("results", help="결과 정리 스크립트 다섯 개를 지금 실행 (학습 없음, work/reports/)")
     p_first = sub.add_parser("first", help="모델 선정 단계: 대상별 PatchTST 최고 · 기준선 대비 판정 (LightGBM 참고)")
     p_stage2 = sub.add_parser("stage2", help="1단계 탐색 상위 조합을 모든 대상에 (대기열에 넣음)")
     p_stage3 = sub.add_parser("stage3", help="PatchTST가 기준을 못 넘은 대상에 다른 모델 (대기열에 넣음)")
@@ -658,6 +707,10 @@ def main(argv: list[str] | None = None) -> int:
         print(cancel(paths.work_root, args.request_id))
     elif args.command == "worker":
         print(f"요청 {run_worker(paths.work_root)}개 처리")
+    elif args.command == "results":
+        status = run_result_scripts(paths.work_root)
+        for item in status["scripts"]:
+            print(f"{item['name']:<24} {'완료' if item['returncode'] == 0 else '실패 (results_run.log 확인)'} · {item['seconds']:.0f}초")
     else:
         _stage_command(args, paths)
     return 0

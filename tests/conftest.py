@@ -134,3 +134,10 @@ def exsitu_xlsx(tmp_path: Path) -> Path:
     path = tmp_path / "metrology.xlsx"
     wb.save(path)
     return path
+
+
+@pytest.fixture(autouse=True)
+def _no_auto_results(monkeypatch):
+    """The queue worker runs the result summaries when the queue drains; tests that need it turn it back on."""
+    monkeypatch.setenv("ALD_AUTO_RESULTS", "0")
+
