@@ -594,7 +594,8 @@ def run_request(folder: Path, *, poll: float = 3.0) -> dict[str, Any]:
 
 # Result summaries (no training) the worker runs when the queue drains; run_drift goes first because side_studies and
 # combine_predictions read the run types it writes. Their txt files land in work/reports/ (served by /api/report).
-RESULT_SCRIPTS = ("run_drift.py", "side_studies.py", "combine_predictions.py", "raw_scale.py", "accuracy.py")
+RESULT_SCRIPTS = ("run_drift.py", "side_studies.py", "combine_predictions.py", "raw_scale.py", "step_choice.py",
+                  "accuracy.py")
 
 
 def auto_results_enabled() -> bool:
@@ -675,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
     p_cancel = sub.add_parser("cancel", help="요청 취소 (실행 중이면 멈춤)")
     p_cancel.add_argument("request_id")
     sub.add_parser("worker", help="대기열이 빌 때까지 실행 (보통 자동으로 뜬다)")
-    sub.add_parser("results", help="결과 정리 스크립트 다섯 개를 지금 실행 (학습 없음, work/reports/)")
+    sub.add_parser("results", help="결과 정리 스크립트를 지금 실행 (학습 없음, work/reports/)")
     p_first = sub.add_parser("first", help="모델 선정 단계: 대상별 PatchTST 최고 · 기준선 대비 판정 (LightGBM 참고)")
     p_stage2 = sub.add_parser("stage2", help="1단계 탐색 상위 조합을 모든 대상에 (대기열에 넣음)")
     p_stage3 = sub.add_parser("stage3", help="PatchTST가 기준을 못 넘은 대상에 다른 모델 (대기열에 넣음)")

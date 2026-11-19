@@ -168,6 +168,20 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert "[교차검증 1]" in text.split("## 구간 전용 조합")[1]
     summary = text.split("교차검증 묶음 요약")[1]
     assert "0.5초 조합 ÷ 1초 공정 전체 − 1 (%)" in summary and "TempAct_C" in summary
+    # scripts/step_choice.py: per recipe step, the recipe mean where the other folds say it beats the pair
+    import sys
+
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    argv0 = sys.argv
+    sys.argv = ["step_choice.py", "--model", "ridge", "--folds", "2"]
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "step_choice.py"), run_name="__main__")
+    finally:
+        sys.argv = argv0
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    choice = (paths.work_root / "reports" / "step_choice.txt").read_text(encoding="utf-8")
+    line = next(x for x in choice.split("[대상별 요약]")[1].splitlines() if x.strip().startswith("TempAct_C"))
+    assert line.split()[1] == "2" and "±" in line  # two folds, change as mean ± SD
     # scripts/pair_test.py opens the test runs only for the chosen targets and scores the 0.5 s region pair there.
     import sys
 

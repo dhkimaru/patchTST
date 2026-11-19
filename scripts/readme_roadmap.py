@@ -63,10 +63,10 @@ CARDS = {
         ["교차검증 5묶음 · VG11은 5 %", "→ 8개 대상 최종 구성"], "채택", None),
     8: ("M", 824, "solve", "10", "시험 run 다시 확인", "11-16 · 재사용, 참고", "검증 대비 시험 run 오차 (가스 · 밸브)", "0.4~1.2배",
         ["시험 오차도 1초보다 9~47 % 낮음", "VG11만 레시피 평균보다 나쁨"], "확인", None),
-    "9a": ("R", 748, "next", "11", "나머지 가상 센서 8개", "11-16 · split_v2", "0.5초 조합 오차 감소 (1초 대비)", "29 · 15 %",
-           ["R.PWR · P.POS만 10 % 넘게", "→ 다음: 교차검증 5묶음"], "유력", "지금"),
-    "9b": ("R", 902, "next", "12", "VG11 사이클 밖 오차", "다음 계획", "시험 run 오차 (레시피 평균 대비)", "1.6배",
-           ["오차의 99 %가 사이클 밖", "→ 원인 분석 예정"], "계획", None),
+    "9a": ("R", 748, "solve", "11", "나머지 가상 센서 8개", "11-16 ~ 11-17", "0.5초 조합 오차 감소 (1초 대비, 5묶음)", "35 · 18 %",
+           ["R.PWR · P.POS, 5묶음 모두 감소", "온도 5 · L.POS는 1초 유지"], "채택", None),
+    "9b": ("R", 902, "next", "12", "VG11 사이클 밖 오차", "11-20 · 학습 없음", "사이클 밖 오차 중 대기압 근처 구간", "93~96%",
+           ["모델이 이 구간 압력을 낮게 예측", "→ 이 구간은 따로 평가 검토"], "확인", "지금"),
 }
 VERDICT_COLOR = {"채택": "good", "채택 유지": "good", "일부 채택": "good", "유력": "good", "확인": "fact", "정정": "warn",
                  "문제 발견": "problem", "계획": "next"}
@@ -166,7 +166,7 @@ def figure(t):
 
     # header + hero number
     p.append(T(40, 46, "실험 로드맵", t, 26, "ink", 800))
-    p.append(T(40, 73, "가상 센서의 새 run 오차 원인 추적과 해결 과정 · 1~633차, 11-16 기준", t, 13.5, "ink2"))
+    p.append(T(40, 73, "가상 센서의 새 run 오차 원인 추적과 해결 과정 · 1~648차, 11-20 기준", t, 13.5, "ink2"))
     v1, v2 = "1.0~2.2배", "0.4~1.2배"
     w2 = tw(v2, 22, True); w1 = tw(v1, 22, True)
     x2 = 940 - w2; xa = x2 - 30; x1 = xa - 6 - w1
@@ -217,10 +217,9 @@ def figure(t):
     p.append(f'<circle cx="{jx}" cy="{jy}" r="8" fill="{t["card"]}" stroke="{t["solve"]}" stroke-width="4.5"/>')
     y7 = my(7)
     arrow(p, t, (rgt(7), y7), (lft(8) - GAP, y7), "r", "solve")
-    for k, dashed in (("9a", False), ("9b", True)):
+    for k in ("9a", "9b"):
         yk = my(k)
-        arrow(p, t, (rgt(8), y7), (lft(k) - GAP, yk), "r", "next", via=((rgt(8) + 52, y7), (lft(k) - 52, yk)),
-              dashed=dashed)
+        arrow(p, t, (rgt(8), y7), (lft(k) - GAP, yk), "r", CARDS[k][2], via=((rgt(8) + 52, y7), (lft(k) - 52, yk)))
 
     for k in CARDS:
         draw_card(p, t, k)
@@ -236,7 +235,7 @@ def figure(t):
     pill(p, t, g1, my("5b") - 27, "① 해법과 결합", "cause")
     pill(p, t, jx + 18, jy, "둘 다 효과 → 합침", "solve", "start")
     pill(p, t, g1, y7 - 27, "채택 → 시험 run", "solve")
-    pill(p, t, g2, my("9a") - 31, "해결 → 나머지", "next")
+    pill(p, t, g2, my("9a") - 31, "해결 → 나머지", "solve")
     pill(p, t, g2, my("9b") + 31, "VG11만 남음", "next")
 
     # experiments that did not lead on
@@ -256,7 +255,7 @@ def figure(t):
             "시험 run은 설정 선택에 쓰지 않은 마지막 11개 run, 11-04 · 11-16(재사용, 참고)에서만 사용."]):
         p.append(T(40, ny + 18 * i, line, t, 11.5, "muted"))
     H = ny + 52
-    title = "실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이기까지 (1~633차)"
+    title = "실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이기까지 (1~648차)"
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
             f'aria-label="{escape(title)}" font-family="{FONT}"><title>{escape(title)}</title>{"".join(p)}</svg>')
 
