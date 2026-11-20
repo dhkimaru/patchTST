@@ -82,7 +82,7 @@ def test_block_average_respects_time_breaks(lab):
     assert arrays["values"][0, 0] == pytest.approx(raw[:2].mean(), rel=1e-6)
 
 
-def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
+def test_step_aligned_blocks_never_mix_steps(lab, tmp_path, monkeypatch):
     """bin_align "step" restarts the 1 s blocks at every step change; "run" keeps the original grouping and cache key."""
     import hashlib
     from itertools import pairwise
@@ -174,6 +174,9 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
     argv0 = sys.argv
     sys.argv = ["step_choice.py", "--model", "ridge", "--folds", "2"]
+    from ald_lab.training import evaluate
+
+    monkeypatch.setitem(evaluate.LEVEL_SPLITS, "TempAct_C", (530.0, "℃"))  # the synthetic temperature sits around 530: both ranges get rows
     try:
         runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "step_choice.py"), run_name="__main__")
     finally:
@@ -184,6 +187,8 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
     assert line.split()[1] == "2" and "±" in line  # two folds, change as mean ± SD
     decision = json.loads((paths.work_root / "reports" / "step_choice.json").read_text(encoding="utf-8"))["TempAct_C"]
     assert decision["folds"] == 2 and decision["adopt"] == (decision["change_mean"] < 0 and decision["change_max"] < 0)
+    assert "[압력 구간별]" in choice and set(decision["levels"]) == set(evaluate.LEVEL_NAMES)
+    assert abs(sum(v["rows_pct"] for v in decision["levels"].values()) - 100) < 0.5
     # scripts/pair_test.py opens the test runs only for the chosen targets and scores the 0.5 s region pair there.
     import sys
 
@@ -253,6 +258,7 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path):
         del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
     rule_text = (paths.work_root / "reports" / "step_rule_test.txt").read_text(encoding="utf-8")
     assert "[검증 run]" in rule_text and "[시험 run]" in rule_text and "TempAct_C" in rule_text and "규칙 MAE" in rule_text
+    assert "[압력 구간별]" in rule_text and "대기압 근처" in rule_text
     with pytest.raises(ValueError):  # the full-process model is not a cycle-only model
         predict_pair(package / "full", package / "full", trace)
     # scripts/vg11_steps.py splits the pair's error by step and run on validation and (reused) test runs, no training.
@@ -375,6 +381,48 @@ def test_thickness_experiment(lab, tmp_path):
     assert set(results["model"]) == {"mean", "ridge", "pls"}
     test = run_final_test(exp_dir, paths, device="cpu")
     assert len(test) >= 2
+
+
+def test_vm_audit_script(lab, tmp_path, monkeypatch):
+    """scripts/vm_audit.py: split-half reliability, time baselines, cycle count, idle time, feature chance level."""
+    import runpy
+    import sys
+
+    paths, split_path = lab
+    rng = np.random.default_rng(3)
+    paths.overview_dir.mkdir(parents=True, exist_ok=True)
+    blocks, points, catalog = [], [], []
+    for i, run_id in enumerate(RUNS, start=1):
+        level = 80 + 2.0 * rng.normal()  # a real run-to-run difference far above the point noise
+        waps = []
+        for wap in range(1, 6):
+            vals = level + 0.05 * rng.normal(size=49)
+            waps.append(vals)
+            points += [{"block_id": f"b{i}", "point": k + 1, "x_mm": 0.0, "y_mm": 0.0, "wap_index": wap,
+                        "thickness_a": float(v)} for k, v in enumerate(vals)]
+        means = [w.mean() for w in waps]
+        blocks.append({"run_id": run_id, "block_id": f"b{i}", "layout": "49pt", "thk_mean": float(np.mean(means)),
+                       "uf_pct_mean": float(np.mean([(w.max() - w.min()) / (2 * w.mean()) * 100 for w in waps])),
+                       "wtow_pct": float((max(means) - min(means)) / (2 * np.mean(means)) * 100)})
+        start = pd.Timestamp(f"2025-04-{10 + i} 10:00:00")
+        catalog.append({"run_id": run_id, "run_no": i, "process_start": start, "process_end": start + pd.Timedelta(hours=4),
+                        "n_cycles": 25})
+    pd.DataFrame(blocks).to_parquet(paths.overview_dir / "exsitu_blocks.parquet")
+    pd.DataFrame(points).to_parquet(paths.overview_dir / "exsitu_points.parquet")
+    pd.DataFrame(catalog).to_parquet(paths.overview_dir / "runs.parquet")
+    config = _config(tmp_path, split_path, task="thickness", name="vm", targets=["thk_mean", "uf_pct_mean"],
+                     models=["ridge"], vm={"exclude_runs": []})
+    monkeypatch.setenv("ALD_WORK_ROOT", str(paths.work_root))
+    monkeypatch.setenv("ALD_DATA_ROOT", str(paths.data_root))
+    monkeypatch.setattr(sys, "argv", ["vm_audit.py", "--config", str(config), "--reps", "20"])
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "vm_audit.py"), run_name="__main__")
+    text = (paths.work_root / "reports" / "vm_audit.txt").read_text(encoding="utf-8")
+    for part in ("[1. 대상 요약]", "[2. 측정 신뢰도", "[3. 시간 구조]", "[4. 사이클 수별 두께]", "[5. run 사이 대기 시간]",
+                 "[6. run 요약 특성과의 순위 상관]", "우연 수준"):
+        assert part in text, part
+    assert "standard_trace_006" not in text  # the sealed test run is never read
+    line = next(x for x in text.splitlines() if x.strip().startswith("thk_mean") and "같은 WAP" in x)
+    assert float(line.split()[-4]) > 0.9  # run levels 2 Å apart, point noise 0.05 Å: halves agree
 
 
 def test_parallel_workers(lab, tmp_path):

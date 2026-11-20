@@ -14,6 +14,22 @@ from .prepare import Bundle
 
 TRANSITION_SECONDS = 10.0
 SHORT_TRANSITION_SECONDS = 3.0  # right after a step change (valve and MFC edges)
+# Targets whose error is reported in two level ranges (user decision 2026-11-20). VG11 reads near-atmospheric pressure
+# while the boat moves, the tube back-fills and pumping starts; with every pressure gauge out of the inputs nothing tells
+# the model that level, so the virtual sensor is judged on the process-pressure rows and the rest is shown apart.
+# Rows are split by the train runs' recipe mean at that step position (not by the measured value), so the split does
+# not depend on the run being scored.
+LEVEL_SPLITS: dict[str, tuple[float, str]] = {"VG11": (10.0, "Torr")}
+LEVEL_NAMES = ("공정 압력", "대기압 근처")
+
+
+def level_ranges(target: str, recipe: Any) -> np.ndarray | None:
+    """Range label per row (``공정 압력`` / ``대기압 근처``) from the recipe mean, or None for other targets."""
+
+    split = LEVEL_SPLITS.get(target)
+    if split is None:
+        return None
+    return np.where(np.asarray(recipe, dtype=np.float64) > split[0], LEVEL_NAMES[1], LEVEL_NAMES[0])
 
 
 def _mae(err: np.ndarray, mask: np.ndarray | None = None) -> float | None:

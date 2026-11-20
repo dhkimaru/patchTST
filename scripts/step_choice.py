@@ -4,6 +4,8 @@
 같은 실험의 레시피 평균 예측(predictions_val.parquet)을 step 이름별로 모은다. 묶음 k에서 어떤 step을 레시피 평균으로 바꿀지는
 나머지 묶음에서만 정하고(그 step의 레시피 평균 오차 합이 조합보다 작으면 바꿈), 묶음 k에서 채점해 조합만 쓴 경우와 비교한다.
 학습 모델은 seed별 오차의 평균이다. 학습 없음, 시험 run 미사용.
+VG11처럼 수준이 두 갈래인 대상(training.evaluate.LEVEL_SPLITS)은 '공정 압력'과 '대기압 근처' 행으로 나눈 MAE도 적는다
+(학습 run의 레시피 평균으로 나누므로 평가 run의 실측과 무관하다). VG11 가상 센서는 공정 압력 구간으로 판정한다(2026-11-20).
 step_choice.json에는 대상마다 채택 여부(모든 묶음에서 나아짐: 변화 평균 < 0, 가장 큰 값 < 0)와 바꾼 step을 남긴다.
 scripts/export_pair.py가 이 파일을 읽어 채택된 대상의 패키지에 recipe_steps.json을 넣는다(ald-predict --recipe-steps).
 
@@ -22,6 +24,7 @@ import pandas as pd
 
 from ald_lab.ledger import collect_ledger
 from ald_lab.paths import resolve_paths
+from ald_lab.training.evaluate import LEVEL_SPLITS, level_ranges
 from ald_lab.training.prepare import TraceSource, run_arrays
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -67,7 +70,8 @@ def load(row) -> pd.DataFrame | None:
 
 
 def fold_errors(k: int, target: str) -> pd.DataFrame | None:
-    """Per step of fold k: summed absolute error of the pair (mean over seeds) and of the recipe mean, and rows."""
+    """Per (step, level range) of fold k: summed absolute error of the pair (mean over seeds) and of the recipe mean,
+    and rows. The range is ``전체`` except for targets in ``LEVEL_SPLITS``."""
 
     full = one_setting(led[(st == f"res05_cv{k}") & (led["target"] == target) & (led["model"] == args.model)])
     cyc = one_setting(led[(st == f"res05_cycle_cv{k}") & (led["target"] == target) & (led["model"] == args.model)])
@@ -91,7 +95,10 @@ def fold_errors(k: int, target: str) -> pd.DataFrame | None:
         m = m[m["step"] != ""]
         m["e_pair"] = (m["pair"] - m["true_0s"]).abs()
         m["e_rec"] = (m["rec"] - m["true_0s"]).abs()
-        parts.append(m.groupby("step").agg(e_pair=("e_pair", "sum"), e_rec=("e_rec", "sum"), n=("e_pair", "size")))
+        ranges = level_ranges(target, m["rec"])
+        m["range"] = "전체" if ranges is None else ranges
+        parts.append(m.groupby(["step", "range"]).agg(e_pair=("e_pair", "sum"), e_rec=("e_rec", "sum"),
+                                                      n=("e_pair", "size")))
     out = sum(p[["e_pair"]] for p in parts) / len(parts)  # seeds averaged on the pair; the recipe mean is one
     return out.join(parts[0][["e_rec", "n"]])
 
@@ -100,9 +107,10 @@ lines: list[str] = ["## step별 레시피 평균 사용 · 0.5초 조합 · 교�
                     "묶음 k의 step 선택은 나머지 묶음의 오차 합으로만 정한다. 변화는 '선택 MAE ÷ 조합 MAE − 1'(음수면 나아짐), "
                     "바꾼 step은 묶음의 절반을 넘게 레시피 평균으로 고른 step, 행 %는 그 step들이 차지하는 행의 몫이다."]
 targets = sorted(set(led.loc[st.str.match(r"^res05_cv\d+$"), "target"])) if len(led) else []
-summary, detail, decisions = [], [], {}
+summary, detail, decisions, levels = [], [], {}, []
 for target in targets:
-    folds = {k: e for k in range(1, args.folds + 1) if (e := fold_errors(k, target)) is not None}
+    by_range = {k: e for k in range(1, args.folds + 1) if (e := fold_errors(k, target)) is not None}
+    folds = {k: e.groupby(level="step").sum() for k, e in by_range.items()}
     if len(folds) < 2:
         continue
     changes, pair_mae, pick_mae, picked = [], [], [], {}
@@ -112,6 +120,13 @@ for target in targets:
         use_rec = rest["e_rec"] < rest["e_pair"]
         for step in use_rec[use_rec].index:
             picked[step] = picked.get(step, 0) + 1
+        if target in LEVEL_SPLITS:
+            fe = by_range[k]
+            use = use_rec.reindex(fe.index.get_level_values("step")).fillna(False).to_numpy(dtype=bool)
+            part = fe.assign(e_rule=np.where(use, fe["e_rec"], fe["e_pair"])).groupby(level="range").sum()
+            for name, r in part.iterrows():
+                levels.append({"target": target, "fold": k, "range": name, "n": r["n"], "rec": r["e_rec"] / r["n"],
+                               "pair": r["e_pair"] / r["n"], "rule": r["e_rule"] / r["n"]})
         chosen = np.where(use_rec, e["e_rec"], e["e_pair"]).sum() / e["n"].sum()
         plain = e["e_pair"].sum() / e["n"].sum()
         pair_mae.append(plain)
@@ -137,6 +152,26 @@ for target in targets:
 if summary:
     lines.append("\n[대상별 요약] 변화의 평균이 음수이고 가장 큰 값도 0보다 작으면 모든 묶음에서 나아진 것이다.")
     lines.append(pd.DataFrame(summary).to_string(index=False))
+if levels:
+    lv = pd.DataFrame(levels)
+    rows = []
+    for (target, name), g in lv.groupby(["target", "range"], sort=False):
+        threshold, unit = LEVEL_SPLITS[target]
+        total = lv[(lv["target"] == target)].groupby("fold")["n"].sum()
+        gain_pair, gain_rule = 100 * (1 - g["pair"] / g["rec"]), 100 * (1 - g["rule"] / g["rec"])
+        rows.append({"대상": target, "구간": name, "행 %": round(100 * (g["n"].to_numpy() / total.loc[g["fold"]].to_numpy()).mean(), 1),
+                     f"레시피 평균 MAE ({unit})": f"{g['rec'].mean():.4g}", f"조합 MAE ({unit})": f"{g['pair'].mean():.4g}",
+                     f"규칙 MAE ({unit})": f"{g['rule'].mean():.4g}",
+                     "조합 개선율 (%)": f"{gain_pair.mean():.1f} ± {gain_pair.std():.1f}",
+                     "규칙 개선율 (%)": f"{gain_rule.mean():.1f} ± {gain_rule.std():.1f}", "규칙 개선율 가장 작은 묶음": round(gain_rule.min(), 1)})
+        decisions.setdefault(target, {}).setdefault("levels", {})[name] = {
+            "rows_pct": rows[-1]["행 %"], "rec_mae": round(float(g["rec"].mean()), 6), "pair_mae": round(float(g["pair"].mean()), 6),
+            "rule_mae": round(float(g["rule"].mean()), 6), "rule_gain_mean": round(float(gain_rule.mean()), 2),
+            "rule_gain_sd": round(float(gain_rule.std()), 2), "rule_gain_min": round(float(gain_rule.min()), 2)}
+    lines.append("\n[압력 구간별] 대기압 근처 = 학습 run 레시피 평균이 " + ", ".join(
+        f"{t} {v[0]:g} {v[1]}" for t, v in LEVEL_SPLITS.items() if t in set(lv["target"])) +
+        "를 넘는 행. MAE는 묶음 평균, 개선율은 같은 구간의 레시피 평균 대비(묶음 평균 ± 표준편차). 판정은 공정 압력 구간으로 한다.")
+    lines.append(pd.DataFrame(rows).to_string(index=False))
 if detail:
     lines.append("\n[레시피 평균으로 바꾼 step] 모든 묶음을 합친 MAE")
     lines.append(pd.DataFrame(detail).to_string(index=False))
