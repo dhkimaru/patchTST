@@ -68,7 +68,9 @@ CARDS = {
     "9b": ("R", 902, "next", "12", "VG11 사이클 밖 오차", "11-20 · 학습 없음", "사이클 밖 오차 중 대기압 근처 구간", "93~96%",
            ["모델이 이 구간 압력을 낮게 예측", "→ 이 구간은 따로 평가 검토"], "확인", None),
     13: ("M", 1060, "solve", "13", "step별 레시피 평균", "11-20 · 학습 없음", "MAE 감소 (교차검증 5묶음, 1% 넘는 5개)", "3~9 %",
-         ["NH3 · 밸브 29 · R.PWR · VG11 · N2-4", "→ 예측 · 패키지에 반영"], "채택", "지금"),
+         ["NH3 · 밸브 29 · R.PWR · VG11 · N2-4", "→ 예측 · 패키지에 반영"], "채택", None),
+    14: ("L", 1060, "next", "14", "시험 run 확인 · VG11 구간", "11-21 · 학습 없음, 재사용 참고", "시험 run에서도 레시피 평균보다 나음",
+         "10개 중 9개", ["VG11 공정 압력 구간은 레시피 평균이 나음", "→ step × 압력 구간으로 다시 고름"], "확인", "지금"),
 }
 VERDICT_COLOR = {"채택": "good", "채택 유지": "good", "일부 채택": "good", "유력": "good", "확인": "fact", "정정": "warn",
                  "문제 발견": "problem", "계획": "next"}
@@ -168,7 +170,7 @@ def figure(t):
 
     # header + hero number
     p.append(T(40, 46, "실험 로드맵", t, 26, "ink", 800))
-    p.append(T(40, 73, "가상 센서의 새 run 오차 원인 추적과 해결 과정 · 1~650차, 11-20 기준", t, 13.5, "ink2"))
+    p.append(T(40, 73, "가상 센서의 새 run 오차 원인 추적과 해결 과정 · 1~654차, 11-21 기준", t, 13.5, "ink2"))
     v1, v2 = "1.0~2.2배", "0.4~1.2배"
     w2 = tw(v2, 22, True); w1 = tw(v1, 22, True)
     x2 = 940 - w2; xa = x2 - 30; x1 = xa - 6 - w1
@@ -224,6 +226,7 @@ def figure(t):
         arrow(p, t, (rgt(8), y7), (lft(k) - GAP, yk), "r", CARDS[k][2], via=((rgt(8) + 52, y7), (lft(k) - 52, yk)))
     arrow(p, t, (cx("9b"), bot("9b")), (rgt(13) + GAP, my(13)), "l", "next",
           via=((cx("9b"), my(13)), (rgt(13) + 52, my(13))))
+    arrow(p, t, (lft(13), my(14)), (rgt(14) + GAP, my(14)), "l", "next")
 
     for k in CARDS:
         draw_card(p, t, k)
@@ -242,9 +245,10 @@ def figure(t):
     pill(p, t, g2, my("9a") - 31, "해결 → 나머지", "solve")
     pill(p, t, g2, my("9b") + 31, "VG11만 남음", "next")
     pill(p, t, (rgt(13) + cx("9b")) / 2 - 10, my(13) + 30, "저압 구간 → step별 선택", "next")
+    pill(p, t, (rgt(14) + lft(13)) / 2, my(14) - 27, "채택 → 시험 run", "next")
 
     # experiments that did not lead on
-    fy = bot(13) + 36
+    fy = max(bot(13), bot(14)) + 36
     section(p, t, 40, fy, "이어지지 않은 실험과 이유", "fact")
     gap = 12; cw = (W - 80 - gap * (len(DEAD) - 1)) / len(DEAD)
     for i, (name, why) in enumerate(DEAD):
@@ -258,10 +262,10 @@ def figure(t):
             "화살표 위 글자는 판정 → 다음 실험. 개선율은 기준선(미래값: 현재값 유지, 가상 센서: 레시피 평균) 대비, 비교 대상이 다른 숫자는 카드에 표시.",
             "오차는 모두 MAE(평균 절대 오차). 개선율 = 1 - MAE ÷ 기준선 MAE, 오차 감소 = 1 - MAE ÷ 비교 대상 MAE, 배 = MAE끼리의 비, %p = 개선율끼리의 차이.",
             "판정: 채택 = 구성에 반영 · 일부 채택 = 일부 대상만 반영 · 유력 = 일부 분할에서 확인 · 확인 = 사실 확인 · 정정 = 앞선 결론 수정",
-            "시험 run은 설정 선택에 쓰지 않은 마지막 11개 run, 11-04 · 11-16(재사용, 참고)에서만 사용."]):
+            "시험 run은 설정 선택에 쓰지 않은 마지막 11개 run, 11-04 · 11-16 · 11-21(재사용, 참고)에서만 사용."]):
         p.append(T(40, ny + 18 * i, line, t, 11.5, "muted"))
     H = ny + 70
-    title = "실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이기까지 (1~650차)"
+    title = "실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이기까지 (1~654차)"
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
             f'aria-label="{escape(title)}" font-family="{FONT}"><title>{escape(title)}</title>{"".join(p)}</svg>')
 

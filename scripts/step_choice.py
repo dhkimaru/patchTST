@@ -4,7 +4,8 @@
 같은 실험의 레시피 평균 예측(predictions_val.parquet)을 step 이름별로 모은다. 묶음 k에서 어떤 step을 레시피 평균으로 바꿀지는
 나머지 묶음에서만 정하고(그 step의 레시피 평균 오차 합이 조합보다 작으면 바꿈), 묶음 k에서 채점해 조합만 쓴 경우와 비교한다.
 학습 모델은 seed별 오차의 평균이다. 학습 없음, 시험 run 미사용.
-VG11처럼 수준이 두 갈래인 대상(training.evaluate.LEVEL_SPLITS)은 '공정 압력'과 '대기압 근처' 행으로 나눈 MAE도 적는다
+VG11처럼 수준이 두 갈래인 대상(training.evaluate.LEVEL_SPLITS)은 step × 구간('공정 압력' · '대기압 근처') 칸마다 고르고(json의 cells),
+두 구간으로 나눈 MAE도 적는다
 (학습 run의 레시피 평균으로 나누므로 평가 run의 실측과 무관하다). VG11 가상 센서는 공정 압력 구간으로 판정한다(2026-11-20).
 step_choice.json에는 대상마다 채택 여부(모든 묶음에서 나아짐: 변화 평균 < 0, 가장 큰 값 < 0)와 바꾼 step을 남긴다.
 scripts/export_pair.py가 이 파일을 읽어 채택된 대상의 패키지에 recipe_steps.json을 넣는다(ald-predict --recipe-steps).
@@ -110,7 +111,10 @@ targets = sorted(set(led.loc[st.str.match(r"^res05_cv\d+$"), "target"])) if len(
 summary, detail, decisions, levels = [], [], {}, []
 for target in targets:
     by_range = {k: e for k in range(1, args.folds + 1) if (e := fold_errors(k, target)) is not None}
-    folds = {k: e.groupby(level="step").sum() for k, e in by_range.items()}
+    # Targets with two level ranges choose per (step, range) cell, so a step that runs from atmosphere down to process
+    # pressure can keep the model in one part and take the recipe mean in the other (2026-11-21).
+    cells = target in LEVEL_SPLITS
+    folds = by_range if cells else {k: e.groupby(level="step").sum() for k, e in by_range.items()}
     if len(folds) < 2:
         continue
     changes, pair_mae, pick_mae, picked = [], [], [], {}
@@ -120,9 +124,9 @@ for target in targets:
         use_rec = rest["e_rec"] < rest["e_pair"]
         for step in use_rec[use_rec].index:
             picked[step] = picked.get(step, 0) + 1
-        if target in LEVEL_SPLITS:
+        if cells:
             fe = by_range[k]
-            use = use_rec.reindex(fe.index.get_level_values("step")).fillna(False).to_numpy(dtype=bool)
+            use = use_rec.reindex(fe.index).fillna(False).to_numpy(dtype=bool)
             part = fe.assign(e_rule=np.where(use, fe["e_rec"], fe["e_pair"])).groupby(level="range").sum()
             for name, r in part.iterrows():
                 levels.append({"target": target, "fold": k, "range": name, "n": r["n"], "rec": r["e_rec"] / r["n"],
@@ -139,13 +143,14 @@ for target in targets:
     summary.append({"대상": target, "묶음 수": len(folds), "조합 MAE": f"{np.mean(pair_mae):.4g}",
                     "step 선택 MAE": f"{np.mean(pick_mae):.4g}", "변화 (%)": f"{ch.mean():.1f} ± {ch.std():.1f}",
                     "가장 큰 값": round(ch.max(), 1), "바꾼 step 수": len(steady), "바꾼 step 행 %": round(share, 1)})
-    decisions[target] = {"adopt": bool(ch.mean() < 0 and ch.max() < 0), "steps": steady, "folds": len(folds),
+    decisions[target] = {"adopt": bool(ch.mean() < 0 and ch.max() < 0), "steps": [] if cells else steady,
+                         "cells": [list(c) for c in steady] if cells else [], "folds": len(folds),
                          "change_mean": round(float(ch.mean()), 2), "change_sd": round(float(ch.std()), 2),
                          "change_max": round(float(ch.max()), 2), "rows_share": round(float(share), 1),
                          "model": args.model}
     for s in steady:
         r = pooled.loc[s]
-        detail.append({"대상": target, "step": s, "행 %": round(100 * r["n"] / pooled["n"].sum(), 1),
+        detail.append({"대상": target, "step": " · ".join(s) if cells else s, "행 %": round(100 * r["n"] / pooled["n"].sum(), 1),
                        "조합 MAE": f"{r['e_pair'] / r['n']:.4g}", "레시피 평균 MAE": f"{r['e_rec'] / r['n']:.4g}",
                        "고른 묶음 수": picked[s]})
 

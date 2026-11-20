@@ -43,7 +43,7 @@ if not choice_file.is_file():
     raise SystemExit("work/reports/step_choice.json이 없습니다. 먼저 python scripts/step_choice.py를 실행하세요.")
 choice = json.loads(choice_file.read_text(encoding="utf-8"))
 targets = [t.strip() for t in args.targets.split(",") if t.strip()] if args.targets else \
-    [t for t, r in choice.items() if r.get("adopt") and r.get("steps")]
+    [t for t, r in choice.items() if r.get("adopt") and (r.get("steps") or r.get("cells"))]
 led = collect_ledger(P.work_root)
 if len(led):
     led = led[led["mae"].notna() & (led["job_status"] == "ok") & (led["task"] == "virtual_sensor")
@@ -66,8 +66,9 @@ out = ["## step별 레시피 평균 사용 · 시험 run 확인 (학습 없음, 
 table, skipped, levels = [], [], []
 for target in targets:
     steps = list((choice.get(target) or {}).get("steps") or [])
+    cells = [tuple(c) for c in (choice.get(target) or {}).get("cells") or []]
     full_dir, cyc_dir = best_job(args.full, target), best_job(args.cycle, target)
-    if not steps or full_dir is None or cyc_dir is None:
+    if not (steps or cells) or full_dir is None or cyc_dir is None:
         skipped.append(f"- {target}: " + ("고른 step이 없음" if not steps else f"study {args.full} · {args.cycle} 기록 없음"))
         continue
     split = load_split(experiment_for(full_dir).split_path())
@@ -83,7 +84,7 @@ for target in targets:
         if "actual" not in pair or "recipe" not in pair:
             skipped.append(f"- {target} · {label}: 실측 또는 레시피 평균 열이 없음")
             continue
-        rule = use_recipe_steps(pair, steps)
+        rule = use_recipe_steps(pair, steps, cells)
         e_pair, e_rule = (pair["pred"] - pair["actual"]).abs(), (rule["pred"] - rule["actual"]).abs()
         e_rec = (pair["recipe"] - pair["actual"]).abs()
         inside = rule["model_used"].eq("레시피 평균")

@@ -16,6 +16,7 @@ import pandas as pd
 import yaml
 
 from .launch import HP_SUFFIX, read_request
+from .training.selection import unit_of
 
 BASE_COLUMNS = ("when", "experiment", "base", "stamp", "status", "source", "memo", "task", "target", "unit", "model",
                 "label", "input_set", "seed", "settings", "mae", "improvement_pct", "mae_cycle", "mae_other",
@@ -82,7 +83,8 @@ def _run_rows(exp_dir: Path, request: dict[str, Any] | None) -> list[dict[str, A
             "source": "대시보드" if request and request.get("source") == "dashboard"
             else ("대기열" if request else "터미널"),
             "memo": (request or {}).get("memo") or config.get("description", ""), "task": task,
-            "target": job["target"], "unit": res.get("unit"), "model": job["model"], "label": job.get("label"),
+            "target": job["target"], "unit": unit_of(job["target"], res.get("unit")), "model": job["model"],
+            "label": job.get("label"),
             "input_set": job.get("input_set", "default"), "seed": job.get("seed"),
             "settings": settings_text(job.get("params") or {}), "params": job.get("params") or {},
             "job_status": res.get("status", "ok"), "mae": res.get("mae"), "improvement_pct": res.get("improvement_pct"),

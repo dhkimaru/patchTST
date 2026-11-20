@@ -112,7 +112,7 @@ def predict_traces(model_dir: str | Path, files: list[Path], *, device: str = "c
 
 
 def predict_pair(full_dir: str | Path, cycle_dir: str | Path, files: list[Path], *, device: str = "cpu",
-                 recipe_steps: list[str] | None = None) -> pd.DataFrame:
+                 recipe_steps: list[str] | None = None, recipe_cells: list[Any] | None = None) -> pd.DataFrame:
     """Region pair: the cycle-only model inside ALD cycles, the full-process model everywhere else.
 
     Both models run on the same traces through :func:`predict_traces`. Rows inside a cycle take the cycle-only
@@ -146,47 +146,69 @@ def predict_pair(full_dir: str | Path, cycle_dir: str | Path, files: list[Path],
         out.loc[use, col] = out.loc[use, f"{col}_cycle"]
     out["model_used"] = np.where(use, "사이클 전용", "공정 전체")
     out.attrs.update(full.attrs, pair=True)
-    return use_recipe_steps(out, recipe_steps) if recipe_steps else out
+    return use_recipe_steps(out, recipe_steps or [], recipe_cells) if recipe_steps or recipe_cells else out
 
 
-def load_recipe_steps(path: str | Path) -> list[str]:
-    """Step names from a ``recipe_steps.json`` (written by ``scripts/export_pair.py``) or a plain list."""
+def load_recipe_rule(path: str | Path) -> tuple[list[str], list[tuple[str, str]]]:
+    """Whole steps and (step, level range) cells from a ``recipe_steps.json`` (``scripts/export_pair.py``) or a plain list."""
 
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
     steps = doc.get("steps", []) if isinstance(doc, dict) else doc
+    cells = doc.get("cells", []) if isinstance(doc, dict) else []
     if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
         raise PredictError(f"{path}: expected a list of step names")
-    return steps
+    if not all(isinstance(c, (list, tuple)) and len(c) == 2 for c in cells):
+        raise PredictError(f"{path}: cells must be [step, range] pairs")
+    return steps, [(str(a), str(b)) for a, b in cells]
 
 
-def use_recipe_steps(frame: pd.DataFrame, steps: list[str]) -> pd.DataFrame:
+def load_recipe_steps(path: str | Path) -> list[str]:
+    return load_recipe_rule(path)[0]
+
+
+def use_recipe_steps(frame: pd.DataFrame, steps: list[str], cells: list[Any] | None = None) -> pd.DataFrame:
     """In the given recipe steps, predict the train runs' recipe mean instead of the model.
 
     ``scripts/step_choice.py`` picks these steps on cross-validation folds: steps where the target barely moves
     (a closed valve, a gas that is off), so the model only adds noise around the recipe value. Rows in them get
     ``pred = recipe`` and ``model_used = 레시피 평균``; ``pred_model`` keeps what the model said. Anything that
-    happens inside these steps (a fault, an unusual run) is not seen there."""
+    happens inside these steps (a fault, an unusual run) is not seen there. ``cells`` are (step, level range) pairs for
+    targets in ``training.evaluate.LEVEL_SPLITS``; the range comes from the recipe mean of the row."""
 
     preds = [c for c in frame.columns if c == "pred" or (c.startswith("pred_+") and not c.endswith(("_full", "_cycle")))]
     if not preds or f"recipe{preds[0][4:]}" not in frame:
         raise PredictError("the model folder has no recipe mean (template.parquet); step rule needs a virtual-sensor model")
     out = frame.copy()
     mask = out["step_name"].astype(str).isin(set(steps)).to_numpy()
+    if cells:
+        from .evaluate import level_ranges
+
+        ranges = level_ranges(str(frame.attrs.get("target", "")), out[f"recipe{preds[0][4:]}"])
+        if ranges is None:
+            raise PredictError(f"cells need a target with level ranges, not {frame.attrs.get('target')!r}")
+        wanted = {(str(a), str(b)) for a, b in cells}
+        mask |= np.array([(s, r) in wanted for s, r in zip(out["step_name"].astype(str), ranges)], dtype=bool)
     for col in preds:
         out[f"{col}_model"] = out[col]
         out.loc[mask, col] = out.loc[mask, f"recipe{col[4:]}"]
     used = out["model_used"].to_numpy(dtype=object) if "model_used" in out else np.full(len(out), "모델", dtype=object)
     used[mask] = "레시피 평균"
     out["model_used"] = used
-    out.attrs.update(frame.attrs, recipe_steps=list(steps))
+    out.attrs.update(frame.attrs, recipe_steps=list(steps), recipe_cells=[list(c) for c in cells or []])
     return out
 
 
 def _unit(model_dir: Path) -> str:
+    """The target's unit: the current column dictionary first (units corrected after training win), then the stored one."""
+
+    from .selection import unit_of
+
     path = model_dir / "metrics_validation.json"
-    if not path.is_file():
-        return ""
-    return str(json.loads(path.read_text(encoding="utf-8")).get("result", {}).get("unit") or "")
+    doc = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    target = (doc.get("result") or {}).get("target") or ""
+    if not target and (model_dir / "job.json").is_file():
+        target = json.loads((model_dir / "job.json").read_text(encoding="utf-8")).get("job", {}).get("target", "")
+    return unit_of(target, (doc.get("result") or {}).get("unit") or "")
 
 
 def _predict_thickness(model_dir: Path, doc: dict[str, Any], cfg: ExperimentConfig,
@@ -240,17 +262,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recipe-steps", help="recipe_steps.json. 여기 적힌 step에서는 모델 대신 학습 run의 레시피 평균을 쓴다")
     args = parser.parse_args(argv)
     files = trace_files(args.csv)
-    steps = load_recipe_steps(args.recipe_steps) if args.recipe_steps else None
+    steps, cells = load_recipe_rule(args.recipe_steps) if args.recipe_steps else (None, None)
     if args.cycle_model:
-        frame = predict_pair(args.model_dir, args.cycle_model, files, device=args.device, recipe_steps=steps)
+        frame = predict_pair(args.model_dir, args.cycle_model, files, device=args.device, recipe_steps=steps,
+                             recipe_cells=cells)
     else:
         frame = predict_traces(args.model_dir, files, device=args.device)
-        frame = use_recipe_steps(frame, steps) if steps else frame
+        frame = use_recipe_steps(frame, steps or [], cells) if steps or cells else frame
     out = Path(args.out) if args.out else Path(args.model_dir) / "predictions.csv"
     frame.to_csv(out, index=False, encoding="utf-8-sig")  # BOM: Excel opens Korean text correctly
     print(f"{frame.attrs.get('target')}: run {len(files)}개 → 예측 {len(frame):,}행 → {out}"
           + (f" (사이클 전용 모델 {int((frame['model_used'] == '사이클 전용').sum()):,}행)" if "model_used" in frame else "")
-          + (f" (레시피 평균 {int((frame['model_used'] == '레시피 평균').sum()):,}행)" if steps else ""))
+          + (f" (레시피 평균 {int((frame['model_used'] == '레시피 평균').sum()):,}행)" if steps or cells else ""))
     for line in describe_errors(frame):
         print("  " + line)
     if args.html:

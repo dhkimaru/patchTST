@@ -115,10 +115,11 @@ def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path
     if experiment_for(out_dir / "cycle").region != "cycle":
         raise ValueError(f"{cycle_job} is not a cycle-only job (data.region: cycle)")
     steps = list((recipe_steps or {}).get("steps") or [])
+    cells = [list(c) for c in (recipe_steps or {}).get("cells") or []]
     sh_steps, bat_steps = ('--recipe-steps "$HERE/recipe_steps.json" ', '--recipe-steps "%HERE%recipe_steps.json" ') \
-        if steps else ("", "")
-    if steps:
-        (out_dir / "recipe_steps.json").write_text(json.dumps({**recipe_steps, "target": target, "steps": steps},
+        if steps or cells else ("", "")
+    if steps or cells:
+        (out_dir / "recipe_steps.json").write_text(json.dumps({**recipe_steps, "target": target, "steps": steps, "cells": cells},
                                                               ensure_ascii=False, indent=1), encoding="utf-8")
     sh = _PREDICT_SH.replace("__LAB__", str(PROJECT_ROOT)).replace(
         '"$HERE" --csv', f'"$HERE/full" --cycle-model "$HERE/cycle" {sh_steps}--csv')
@@ -130,10 +131,11 @@ def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path
     lines = [f"ALD 가상 센서 구간 전용 조합 — {target}", "",
              "사이클 안은 사이클 전용 모델(cycle/), 나머지 구간은 공정 전체 모델(full/)의 예측을 쓴다.",
              "사이클 전용 모델의 window가 아직 사이클 안에 다 들어오지 않은 첫 몇 초는 공정 전체 모델을 쓴다.", ""]
-    if steps:
+    if steps or cells:
         rule = recipe_steps or {}
         nan = float("nan")
-        lines[4:4] = [(f"step {len(steps)}개(recipe_steps.json)에서는 두 모델 대신 학습 run의 레시피 평균을 쓴다. "
+        what = f"step {len(steps)}개" if steps else f"step × 압력 구간 {len(cells)}칸"
+        lines[4:4] = [(f"{what}(recipe_steps.json)에서는 두 모델 대신 학습 run의 레시피 평균을 쓴다. "
                        "교차검증에서 고른 step으로, 대상이 거의 일정한 구간(밸브 닫힘, 가스 꺼짐 등)이다."),
                       (f"  교차검증 변화(규칙 MAE ÷ 조합 MAE - 1): {rule.get('change_mean', nan):.1f} ± "
                        f"{rule.get('change_sd', nan):.1f}%, 가장 큰 값 {rule.get('change_max', nan):.1f}%, "
@@ -150,7 +152,7 @@ def export_pair(full_job: str | Path, cycle_job: str | Path, out_dir: str | Path
               "- 서버:    bash predict.sh <trace CSV 파일 또는 폴더> [출력 CSV] [cpu|cuda:0]",
               "- Windows: predict.bat <trace CSV 파일 또는 폴더> [출력 CSV]   (ald-lab이 설치된 Python 필요)",
               "- 출력 CSV: pred(조합) · pred_full · pred_cycle · recipe(레시피 평균) · model_used(어느 모델을 썼는지), "
-              "실측이 있으면 actual" + (", pred_model(규칙 적용 전 예측)" if steps else ""),
+              "실측이 있으면 actual" + (", pred_model(규칙 적용 전 예측)" if steps or cells else ""),
               "- 재생 화면: <출력 CSV 이름>_player.html"]
     if note:
         lines += ["", note]

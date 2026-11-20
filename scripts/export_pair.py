@@ -50,9 +50,9 @@ for target in targets:
         jobs[part] = Path(best["exp_dir"]) / "jobs" / str(best["job_id"])
         lines.append(f"{target} · {part}: {best['experiment']}/{best['stamp']} seed {best['seed']} 검증 MAE {best['mae']:.4g}")
     rule = choice.get(target) or {}
-    rule = rule if rule.get("adopt") and rule.get("steps") else None
-    lines.append(f"{target} · step별 레시피 평균: " + (f"step {len(rule['steps'])}개 (교차검증 변화 {rule['change_mean']:.1f}%)"
-                                                     if rule else "쓰지 않음"))
+    rule = rule if rule.get("adopt") and (rule.get("steps") or rule.get("cells")) else None
+    size = (f"step {len(rule['steps'])}개" if rule.get("steps") else f"step × 압력 구간 {len(rule['cells'])}칸") if rule else ""
+    lines.append(f"{target} · step별 레시피 평균: " + (f"{size} (교차검증 변화 {rule['change_mean']:.1f}%)" if rule else "쓰지 않음"))
     export_pair(jobs["full"], jobs["cycle"], root / target, recipe_steps=rule,
                 note=f"고른 기준: 대상별로 study {args.full} · {args.cycle}에서 검증 MAE가 가장 낮은 {args.model} job (시험 run은 쓰지 않음).")
 (root / "README.txt").write_text("ALD 가상 센서 구간 전용 조합 패키지\n\n" + "\n".join(lines) + "\n", encoding="utf-8")

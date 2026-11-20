@@ -188,6 +188,7 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path, monkeypatch):
     decision = json.loads((paths.work_root / "reports" / "step_choice.json").read_text(encoding="utf-8"))["TempAct_C"]
     assert decision["folds"] == 2 and decision["adopt"] == (decision["change_mean"] < 0 and decision["change_max"] < 0)
     assert "[압력 구간별]" in choice and set(decision["levels"]) == set(evaluate.LEVEL_NAMES)
+    assert decision["steps"] == [] and all(len(c) == 2 for c in decision["cells"])  # chosen per (step, range) cell
     assert abs(sum(v["rows_pct"] for v in decision["levels"].values()) - 100) < 0.5
     # scripts/pair_test.py opens the test runs only for the chosen targets and scores the 0.5 s region pair there.
     import sys
@@ -233,6 +234,10 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path, monkeypatch):
     assert hit.any() and (~hit).any() and "recipe" in pair
     assert np.allclose(ruled.loc[hit, "pred"], ruled.loc[hit, "recipe"]) and ruled.loc[hit, "model_used"].eq("레시피 평균").all()
     assert np.allclose(ruled.loc[~hit, "pred"], pair.loc[~hit, "pred"]) and np.allclose(ruled["pred_model"], pair["pred"])
+    cell = predict_pair(package / "full", package / "cycle", trace, recipe_cells=[("SI-FL1", "공정 압력")])
+    inside = cell["step_name"].eq("SI-FL1") & (cell["recipe"] <= 530.0)  # TempAct_C split at 530 in this test
+    assert inside.any() and cell.loc[inside, "model_used"].eq("레시피 평균").all()
+    assert not cell.loc[~inside, "model_used"].eq("레시피 평균").any()
     full = predict_traces(package / "full", trace)
     cyc = predict_traces(package / "cycle", trace)
     assert len(pair) == len(full) and (pair["model_used"] == "사이클 전용").any() and (pair["model_used"] == "공정 전체").any()
@@ -423,6 +428,14 @@ def test_vm_audit_script(lab, tmp_path, monkeypatch):
     assert "standard_trace_006" not in text  # the sealed test run is never read
     line = next(x for x in text.splitlines() if x.strip().startswith("thk_mean") and "같은 WAP" in x)
     assert float(line.split()[-4]) > 0.9  # run levels 2 Å apart, point noise 0.05 Å: halves agree
+    # scripts/vm_stage1.py: time-ordered evaluation against EWMA, then leave-one-run-out for reference
+    monkeypatch.setattr(sys, "argv", ["vm_stage1.py", "--config", str(config), "--start", "3", "--top", "3", "--seeds", "1"])
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "vm_stage1.py"), run_name="__main__")
+    stage1 = (paths.work_root / "reports" / "vm_stage1.txt").read_text(encoding="utf-8")
+    for part in ("[thk_mean] 평가 run 2개", "EWMA + Ridge", "EWMA + LightGBM", "[gpc]", "[참고 · leave-one-run-out]",
+                 "EWMA 대비 판정"):
+        assert part in stage1, part
+    assert "standard_trace_006" not in stage1
 
 
 def test_parallel_workers(lab, tmp_path):

@@ -556,13 +556,13 @@ columns:
   group: gas_flow
   family: flow_DCS
   family_rep: true
-  unit: sccm
+  unit: slm
   role: measurement
 - column: MFCMon_NH3
   group: gas_flow
   family: flow_NH3
   family_rep: true
-  unit: sccm
+  unit: slm
   role: measurement
 - column: MFCMon_F2
   group: gas_flow
@@ -872,6 +872,7 @@ columns:
   group: rf
   family: rf_reflect
   family_rep: true
+  unit: W
   role: measurement
 - column: AUXMon_DCS_IN
   group: line_heater
