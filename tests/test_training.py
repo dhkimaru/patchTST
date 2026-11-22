@@ -264,6 +264,18 @@ def test_step_aligned_blocks_never_mix_steps(lab, tmp_path, monkeypatch):
     rule_text = (paths.work_root / "reports" / "step_rule_test.txt").read_text(encoding="utf-8")
     assert "[검증 run]" in rule_text and "[시험 run]" in rule_text and "TempAct_C" in rule_text and "규칙 MAE" in rule_text
     assert "[압력 구간별]" in rule_text and "대기압 근처" in rule_text
+    # scripts/vs_anomaly.py: out-of-fold residuals per run from the saved CV predictions, ranked against the recipe mean.
+    os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"] = str(paths.work_root), str(paths.data_root)
+    sys.argv = ["vs_anomaly.py", "--model", "ridge", "--folds", "2", "--runs", "standard_trace_004", "--min-runs", "2"]
+    try:
+        runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "vs_anomaly.py"), run_name="__main__")
+    finally:
+        sys.argv = argv
+        del os.environ["ALD_WORK_ROOT"], os.environ["ALD_DATA_ROOT"]
+    anomaly = (paths.work_root / "reports" / "vs_anomaly.txt").read_text(encoding="utf-8")
+    for part in ("[1. 이상 run별 요약]", "[2. 대상별 순위]", "[3. 튄 대상이 많은 run]", "[4. 이상 run에서", "TempAct_C"):
+        assert part in anomaly, part
+    assert "standard_trace_006" not in anomaly  # test runs are never in CV predictions
     with pytest.raises(ValueError):  # the full-process model is not a cycle-only model
         predict_pair(package / "full", package / "full", trace)
     # scripts/vg11_steps.py splits the pair's error by step and run on validation and (reused) test runs, no training.

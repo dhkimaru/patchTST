@@ -595,7 +595,7 @@ def run_request(folder: Path, *, poll: float = 3.0) -> dict[str, Any]:
 # Result summaries (no training) the worker runs when the queue drains; run_drift goes first because side_studies and
 # combine_predictions read the run types it writes. Their txt files land in work/reports/ (served by /api/report).
 RESULT_SCRIPTS = ("run_drift.py", "side_studies.py", "combine_predictions.py", "raw_scale.py", "step_choice.py",
-                  "accuracy.py")
+                  "vs_anomaly.py", "accuracy.py")
 
 
 def auto_results_enabled() -> bool:
