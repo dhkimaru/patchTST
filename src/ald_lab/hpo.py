@@ -1238,6 +1238,14 @@ def refresh_report(paths: LabPaths, name: str, *, max_age_seconds: float = 30.0)
     spec = load_study(path)
     old = study_dir(paths, name) / "summary.json"
     run = (json.loads(old.read_text(encoding="utf-8")).get("run") or {}) if old.is_file() else {}
+    if not run.get("started"):  # a run of older code kept no start time: the queue request has it
+        from .launch import list_requests
+
+        req = next((r for r in list_requests(Path(paths.work_root), include_hidden=True)
+                    if r.get("kind") == "hpo" and str(r.get("name")) == name and not r.get("smoke")), None)
+        if req and req.get("started"):
+            run = {**run, "started": req["started"], "workers": _workers(req.get("gpus")),
+                   "finished": req.get("status") != "running"}
     report_study(spec, paths, importance=False, run=run)
     return True
 

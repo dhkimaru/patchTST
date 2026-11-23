@@ -436,6 +436,15 @@ def test_an_old_style_reference_is_replaced(lab, tmp_path, monkeypatch):  # noqa
     monkeypatch.setattr(hpo, "study_files", lambda folder_=None: [study])
     text = Lab(paths, examples=False).report_text("hpo_old_ref.txt")
     assert text and "[지금 설정 trial 비교]" in text and "trial 1 (3판" in text
+    # a run of older code kept no start time: the pace comes from the queue request (start, GPU count)
+    monkeypatch.setattr(launch, "list_requests", lambda work_root, include_hidden=False: [
+        {"kind": "hpo", "name": "old_ref", "started": "2026-11-24T02:10:00", "gpus": "0,1", "status": "running"}])
+    summary_path = paths.work_root / "hpo" / "old_ref" / "summary.json"
+    summary_path.write_text(json.dumps({**json.loads(summary_path.read_text()), "run": {}}))  # as older code left it
+    report.unlink()
+    assert hpo.refresh_report(paths, "old_ref")
+    run = json.loads((paths.work_root / "hpo" / "old_ref" / "summary.json").read_text())["run"]
+    assert run["workers"] == 2 and run["started"].startswith("2026-11-24") and not run["finished"]
 
 
 def test_failed_trials_explain_themselves(lab, tmp_path, monkeypatch):  # noqa: F811
