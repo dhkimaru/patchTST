@@ -702,10 +702,12 @@ def _seed_sd_pct(spec: StudySpec, paths: LabPaths) -> float | None:
         return float(spec.saturation["seed_sd_pct"])
     ref = study_dir(paths, spec.name).parent / "reference.json"
     if ref.is_file():
-        doc = json.loads(ref.read_text(encoding="utf-8"))
-        for row in doc.get("rows", []):
-            if row.get("target") == spec.target and row.get("sd_pct") is not None:
-                return float(row["sd_pct"])
+        rows = json.loads(ref.read_text(encoding="utf-8")).get("rows", [])
+        experiment = str(spec.enqueue_from.get("experiment") or "")
+        mine = [r for r in rows if r.get("target") == spec.target and r.get("sd_pct") is not None]
+        exact = [r for r in mine if r.get("experiment") == experiment]
+        for row in exact or mine:  # the study's own reference experiment first, any other run of the target next
+            return float(row["sd_pct"])
     return None
 
 
@@ -990,14 +992,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         folder = Path(paths.work_root) / "hpo"
         folder.mkdir(parents=True, exist_ok=True)
-        doc = {"experiment": args.experiment, "model": args.model, "metric": args.metric,
-               "updated": datetime.now().isoformat(timespec="seconds"),
-               "rows": rows.drop(columns=["params"]).to_dict(orient="records")}
+        new_rows = rows.drop(columns=["params"]).assign(experiment=args.experiment, model=args.model)
         ref_path = folder / "reference.json"
         old = json.loads(ref_path.read_text(encoding="utf-8")) if ref_path.is_file() else {}
-        merged = {r["target"]: r for r in old.get("rows", [])}
-        merged.update({r["target"]: r for r in doc["rows"]})
-        _write_json(ref_path, {**doc, "rows": list(merged.values())})
+        key = lambda r: f"{r.get('experiment')}|{r.get('model')}|{r['target']}"
+        merged = {key(r): r for r in old.get("rows", [])}
+        merged.update({key(r): r for r in new_rows.to_dict(orient="records")})
+        _write_json(ref_path, {"updated": datetime.now().isoformat(timespec="seconds"),
+                               "rows": sorted(merged.values(), key=lambda r: (str(r.get("experiment")), r["target"]))})
         show = rows[["target", "unit", "seeds", "mean", "sd", "sd_pct", "context_seconds", "settings"]]
         print(f"## 지금 설정 ({args.experiment}, {args.model}, 검증 {args.metric}, seed {args.min_seeds}개 이상 우선)")
         print(show.to_string(index=False, formatters={"mean": "{:.4g}".format,

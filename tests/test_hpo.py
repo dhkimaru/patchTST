@@ -119,6 +119,14 @@ def test_reference_from_the_ledger(lab, tmp_path):  # noqa: F811
     rows = hpo.reference_rows(paths.work_root, "synthetic", min_seeds=2)
     assert list(rows["target"]) == ["VG11"] and int(rows.iloc[0]["seeds"]) == 2
     assert rows.iloc[0]["sd"] >= 0 and rows.iloc[0]["params"]["d_model"] == 8
+    # The CLI keeps one row per (experiment, model, target): two experiments of the same target do not overwrite.
+    for experiment, metric in (("synthetic", "mae"), ("synthetic", "mae_cycle")):
+        assert hpo.main(["reference", "--experiment", experiment, "--metric", metric, "--min-seeds", "2",
+                         "--work-root", str(paths.work_root), "--data-root", str(paths.data_root)]) == 0
+    ref = json.loads((paths.work_root / "hpo" / "reference.json").read_text())
+    assert len(ref["rows"]) == 1 and ref["rows"][0]["metric"] == "mae_cycle"  # same key, the later call wins
+    assert hpo._seed_sd_pct(hpo.load_study(_study(tmp_path, base, name="sd_check", enqueue_from={
+        "experiment": "synthetic"})), paths) == pytest.approx(ref["rows"][0]["sd_pct"])
 
     # enqueue_from turns the reference into the first trial; settings outside the space ride along as extras.
     study = _study(tmp_path, base, name="ref_search", trials=2, enqueue=[],
