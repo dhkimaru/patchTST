@@ -320,6 +320,27 @@ class Lab:
                                      data_root=self.paths.data_root, source="dashboard")
         return {"ids": [r["id"] for r in records]}
 
+    def hpo_refcheck(self, form: dict[str, Any]) -> dict[str, Any]:
+        """Queue the reproduction experiment of a study's current setting (record seeds + the study's seed)."""
+
+        from . import hpo
+
+        name = str(form.get("name") or "")
+        files = {p.stem: p for p in hpo.study_files()}
+        if name not in files:
+            raise launch.LaunchError(f"탐색 설정이 없습니다: {name}")
+        spec = hpo.load_study(files[name])
+        try:
+            doc, record = hpo.refcheck_doc(spec, self.paths)
+        except hpo.StudyError as exc:
+            raise launch.LaunchError(str(exc)) from exc
+        records = launch.submit_docs(self.paths.work_root, [doc], gpus=str(form.get("gpus") or "auto"), report=True,
+                                     data_root=self.paths.data_root, source="dashboard")
+        folder = hpo.study_dir(self.paths, name)
+        folder.mkdir(parents=True, exist_ok=True)
+        hpo._write_json(folder / "refcheck.json", record)
+        return {"ids": [r["id"] for r in records], "seeds": doc["seeds"]}
+
     def hpo_requeue(self, form: dict[str, Any]) -> dict[str, Any]:
         from . import hpo
 
@@ -438,6 +459,8 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                     self._json(lab.hpo_top(form))
                 elif url.path == "/api/hpo/requeue":
                     self._json(lab.hpo_requeue(form))
+                elif url.path == "/api/hpo/refcheck":
+                    self._json(lab.hpo_refcheck(form))
                 elif url.path == "/api/rebuild":
                     threading.Thread(target=lab.rebuild, daemon=True).start()
                     self._json({"status": "rebuilding"})

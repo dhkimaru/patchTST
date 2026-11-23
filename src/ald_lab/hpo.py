@@ -394,7 +394,9 @@ def reference_rows(work_root: Path, experiment: str, *, model: str = "patchtst",
         values = g[metric].astype(float)
         mean = float(values.mean())
         sd = float(values.std(ddof=1)) if len(values) > 1 else None
+        per_seed = {int(s): float(v) for s, v in g.groupby("seed")[metric].mean().items()}
         rows.append({"target": target, "unit": g["unit"].iloc[0], "settings": settings, "train": train,
+                     "per_seed": per_seed,
                      "params": g["params"].iloc[0], "context_seconds": float(g["context_seconds"].iloc[0]),
                      "input_set": input_set, "seeds": int(g["seed"].nunique()), "metric": metric, "mean": mean,
                      "sd": sd, "sd_pct": (sd / mean * 100) if sd is not None and mean else None,
@@ -444,7 +446,8 @@ def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any
         else:
             extra[key] = value
     expected = {"mean": float(row["mean"]), "sd": None if pd.isna(row["sd"]) else float(row["sd"]),
-                "seeds": int(row["seeds"]), "train": str(row.get("train") or ""), "settings": str(row["settings"])}
+                "seeds": int(row["seeds"]), "train": str(row.get("train") or ""), "settings": str(row["settings"]),
+                "per_seed": {str(k): v for k, v in dict(row.get("per_seed") or {}).items()}}
     return in_space, extra, expected
 
 
@@ -1093,6 +1096,7 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
                  "ref_version": t.user_attrs.get("ref_version")} for t in top],
         "failures": failures(spec, trials, paths),
         "references": reference_trials(spec, paths, trials),
+        "refcheck": refcheck_results(spec, paths),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     folder = study_dir(paths, spec.name)
@@ -1191,6 +1195,14 @@ def study_text(summary: dict[str, Any]) -> str:
         lines.append("- 공통: " + " · ".join(f"{k}={_fmt(v, 4)}" for k, v in sorted(refs["same"].items())))
         if refs.get("record"):
             lines.append(f"- 누적 기록의 설정: {refs['record']['settings']} | 학습 설정: {refs['record'].get('train') or '-'}")
+    check = summary.get("refcheck")
+    if check:
+        lines += ["", f"[재현 실험] 지금 설정을 일반 학습 경로로 다시 학습 (검증 {check['metric']}, 요청 {check.get('submitted')})",
+                  "    seed   누적 기록   다시 학습"]
+        for seed in sorted({*check["record"], *check["rerun"]}):
+            note = "  (탐색 seed)" if seed == check["study_seed"] else ""
+            lines.append(f"{seed:>8d}  {_fmt(check['record'].get(seed)):>10s}  {_fmt(check['rerun'].get(seed)):>10s}{note}")
+        lines.append(f"판정: {check['verdict']}")
     fails = summary.get("failures") or []
     if fails:
         kinds = ", ".join(f"{k} {v}" for k, v in failure_kinds(fails).items())
@@ -1338,6 +1350,7 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
             "model": spec.model, "objective": spec.objective, "unit": unit_of(spec.target, None), "budget": spec.trials,
             "task": task, "request": req.get("id") if req else None, "request_status": req.get("status") if req else None,
             "report": f"hpo_{spec.name}.txt", "finished": 0, "counts": None, "progress": None,
+            "has_reference_source": bool(spec.enqueue_from), "refcheck": None,
         }
         journal = study_dir(paths, spec.name) / "study.journal"
         if journal.is_file():
@@ -1352,6 +1365,10 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
                     info = {"error": f"{type(exc).__name__}: {exc}"}
                 _STATUS_CACHE[spec.name] = (key, info)
             row.update(info)
+        try:  # the reproduction experiment can exist before the study ever ran
+            row["refcheck"] = refcheck_results(spec, paths)
+        except Exception as exc:  # noqa: BLE001  (a half-written result file: try again on the next refresh)
+            row["refcheck"] = {"verdict": f"읽지 못함: {type(exc).__name__}", "gap_pct": None, "rerun": {}}
         status = row["request_status"]
         if status in ("running", "queued"):
             row["state"] = status
@@ -1443,6 +1460,91 @@ def top_configs(spec: StudySpec | str | Path, paths: LabPaths, *, k: int = 5, se
         doc["models"] = models
         docs.append(doc)
     return docs
+
+
+REFCHECK_SUFFIX = "_refcheck"
+
+
+def refcheck_doc(spec: StudySpec, paths: LabPaths) -> tuple[dict[str, Any], dict[str, Any]]:
+    """An experiment that retrains the current setting through the normal training path (not the search) with the
+    record's seeds and the study's seed, from the record run's own experiment file: data, window and train exactly
+    as they were. Whether the record comes back tells a seed effect from a search-path or data difference apart.
+    Returns the document and the record it should reproduce (kept in ``work/hpo/<name>/refcheck.json``)."""
+
+    conf = spec.enqueue_from
+    if not conf:
+        raise StudyError(f"{spec.name}: enqueue_from가 없어 지금 설정을 알 수 없습니다")
+    metric = str(conf.get("metric", spec.objective))
+    rows = reference_rows(paths.work_root, str(conf["experiment"]), model=spec.model, metric=metric,
+                          min_seeds=int(conf.get("min_seeds", 1)))
+    rows = rows[rows["target"] == spec.target] if len(rows) else rows
+    if not len(rows):
+        raise StudyError(f"{spec.name}: 누적 기록에 지금 설정이 없습니다")
+    row = rows.iloc[0]
+    doc = yaml.safe_load((Path(row["exp_dir"]) / "experiment.yaml").read_text(encoding="utf-8"))
+    record_seeds = sorted(int(s) for s in (row["per_seed"] or {}))
+    doc["name"] = f"{spec.name}{REFCHECK_SUFFIX}"
+    doc["targets"] = [spec.target]
+    doc["seeds"] = sorted({*record_seeds, int(spec.seed)})
+    doc["models"] = [{"name": spec.model, "label": f"{spec.model}_refcheck", "params": dict(row["params"] or {})}]
+    doc.setdefault("window", {})["context_seconds"] = float(row["context_seconds"])
+    data = doc.get("data") or {}
+    if row["input_set"] != "default" and row["input_set"] in (data.get("input_sets") or {}):
+        data["input_sets"] = {row["input_set"]: data["input_sets"][row["input_set"]]}
+    doc["study"] = f"hpo_ref:{spec.name}"
+    doc["description"] = (f"{spec.name}: 지금 설정을 일반 학습 경로로 다시 학습 (기록 seed {record_seeds} + 탐색 seed "
+                          f"{spec.seed}, 기록 run의 실험 파일 그대로)")
+    record = {"experiment": doc["name"], "metric": metric, "mean": float(row["mean"]),
+              "sd": None if pd.isna(row["sd"]) else float(row["sd"]),
+              "per_seed": {str(k): float(v) for k, v in dict(row["per_seed"] or {}).items()},
+              "record_run": str(row["exp_dir"]), "submitted": datetime.now().isoformat(timespec="seconds")}
+    return doc, record
+
+
+def refcheck_results(spec: StudySpec, paths: LabPaths) -> dict[str, Any] | None:
+    """The reproduction experiment against its record, seed by seed, with a verdict (None before one was queued)."""
+
+    from .ledger import _run_rows
+
+    side = study_dir(paths, spec.name) / "refcheck.json"
+    if not side.is_file():
+        return None
+    info = json.loads(side.read_text(encoding="utf-8"))
+    metric = info["metric"]
+    root = Path(paths.work_root) / "experiments" / info["experiment"]
+    rerun: dict[int, float] = {}
+    for exp_dir in sorted(root.iterdir()) if root.is_dir() else []:  # later runs replace earlier ones
+        for r in _run_rows(exp_dir, None) if exp_dir.is_dir() else []:
+            value = r.get(metric)
+            if (r["model"] == spec.model and r["target"] == spec.target and r.get("job_status", "ok") == "ok"
+                    and value is not None and not pd.isna(value)):
+                rerun[int(r["seed"])] = float(value)
+    record = {int(k): float(v) for k, v in (info.get("per_seed") or {}).items()}
+    out: dict[str, Any] = {"metric": metric, "record": record, "rerun": rerun, "study_seed": int(spec.seed),
+                           "record_mean": info.get("mean"), "submitted": info.get("submitted"), "verdict": None}
+    common = [s for s in record if s in rerun]
+    if not common:
+        out["verdict"] = "결과 기다리는 중"
+        return out
+    rec = float(np.mean([record[s] for s in common]))
+    new = float(np.mean([rerun[s] for s in common]))
+    sd = info.get("sd")
+    limit = max(REF_TOLERANCE_PCT, 3 * sd / rec * 100) if sd and rec else REF_TOLERANCE_PCT
+    out.update(common=common, record_common=rec, rerun_common=new, gap_pct=(new - rec) / rec * 100, limit_pct=limit)
+    reproduced = abs(out["gap_pct"]) <= limit
+    mine = rerun.get(int(spec.seed))
+    if not reproduced:
+        out["verdict"] = (f"일반 학습 경로에서도 기록이 재현되지 않음({out['gap_pct']:+.1f}%): 기록 이후 코드, 데이터 또는 "
+                          "실험 파일 밖의 설정이 바뀌었을 수 있음")
+    elif mine is None:
+        out["verdict"] = "기록 seed는 재현됨, 탐색 seed 결과 기다리는 중"
+    else:
+        seed_gap = (mine - rec) / rec * 100
+        out["study_seed_gap_pct"] = seed_gap
+        out["verdict"] = (f"기록 seed는 재현됨. 탐색 seed {spec.seed}는 기록 평균 대비 {seed_gap:+.1f}%: "
+                          + ("seed 차이가 큼(trial 하나의 값은 이만큼 흔들림)" if abs(seed_gap) > limit else
+                             "seed 차이 수준이 아님, 기준 trial과 다르면 탐색 경로를 확인"))
+    return out
 
 
 # ----------------------------------------------------------------------------- CLI

@@ -353,6 +353,42 @@ def test_reference_keeps_runs_that_trained_differently_apart(lab, tmp_path):  # 
     assert "train" in (paths.work_root / "reports" / "hpo_reference.txt").read_text(encoding="utf-8")
 
 
+def test_refcheck_retrains_the_record_through_the_normal_path(lab, tmp_path, monkeypatch):  # noqa: F811
+    """'재현 확인': the record run's own experiment file, the record's seeds plus the study's seed, compared seed by
+    seed. On CPU the record seeds come back exactly, so the verdict says the record reproduces."""
+
+    from ald_lab.report.lab import hpo_html
+    from ald_lab.server import Lab
+
+    paths, split_path = lab
+    base = _ledger_reference(tmp_path, split_path, paths)  # seeds 1, 2
+    path = _study(tmp_path, base, name="rc", enqueue=[], enqueue_from={"experiment": "synthetic", "min_seeds": 2})
+    spec = hpo.load_study(path)
+    doc, record = hpo.refcheck_doc(spec, paths)
+    assert doc["name"] == "rc_refcheck" and doc["seeds"] == sorted({1, 2, spec.seed}) and doc["study"] == "hpo_ref:rc"
+    assert doc["models"][0]["params"]["d_model"] == 8 and doc["train"]["max_epochs"] == 2  # the record's own file
+    assert set(record["per_seed"]) == {"1", "2"}
+
+    monkeypatch.setattr(hpo, "study_files", lambda folder_=None: [path])
+    monkeypatch.setattr(launch, "ensure_worker", lambda work_root: False)
+    server = Lab(paths, examples=False)
+    out = server.hpo_refcheck({"name": "rc", "gpus": "cpu"})
+    assert out["seeds"] == doc["seeds"] and (paths.work_root / "hpo" / "rc" / "refcheck.json").is_file()
+    assert hpo.refcheck_results(spec, paths)["verdict"] == "결과 기다리는 중"
+
+    file = tmp_path / "rc_refcheck.yaml"  # what the queue worker would run
+    file.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    run_experiment(file, paths, devices=["cpu"])
+    check = hpo.refcheck_results(spec, paths)
+    assert check["common"] == [1, 2] and abs(check["gap_pct"]) < 1e-6 and spec.seed in check["rerun"]
+    assert check["verdict"].startswith("기록 seed는 재현됨")
+    assert not len(main_records(collect_ledger(paths.work_root)).query("experiment == 'rc_refcheck'"))  # side study
+    hpo.report_study(spec, paths, importance=False)
+    assert "[재현 실험]" in (paths.work_root / "reports" / "hpo_rc.txt").read_text(encoding="utf-8")
+    page = hpo_html(paths, live=True)
+    assert 'data-hpo-refcheck="rc"' in page and "재현 실험: 기록" in page
+
+
 def test_dashboard_flags_a_reference_that_did_not_reproduce(monkeypatch):
     from ald_lab.report.lab import hpo_html
 

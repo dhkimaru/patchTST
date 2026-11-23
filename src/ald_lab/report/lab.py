@@ -397,6 +397,15 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
                          "'기준 trial 다시 넣기'로 바로잡습니다\">⚠ 이전 방식</div>")
         if row.get("ref_pending"):
             ref_cell += '<div class="sub">새 기준 trial 학습 중</div>'
+        rc = row.get("refcheck")
+        if rc:
+            if rc.get("gap_pct") is None:
+                ref_cell += '<div class="sub">재현 실험 기다리는 중</div>'
+            else:
+                mine = rc["rerun"].get(rc["study_seed"])
+                ref_cell += (f'<div class="sub" title="{r.e(rc["verdict"])}">재현 실험: 기록 {_fmt(rc["record_common"])} → '
+                             f'다시 {_fmt(rc["rerun_common"])}'
+                             + (f', seed {rc["study_seed"]} {_fmt(mine)}' if mine is not None else "") + "</div>")
         gain = row.get("gain_pct")
         gain_cell = "-" if gain is None else (f'<span class="st {"good" if gain > 0 else ""}">{-gain:+.1f}%</span>')
         if gain is not None and check and not check.get("ok"):
@@ -417,6 +426,10 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
         acts = [f'<a href="/api/report?name={r.e(row["report"])}" target="_blank" rel="noopener">보고서</a>']
         if live and c["complete"] >= 10:
             acts.append(f'<button type="button" class="pl-btn" data-hpo-top="{name}" title="상위 5개 설정을 seed 3개로 다시 학습 (대기열)">상위 5개 재학습</button>')
+        if live and row.get("has_reference_source"):
+            acts.append(f'<button type="button" class="pl-btn" data-hpo-refcheck="{name}" title="누적 기록의 지금 설정을 '
+                        f'일반 학습 경로로 기록 seed와 탐색 seed로 다시 학습해, 기록이 재현되는지와 seed 차이를 봅니다 (대기열)">'
+                        "재현 확인</button>")
         if live and not row.get("ref_pending") and (old_ref or (ref is None and c["complete"] + c["pruned"] > 0)):
             acts.append(f'<button type="button" class="pl-btn" data-hpo-requeue="{name}" title="지금 설정을 정확히 재현한 trial을 맨 앞에 넣습니다 (실행 중이면 다음 trial)">기준 trial 다시 넣기</button>')
         body.append(
@@ -582,6 +595,9 @@ function hpo(){const box=$('lab-hpo');if(!box)return;const keep=new Set([...box.
     box.querySelectorAll('[data-hpo-top]').forEach(b=>b.onclick=()=>{if(!confirm(b.dataset.hpoTop+': 상위 5개 설정을 seed 3개(42·43·44)로 다시 학습할까요?'))return;
       b.disabled=true;post('/api/hpo/top',{name:b.dataset.hpoTop,k:5,seeds:'42,43,44',gpus:gpus()}).then(r=>{
         say(r.error?'오류: '+r.error:'대기열에 넣었습니다: '+r.ids.join(', '));queue();hpo();});});
+    box.querySelectorAll('[data-hpo-refcheck]').forEach(b=>b.onclick=()=>{if(!confirm(b.dataset.hpoRefcheck+': 지금 설정을 일반 학습 경로로 기록 seed와 탐색 seed로 다시 학습할까요? (대기열, seed 수만큼 작업)'))return;
+      b.disabled=true;post('/api/hpo/refcheck',{name:b.dataset.hpoRefcheck,gpus:gpus()}).then(r=>{
+        say(r.error?'오류: '+r.error:'재현 실험을 대기열에 넣었습니다 (seed '+r.seeds.join(', ')+'): '+r.ids.join(', '));queue();hpo();});});
     box.querySelectorAll('[data-hpo-requeue]').forEach(b=>b.onclick=()=>{b.disabled=true;post('/api/hpo/requeue',{name:b.dataset.hpoRequeue}).then(r=>{
       say(r.error?'오류: '+r.error:(r.queued?b.dataset.hpoRequeue+': 지금 설정 trial을 맨 앞에 넣었습니다':'이미 들어가 있거나 누적 기록에서 지금 설정을 찾지 못했습니다'));hpo();});});
   }).catch(()=>{});}
