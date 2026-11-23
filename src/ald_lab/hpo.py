@@ -444,7 +444,7 @@ def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any
         else:
             extra[key] = value
     expected = {"mean": float(row["mean"]), "sd": None if pd.isna(row["sd"]) else float(row["sd"]),
-                "seeds": int(row["seeds"]), "train": str(row.get("train") or "")}
+                "seeds": int(row["seeds"]), "train": str(row.get("train") or ""), "settings": str(row["settings"])}
     return in_space, extra, expected
 
 
@@ -941,7 +941,8 @@ def journal_failures(paths: LabPaths, name: str) -> dict[str, str]:
 
 
 def brief_settings(params: dict[str, Any]) -> str:
-    """The settings that decide memory and time: window, patch, patch count, size, batch."""
+    """The settings that decide memory and time: window, patch, patch count, size, batch, and the size of one
+    layer's attention scores (batch × heads × patches² × 4 bytes, the tensor that runs out of memory first)."""
 
     p = dict(params)
     context, patch = p.get(CONTEXT_KEY), p.get("patch_seconds")
@@ -953,13 +954,19 @@ def brief_settings(params: dict[str, Any]) -> str:
         parts.append(f"window {float(context):g}초")
     if patch is not None:
         parts.append(f"patch {float(patch):g}초" + (f" 간격 {float(stride):g}초" if stride else ""))
+    tokens = None
     if context is not None and patch is not None and stride:
-        parts.append(f"patch {int((float(context) - float(patch)) // float(stride)) + 1}개")
+        tokens = int((float(context) - float(patch)) // float(stride)) + 2  # PatchTST pads one stride at the end
+        parts.append(f"patch {tokens}개")
     for key, label in (("d_model", "d_model "), ("n_layers", "층 "), ("n_heads", "head "), ("d_ff", "d_ff "),
                        ("train.batch_size", "batch "), ("train.lr", "lr ")):
         if p.get(key) is not None:
             value = p[key]
             parts.append(f"{label}{value:.0e}" if key == "train.lr" else f"{label}{value}")
+    batch, heads = p.get("train.batch_size"), p.get("n_heads")
+    if tokens and batch and heads:
+        size = int(batch) * int(heads) * tokens**2 * 4 / 2**30
+        parts.append(f"attention 점수 한 층 {size:.2f} GiB" if size < 10 else f"attention 점수 한 층 {size:.0f} GiB")
     return ", ".join(parts)
 
 
@@ -990,6 +997,40 @@ def failure_kinds(items: list[dict[str, Any]]) -> dict[str, int]:
     for item in items:
         counts[item["kind"]] = counts.get(item["kind"], 0) + 1
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def _trained_with(t: Any) -> dict[str, Any]:
+    """Everything a trial trained with: sampled or enqueued values, the extras riding along, the resolved job."""
+
+    return {**t.params, **dict(t.user_attrs.get("extra_params") or {}), **dict(t.user_attrs.get("actual") or {})}
+
+
+def reference_trials(spec: StudySpec, paths: LabPaths, trials: list[Any]) -> dict[str, Any] | None:
+    """Every current-setting trial (all versions) with what it trained with, the keys on which they differ and the
+    record they should reproduce. This is how a reference that missed its record is traced."""
+
+    refs = [t for t in trials if t.user_attrs.get("role") == "reference"]
+    if not refs:
+        return None
+    used = [_trained_with(t) for t in refs]
+    keys = sorted({k for u in used for k in u})
+    differ = [k for k in keys if len({json.dumps(u.get(k), sort_keys=True, default=str) for u in used}) > 1]
+    record = None
+    for t in refs:
+        expected = t.user_attrs.get("expected")
+        if expected and expected.get("settings"):
+            record = {"settings": expected["settings"], "train": expected.get("train", "")}
+    if record is None:
+        path = study_dir(paths, spec.name).parent / "reference.json"
+        rows = json.loads(path.read_text(encoding="utf-8")).get("rows", []) if path.is_file() else []
+        experiment = str(spec.enqueue_from.get("experiment") or "")
+        mine = [r for r in rows if r.get("target") == spec.target and r.get("experiment") == experiment]
+        if mine:
+            record = {"settings": mine[0].get("settings", ""), "train": mine[0].get("train", "")}
+    return {"trials": [{"number": t.number, "version": int(t.user_attrs.get("ref_version", 1)), "state": t.state.name,
+                        "value": t.value, "epochs": t.user_attrs.get("epochs"), "params": u}
+                       for t, u in zip(refs, used)],
+            "differ": differ, "same": {k: used[0].get(k) for k in keys if k not in differ}, "record": record}
 
 
 def _actual(t: Any) -> dict[str, Any]:
@@ -1051,6 +1092,7 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
         "top": [{"number": t.number, "value": t.value, "params": _actual(t), "role": t.user_attrs.get("role", ""),
                  "ref_version": t.user_attrs.get("ref_version")} for t in top],
         "failures": failures(spec, trials, paths),
+        "references": reference_trials(spec, paths, trials),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     folder = study_dir(paths, spec.name)
@@ -1138,6 +1180,17 @@ def study_text(summary: dict[str, Any]) -> str:
                   "trial 수  최고 기록  기대 최고치"]
         for n in marks:
             lines.append(f"{n:>8d}  {_fmt(curve[n - 1]):>9s}  {_fmt(expected[n - 1]):>10s}")
+    refs = summary.get("references")
+    if refs:
+        lines += ["", ("[지금 설정 trial 비교] 기준 trial마다 실제로 학습한 설정. 기준 trial끼리 다른 값만 trial별로 "
+                       "적고, 나머지는 '공통'에 적는다")]
+        for t in refs["trials"]:
+            diff = " · ".join(f"{k}={_fmt(t['params'].get(k), 4)}" for k in refs["differ"]) or "차이 없음"
+            lines.append(f"- trial {t['number']} ({t['version']}판, {t['state']}, {_fmt(t['value'])} {unit}, "
+                         f"{t.get('epochs') or '-'} epoch): {diff}")
+        lines.append("- 공통: " + " · ".join(f"{k}={_fmt(v, 4)}" for k, v in sorted(refs["same"].items())))
+        if refs.get("record"):
+            lines.append(f"- 누적 기록의 설정: {refs['record']['settings']} | 학습 설정: {refs['record'].get('train') or '-'}")
     fails = summary.get("failures") or []
     if fails:
         kinds = ", ".join(f"{k} {v}" for k, v in failure_kinds(fails).items())
@@ -1155,6 +1208,26 @@ def study_text(summary: dict[str, Any]) -> str:
             role = " (지금 설정)" if t.get("role") == "reference" else ""
             lines.append(f"- trial {t['number']}{role}: {_fmt(t['value'])} {unit} | {params}")
     return "\n".join(lines) + "\n"
+
+
+def refresh_report(paths: LabPaths, name: str, *, max_age_seconds: float = 30.0) -> bool:
+    """Rewrite ``reports/hpo_<name>.txt`` from the study journal when it is missing or older than the journal (a
+    study run by older code writes it only at the end). True when rewritten."""
+
+    journal = study_dir(paths, name) / "study.journal"
+    if not journal.is_file():
+        return False
+    report = Path(paths.work_root) / "reports" / f"hpo_{name}.txt"
+    if report.is_file() and report.stat().st_mtime >= journal.stat().st_mtime - max_age_seconds:
+        return False
+    path = next((p for p in study_files() if p.stem == name), None)
+    if path is None:
+        return False
+    spec = load_study(path)
+    old = study_dir(paths, name) / "summary.json"
+    run = (json.loads(old.read_text(encoding="utf-8")).get("run") or {}) if old.is_file() else {}
+    report_study(spec, paths, importance=False, run=run)
+    return True
 
 
 def write_overview(paths: LabPaths) -> Path:

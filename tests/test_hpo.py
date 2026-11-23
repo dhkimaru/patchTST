@@ -373,7 +373,7 @@ def test_dashboard_flags_a_reference_that_did_not_reproduce(monkeypatch):
     assert "⚠" not in page and "data-hpo-requeue" not in page
 
 
-def test_an_old_style_reference_is_replaced(lab, tmp_path):  # noqa: F811
+def test_an_old_style_reference_is_replaced(lab, tmp_path, monkeypatch):  # noqa: F811
     paths, split_path = lab
     base = _ledger_reference(tmp_path, split_path, paths)
     study = _study(tmp_path, base, name="old_ref", trials=3, enqueue=[], pruner={"kind": "none"},
@@ -386,6 +386,20 @@ def test_an_old_style_reference_is_replaced(lab, tmp_path):  # noqa: F811
     summary = json.loads((paths.work_root / "hpo" / "old_ref" / "summary.json").read_text())
     assert summary["reference"]["version"] == hpo.REF_VERSION and summary["reference"]["number"] == 1
     assert not hpo.enqueue_reference(spec, paths)  # already there: nothing queued twice
+    # both current-setting trials side by side: the keys they differ on, and the record they should reproduce
+    refs = summary["references"]
+    assert [t["version"] for t in refs["trials"]] == [1, hpo.REF_VERSION] and "train.max_epochs" in refs["differ"]
+    assert refs["record"] and "d_model=8" in refs["record"]["settings"] and "max_epochs=2" in refs["record"]["train"]
+    report = paths.work_root / "reports" / "hpo_old_ref.txt"
+    assert "[지금 설정 trial 비교]" in report.read_text(encoding="utf-8")
+
+    # the dashboard link writes a missing report from the study journal (a study run by older code)
+    from ald_lab.server import Lab
+
+    report.unlink()
+    monkeypatch.setattr(hpo, "study_files", lambda folder_=None: [study])
+    text = Lab(paths, examples=False).report_text("hpo_old_ref.txt")
+    assert text and "[지금 설정 trial 비교]" in text and "trial 1 (3판" in text
 
 
 def test_failed_trials_explain_themselves(lab, tmp_path, monkeypatch):  # noqa: F811
@@ -417,7 +431,13 @@ def test_failed_trials_explain_themselves(lab, tmp_path, monkeypatch):  # noqa: 
 
     found = hpo.failures(spec, study.get_trials(deepcopy=False), paths)
     assert [f["kind"] for f in found] == ["GPU 메모리 부족", "설정 조합 불가", "GPU 메모리 부족", "기록 없음"]
-    assert "patch 15개" in found[0]["settings"] and "batch 2048" in found[0]["settings"]  # (16 - 2) // 1 + 1
+    assert "patch 16개" in found[0]["settings"] and "batch 2048" in found[0]["settings"]  # (16 - 2) // 1 + 2 (end pad)
+    # the size the GPU reported for two real failures: batch × heads × patches² × 4 bytes
+    big = hpo.brief_settings({"window.context_seconds": 256, "patch_seconds": 2, "stride_ratio": 0.5, "n_heads": 16,
+                              "train.batch_size": 2048, "stride_seconds": 1})
+    assert "patch 256개" in big and "attention 점수 한 층 8.00 GiB" in big
+    assert "7.94 GiB" in hpo.brief_settings({"window.context_seconds": 256, "patch_seconds": 2, "stride_seconds": 0.5,
+                                             "n_heads": 8, "train.batch_size": 1024})
     assert found[3]["error"] == hpo.FAIL_UNKNOWN  # the other study's journal line is not taken
     assert hpo.fail_kind("검증 mae가 NaN: 학습 발산 (NAN_LOSS)") == "학습 발산 (NaN)"
 

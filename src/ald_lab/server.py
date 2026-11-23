@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -106,6 +107,13 @@ class Lab:
         """One result file by name (no folders); the view-only address masks server paths as the page does."""
 
         path = self.paths.work_root / "reports" / name
+        if REPORT_NAME.match(name) and name.startswith("hpo_") and name.endswith(".txt"):
+            try:  # a running study's report, written now from its journal (older runs write it only at the end)
+                from . import hpo
+
+                hpo.refresh_report(self.paths, name[len("hpo_"):-len(".txt")])
+            except Exception as exc:  # noqa: BLE001  (optuna missing, journal being written: serve what is there)
+                print(f"hpo report {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
         if not REPORT_NAME.match(name) or not path.is_file() or path.stat().st_size > REPORT_MAX_BYTES:
             return None
         text = path.read_text(encoding="utf-8", errors="replace")
