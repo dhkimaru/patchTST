@@ -388,8 +388,12 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
                     f"{r.e(sat)}</span>")
         if state == "running" and pace.get("eta_at"):
             end_cell = r.e(_when(row.get("end_at") or pace["eta_at"]))
+        elif state == "queued" and row.get("end_at"):
+            basis = row.get("end_basis") or ""
+            mark = '<br><span class="sub">참고</span>' if basis.startswith("다른 과제") else ""
+            end_cell = f'<span title="{r.e(basis)}">{r.e(_when(row["end_at"]))}</span>{mark}'
         elif state == "queued":
-            end_cell = r.e(_when(row.get("end_at"))) if row.get("end_at") else f'<span class="sub">{r.e(row.get("end_basis") or "-")}</span>'
+            end_cell = f'<span class="sub">{r.e(row.get("end_basis") or "-")}</span>'
         else:
             end_cell = "-"
         acts = [f'<a href="/api/report?name={r.e(row["report"])}" target="_blank" rel="noopener">보고서</a>']

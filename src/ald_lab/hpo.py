@@ -1139,14 +1139,16 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
     order = {r["id"]: i for i, r in enumerate(reversed([q for q in requests if q.get("status") == "queued"]))}
     queued = sorted((r for r in rows if r.get("state") == "queued"), key=lambda r: order.get(r["request"], 0))
     for row in queued:
-        per = float(np.median(paces.get(row.get("task", "")) or every)) if every else None
+        same = paces.get(row.get("task", ""))
+        per = float(np.median(same or every)) if every else None
         if per is None:
             row["end_basis"] = "첫 탐색의 속도를 잰 뒤 계산"
             continue
         left = max(0, row["budget"] - row["finished"])
         clock = clock + timedelta(minutes=per * left)
         row["end_at"] = clock.isoformat(timespec="minutes")
-        row["end_basis"] = f"같은 과제 탐색의 trial당 {_minutes(per)} 기준"
+        row["end_basis"] = (f"같은 과제 탐색의 trial당 {_minutes(per)} 기준" if same else
+                            f"다른 과제 탐색의 trial당 {_minutes(per)}를 빌린 값(참고, 이 과제 첫 탐색이 시작되면 다시 계산)")
     states = {k: sum(1 for r in rows if r.get("state") == k) for k in STATE_NAMES}
     return {"rows": rows, "states": states, "finished": sum(r.get("finished", 0) for r in rows),
             "budget": sum(r.get("budget", 0) for r in rows if "error" not in r),

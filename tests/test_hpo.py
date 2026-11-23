@@ -312,6 +312,7 @@ def test_dashboard_lists_studies_with_progress_and_end_times(lab, tmp_path, monk
     assert rows["study_done"]["state"] == "done" and rows["study_done"]["finished"] == 2
     assert rows["study_next"]["state"] == "queued" and rows["study_next"]["request"] == ids[0]
     assert rows["study_next"]["end_at"] and status["queue_end"]  # from the pace of the finished study
+    assert rows["study_next"]["end_basis"].startswith("같은 과제")  # same task: not marked as borrowed
     assert rows["study_new"]["state"] == "new" and status["states"]["done"] == 1
     doc = yaml.safe_load((paths.work_root / "queue" / ids[0] / "experiment.yaml").read_text(encoding="utf-8"))
     assert launch.is_study_doc(doc) and doc["name"] == "study_next"
