@@ -998,8 +998,16 @@ def main(argv: list[str] | None = None) -> int:
         key = lambda r: f"{r.get('experiment')}|{r.get('model')}|{r['target']}"
         merged = {key(r): r for r in old.get("rows", [])}
         merged.update({key(r): r for r in new_rows.to_dict(orient="records")})
-        _write_json(ref_path, {"updated": datetime.now().isoformat(timespec="seconds"),
-                               "rows": sorted(merged.values(), key=lambda r: (str(r.get("experiment")), r["target"]))})
+        all_rows = sorted(merged.values(), key=lambda r: (str(r.get("experiment")), r["target"]))
+        _write_json(ref_path, {"updated": datetime.now().isoformat(timespec="seconds"), "rows": all_rows})
+        table = pd.DataFrame(all_rows)[["experiment", "target", "unit", "metric", "seeds", "mean", "sd", "sd_pct",
+                                        "context_seconds", "settings"]]
+        reports = Path(paths.work_root) / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        (reports / "hpo_reference.txt").write_text(
+            "## 지금 설정의 기준점 (누적 기록, 검증 run, 학습 없음)\n"
+            "실험·대상마다 seed 평균이 가장 낮은 설정. sd = seed 간 표준편차(단위는 대상 단위), sd_pct = sd ÷ 평균 × 100.\n\n"
+            + table.to_string(index=False, float_format=lambda v: f"{v:.4g}") + "\n", encoding="utf-8")
         show = rows[["target", "unit", "seeds", "mean", "sd", "sd_pct", "context_seconds", "settings"]]
         print(f"## 지금 설정 ({args.experiment}, {args.model}, 검증 {args.metric}, seed {args.min_seeds}개 이상 우선)")
         print(show.to_string(index=False, formatters={"mean": "{:.4g}".format,

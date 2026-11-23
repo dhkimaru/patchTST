@@ -125,6 +125,7 @@ def test_reference_from_the_ledger(lab, tmp_path):  # noqa: F811
                          "--work-root", str(paths.work_root), "--data-root", str(paths.data_root)]) == 0
     ref = json.loads((paths.work_root / "hpo" / "reference.json").read_text())
     assert len(ref["rows"]) == 1 and ref["rows"][0]["metric"] == "mae_cycle"  # same key, the later call wins
+    assert "VG11" in (paths.work_root / "reports" / "hpo_reference.txt").read_text(encoding="utf-8")
     assert hpo._seed_sd_pct(hpo.load_study(_study(tmp_path, base, name="sd_check", enqueue_from={
         "experiment": "synthetic"})), paths) == pytest.approx(ref["rows"][0]["sd_pct"])
 
