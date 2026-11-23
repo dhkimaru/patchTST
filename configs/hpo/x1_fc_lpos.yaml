@@ -22,6 +22,7 @@ pruner:
 train:
   min_epochs: 40
   patience: 15
+  max_minutes: 120
 fixed:
   channel_mode: mixing
 space:

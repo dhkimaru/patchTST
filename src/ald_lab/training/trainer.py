@@ -10,6 +10,10 @@ Speed choices (the previous project took 2–8 h per model at ~3,600 windows/s):
   the full validation set is scored once, after training;
 - bf16 autocast and TF32 matmuls on CUDA, large batches (1024 by default).
 
+When a batch does not fit in GPU memory (a search can ask for 500 patches × batch 2048), the batch is split into
+parts whose gradients are added before one optimizer step, so the effective batch size stays the one asked for
+(BatchNorm statistics then come from each part). Evaluation halves its batch instead.
+
 Each epoch also records the validation MAE in model space (standardized, or the scaled correction to the recipe
 template); for one target and data setting it is proportional to the MAE in physical units, so it is comparable
 across losses. A hyperparameter search reads it through ``on_epoch`` to stop weak trials early (``hpo.py``).
@@ -88,6 +92,39 @@ def _loss_fn(settings: TrainSettings) -> Callable[[torch.Tensor, torch.Tensor], 
     return nn.MSELoss()
 
 
+def is_oom(exc: BaseException) -> bool:
+    """True for a GPU out-of-memory error."""
+
+    return isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
+def _free(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _over_batches(ws: WindowSet, idx: np.ndarray, batch_size: int,
+                  fn: Callable[[torch.Tensor, torch.Tensor], Any]) -> tuple[list[Any], int]:
+    """``fn(x, y)`` for each batch of ``idx`` in order, halving the batch while it runs out of GPU memory.
+    Returns the outputs and the batch size that fitted."""
+
+    while True:
+        out: list[Any] = []
+        oom = False
+        try:
+            for _, tidx in ws.iter_batches(idx, batch_size):
+                out.append(fn(*ws.gather(tidx)))
+        except Exception as exc:
+            if not is_oom(exc) or batch_size <= 1:
+                raise
+            oom = True  # retried outside the handler so the failed batch's tensors are released first
+        if not oom:
+            return out, batch_size
+        out = []
+        batch_size = max(1, batch_size // 2)
+        _free(ws.device)
+
+
 def _autocast(device: torch.device, enabled: bool):
     # bf16 needs no loss scaling (RTX 30/40 series); older GPUs simply train in fp32.
     if enabled and device.type == "cuda" and torch.cuda.is_bf16_supported():
@@ -105,33 +142,35 @@ def configure_backend(device: torch.device) -> None:
 @torch.no_grad()
 def predict(model: nn.Module, ws: WindowSet, idx: np.ndarray, *, batch_size: int = 4096,
             amp: bool = True) -> np.ndarray:
-    """Standardized predictions ``(n, H, T)`` for windows ``idx``."""
+    """Standardized predictions ``(n, H, T)`` for windows ``idx`` (the batch halves while it does not fit)."""
 
     model.eval()
-    parts = []
-    for _, tidx in ws.iter_batches(idx, batch_size):
-        x, _ = ws.gather(tidx)
+
+    def one(x: torch.Tensor, _y: torch.Tensor) -> np.ndarray:
         with _autocast(ws.device, amp):
-            parts.append(model(x).float().cpu().numpy())
+            return model(x).float().cpu().numpy()
+
+    parts, _ = _over_batches(ws, idx, batch_size, one)
     return np.concatenate(parts) if parts else np.zeros((0, len(ws.horizons), ws.y.shape[1]), np.float32)
 
 
 @torch.no_grad()
 def _val_loss(model: nn.Module, ws: WindowSet, idx: np.ndarray, settings: TrainSettings,
-              loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -> tuple[float, float]:
-    """Validation loss and MAE (model space) on windows ``idx``."""
+              loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+              batch_size: int | None = None) -> tuple[float, float, int]:
+    """Validation loss and MAE (model space) on windows ``idx``, and the batch size that fitted in memory."""
 
     model.eval()
-    total, abs_total, count = 0.0, 0.0, 0
-    for _, tidx in ws.iter_batches(idx, settings.eval_batch_size):
-        x, y = ws.gather(tidx)
+
+    def one(x: torch.Tensor, y: torch.Tensor) -> tuple[float, float, int]:
         with _autocast(ws.device, settings.amp):
             pred = model(x)
         pred = pred.float()
-        total += float(loss_fn(pred, y)) * len(tidx)
-        abs_total += float((pred - y).abs().mean()) * len(tidx)
-        count += len(tidx)
-    return total / max(count, 1), abs_total / max(count, 1)
+        return float(loss_fn(pred, y)) * len(x), float((pred - y).abs().mean()) * len(x), len(x)
+
+    parts, used = _over_batches(ws, idx, batch_size or settings.eval_batch_size, one)
+    count = sum(p[2] for p in parts)
+    return sum(p[0] for p in parts) / max(count, 1), sum(p[1] for p in parts) / max(count, 1), used
 
 
 def _lr_factor(settings: TrainSettings) -> Callable[[int], float]:
@@ -194,6 +233,21 @@ def train_model(
 
     history: list[dict[str, float]] = []
     best_loss, best_state, best_epoch, bad_epochs = math.inf, None, 0, 0
+    parts = 1  # each batch is computed in this many pieces once it runs out of GPU memory (gradients added up)
+    eval_batch = settings.eval_batch_size
+
+    def step(batch: torch.Tensor) -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        total = torch.zeros((), device=device)
+        for piece in torch.tensor_split(batch, parts):
+            x, y = train.gather(piece)
+            with _autocast(device, settings.amp):
+                pred = runner(x)
+            loss = loss_fn(pred.float(), y) * (len(piece) / len(batch))  # a mean over the whole batch
+            loss.backward()
+            total += loss.detach()
+        return total
+
     status = "MAX_EPOCHS"
     started = time.perf_counter()
     train_seconds = 0.0
@@ -211,12 +265,21 @@ def train_model(
             batch = order[start : start + settings.batch_size]
             if len(batch) < 2:  # BatchNorm needs two samples
                 continue
-            x, y = train.gather(batch)
-            with _autocast(device, settings.amp):
-                pred = runner(x)
-            loss = loss_fn(pred.float(), y)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            while True:
+                oom = False
+                try:
+                    loss = step(batch)
+                except Exception as exc:
+                    # BatchNorm needs two samples per piece; past that the setting cannot train on this GPU.
+                    if not is_oom(exc) or len(batch) // (parts * 2) < 2:
+                        raise
+                    oom = True
+                if not oom:
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                _free(device)
+                parts *= 2
+                log(f"GPU 메모리 부족: batch {len(batch)}을 {parts}조각으로 나눠 계산 (실효 batch는 그대로)")
             if settings.grad_clip:
                 nn.utils.clip_grad_norm_(model.parameters(), settings.grad_clip)
             optimizer.step()
@@ -229,7 +292,10 @@ def train_model(
             log(f"epoch {epoch}: loss is not finite; stopping")
             break
         train_seconds += time.perf_counter() - epoch_start
-        val_loss, val_mae = _val_loss(runner, val, val_idx, settings, loss_fn)
+        val_loss, val_mae, used = _val_loss(runner, val, val_idx, settings, loss_fn, eval_batch)
+        if used < eval_batch:
+            log(f"GPU 메모리 부족: 검증 batch {eval_batch} → {used}")
+            eval_batch = used
         lr = optimizer.param_groups[0]["lr"]  # the rate this epoch trained with
         if settings.lr_schedule == "plateau":
             scheduler.step(val_loss)
@@ -271,4 +337,6 @@ def train_model(
         "windows_per_second": round(windows_seen / train_seconds, 1) if train_seconds else None,
         "peak_gpu_mb": round(peak_mb, 1) if peak_mb is not None else None,
         "batch_size": settings.batch_size,
+        "batch_parts": parts,
+        "eval_batch_size": eval_batch,
     }

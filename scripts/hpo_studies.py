@@ -24,6 +24,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "configs" / "hpo"
 TRIALS = 150
+# One trial may hold a GPU for at most this long; it then keeps its best epoch so far (train status TIME_LIMIT).
+# A setting that only fits in memory by splitting its batch (500 patches, batch 2048) can need 3~5 min per epoch,
+# 100 times the current setting; without a limit one such trial could take a GPU for half a day.
+TRIAL_MINUTES = 120
 
 # Model size and regularization (both tasks). PatchTST with every signal of a patch in one token (channel mixing):
 # channel-independent was 6x worse in the previous project and 164 times slower here, so it is not searched.
@@ -48,7 +52,7 @@ TRAIN_SPACE = {
 FORECAST = {
     "base": "g1_forecast_params",
     "objective": "mae",
-    "train": {"min_epochs": 40, "patience": 15},
+    "train": {"min_epochs": 40, "patience": 15, "max_minutes": TRIAL_MINUTES},
     "pruner": {"kind": "hyperband", "min_resource": 40, "reduction_factor": 3},
     "space": {
         **TRAIN_SPACE,
@@ -74,7 +78,7 @@ VS_SPACE = {
     "window.context_seconds": [32, 48, 64, 96, 128, 192, 256],
 }
 VS_COMMON = {
-    "train": {"min_epochs": 20, "patience": 10, "loss": "mae"},
+    "train": {"min_epochs": 20, "patience": 10, "loss": "mae", "max_minutes": TRIAL_MINUTES},
     "pruner": {"kind": "hyperband", "min_resource": 20, "reduction_factor": 3},
     "space": VS_SPACE,
 }

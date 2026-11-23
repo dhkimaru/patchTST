@@ -360,7 +360,8 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
                '<button type="button" class="pl-btn" data-hpo-reference title="누적 기록에서 지금 설정의 seed 평균·표준편차를 다시 계산 (학습 없음)">'
                '기준점 다시 뽑기</button><span class="lab-msg"></span></div>') if live else ""
     body = []
-    for row in rows:
+    order = {s: i for i, s in enumerate(("running", "queued", "partial", "failed", "cancelled", "done", "new"))}
+    for row in sorted(rows, key=lambda x: (order.get(x.get("state", "new"), 9), x["name"])):
         name = r.e(row["name"])
         if "error" in row and "target" not in row:
             body.append(f"<tr><td></td><td><b>{name}</b></td><td colspan='9' class='lab-err'>{r.e(row['error'])}</td></tr>")
@@ -375,12 +376,21 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
         bar = (f'<div class="lab-bar"><i style="width:{100 * share:.1f}%"></i></div>'
                f'<div class="sub">완료 {c["complete"]} · 중단 {c["pruned"]} · 실패 {c["fail"]} / 예산 {row["budget"]}'
                + (f' · trial당 {r.e(r.minutes(pace["per_trial_min"]))}' if pace.get("per_trial_min") else "") + "</div>")
+        fails = row.get("failures") or []
+        if fails:
+            kinds = ", ".join(f"{r.e(k)} {v}" for k, v in (row.get("failure_kinds") or {}).items())
+            items = "".join(f"<li><b>trial {f['trial']}</b> {r.e(f['kind'])}: {r.e(f['settings'])}"
+                            f"<div class='sub'>{r.e(f['error'])}</div></li>" for f in fails)
+            bar += (f'<details class="lab-hpo-fail" data-key="fail-{name}"><summary>실패 원인: {kinds}</summary>'
+                    f"<ul>{items}</ul></details>")
         unit = row.get("unit") or ""
         ref = row.get("reference")
         old_ref = ref is not None and row.get("ref_version", 0) < REF_VERSION
         ref_cell = "-" if ref is None else f"{_fmt(ref)} {r.e(unit)}"
         if old_ref:
             ref_cell += '<div class="lab-warn" title="기록에 없던 설정을 탐색기가 골라, 지금 설정과 다를 수 있습니다">⚠ 이전 방식</div>'
+        if row.get("ref_pending"):
+            ref_cell += '<div class="sub">새 기준 trial 학습 중</div>'
         gain = row.get("gain_pct")
         gain_cell = "-" if gain is None else (f'<span class="st {"good" if gain > 0 else ""}">{-gain:+.1f}%</span>')
         sat = row.get("saturation") or "-"
@@ -399,7 +409,7 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
         acts = [f'<a href="/api/report?name={r.e(row["report"])}" target="_blank" rel="noopener">보고서</a>']
         if live and c["complete"] >= 10:
             acts.append(f'<button type="button" class="pl-btn" data-hpo-top="{name}" title="상위 5개 설정을 seed 3개로 다시 학습 (대기열)">상위 5개 재학습</button>')
-        if live and (old_ref or (ref is None and c["complete"] + c["pruned"] > 0)):
+        if live and not row.get("ref_pending") and (old_ref or (ref is None and c["complete"] + c["pruned"] > 0)):
             acts.append(f'<button type="button" class="pl-btn" data-hpo-requeue="{name}" title="지금 설정을 정확히 재현한 trial을 맨 앞에 넣습니다 (실행 중이면 다음 trial)">기준 trial 다시 넣기</button>')
         body.append(
             f"<tr><td>{box}</td><td><b>{name}</b><div class='sub'>{r.e(row.get('description') or '')}</div></td>"
@@ -408,12 +418,14 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
             f"<td style='min-width:170px'>{bar}</td><td>{ref_cell}</td>"
             f"<td>{_fmt(row.get('best'))} {r.e(unit) if row.get('best') is not None else ''}</td><td>{gain_cell}</td>"
             f"<td>{sat_cell}</td><td>{end_cell}</td><td class='lab-hpo-acts'>{' '.join(acts)}</td></tr>")
-    table = ('<div class="tw"><table class="lab-hpo"><tr><th></th><th>탐색</th><th>대상 · 지표</th><th>상태</th><th>진행</th>'
+    table = ('<div class="tw lab-hpo-scroll"><table class="lab-hpo"><tr><th></th><th>탐색</th><th>대상 · 지표</th><th>상태</th><th>진행</th>'
              "<th>지금 설정</th><th>최고</th><th>지금 대비</th><th>포화</th><th>예상 끝</th><th>보기 · 동작</th></tr>"
              + "".join(body) + "</table></div>")
     note = ('<p class="sub">지금 대비 = 최고 ÷ 지금 설정 - 1 (음수면 나아짐). 포화 = 최근 50개 trial에서 최고 기록 개선이 '
             "max(1%, seed 표준편차)보다 작음. 예상 끝은 지금 속도 기준이며, 대기열의 다른 실험 시간은 빠져 있습니다. "
-            "trial은 검증 run 하나로 고른 값이라 낙관적입니다. 상위 설정은 seed 3개로 다시 학습해 판정합니다.</p>")
+            "trial은 검증 run 하나로 고른 값이라 낙관적입니다. 상위 설정은 seed 3개로 다시 학습해 판정합니다. "
+            "표는 실행 중, 대기, 멈춤, 완료, 미실행 순이며 안에서 스크롤됩니다. GPU 메모리가 모자란 설정은 batch를 조각내 "
+            "같은 실효 batch로 학습하고, trial 하나는 탐색 파일의 train.max_minutes(기본 120분)까지만 GPU를 씁니다.</p>")
     return head + actions + table + note
 
 
@@ -493,6 +505,10 @@ table.lab-filelist td:nth-child(n+3){white-space:nowrap}
 table.lab-hpo td{vertical-align:middle} table.lab-hpo td:nth-child(n+3){white-space:nowrap}
 table.lab-hpo td.lab-hpo-acts{white-space:normal;min-width:150px} .lab-hpo-acts .pl-btn{padding:2px 8px;margin:2px 0}
 table.lab-hpo td:nth-child(2){min-width:220px}
+.lab-hpo-scroll{max-height:470px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--grid);border-radius:8px}
+.lab-hpo-scroll table.lab-hpo{margin:0} .lab-hpo-scroll table.lab-hpo th{position:sticky;top:0;z-index:1}
+table.lab-hpo th{word-break:keep-all} .lab-hpo-fail{margin-top:4px;white-space:normal;max-width:300px} .lab-hpo-fail summary{cursor:pointer;color:var(--text2)}
+.lab-hpo-fail ul{margin:4px 0 0;padding-left:18px} .lab-hpo-fail li{margin:2px 0}
 table.lab-xlist tr[data-xsel]{cursor:pointer} table.lab-xlist tr[data-xsel]:hover td{background:var(--shade)}
 table.lab-xlist tr.on td{background:var(--shade);font-weight:600} table.lab-xlist tr.on td:first-child{box-shadow:inset 3px 0 0 var(--s1)}
 table.lab-xlist td:nth-child(n+3){white-space:nowrap} .lab-xpanel{margin-top:12px}
@@ -540,7 +556,11 @@ get('/api/meta').then(meta=>{M=meta;$('lab-offline').hidden=true;$('lab-live').h
 // 극한 탐색: study table, queue the checked studies, current-setting trial, top settings again with seeds
 function hpo(){const box=$('lab-hpo');if(!box)return;const keep=new Set([...box.querySelectorAll('.lab-hpo-pick:checked')].map(i=>i.value));
   const msg=(box.querySelector('#lab-hpo-actions .lab-msg')||{}).textContent||'';
-  get('/api/fragment/hpo').then(html=>{box.innerHTML=html;box.querySelectorAll('.lab-hpo-pick').forEach(i=>{if(keep.has(i.value))i.checked=true;});
+  get('/api/fragment/hpo').then(html=>{const sc=box.querySelector('.lab-hpo-scroll'),top=sc?sc.scrollTop:0,left=sc?sc.scrollLeft:0;
+    const open=new Set([...box.querySelectorAll('details[data-key][open]')].map(d=>d.dataset.key));
+    box.innerHTML=html;box.querySelectorAll('.lab-hpo-pick').forEach(i=>{if(keep.has(i.value))i.checked=true;});
+    box.querySelectorAll('details[data-key]').forEach(d=>{if(open.has(d.dataset.key))d.open=true;});
+    const sc2=box.querySelector('.lab-hpo-scroll');if(sc2){sc2.scrollTop=top;sc2.scrollLeft=left;}
     const m=box.querySelector('#lab-hpo-actions .lab-msg');if(m)m.textContent=msg;
     const say=t=>{const x=box.querySelector('#lab-hpo-actions .lab-msg');if(x)x.textContent=t;};
     const gpus=()=>F?[...F.gpus].sort().join(',')||'cpu':'auto';

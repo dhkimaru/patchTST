@@ -574,6 +574,7 @@ def run_trials(spec: StudySpec, cfg: Any, paths: LabPaths, split: Any, exp_dir: 
                              save_artifacts=False)
         except Exception as exc:  # noqa: BLE001  (recorded in the journal by run_job; the study goes on)
             traceback.print_exc()
+            trial.set_user_attr("error", f"{type(exc).__name__}: {exc}"[:500])
             study.tell(trial, state=TrialState.FAIL)
             record = {"job_id": job.job_id, "target": job.target, "model": job.model, "label": job.label,
                       "seed": job.seed, "status": "failed", "error": f"{type(exc).__name__}: {exc}",
@@ -584,9 +585,13 @@ def run_trials(spec: StudySpec, cfg: Any, paths: LabPaths, split: Any, exp_dir: 
             trial.set_user_attr("job_id", job.job_id)
             trial.set_user_attr("epochs", result.get("epochs"))
             trial.set_user_attr("mae", result.get("mae"))
+            trial.set_user_attr("train_status", result.get("train_status"))
+            if (result.get("batch_parts") or 1) > 1:
+                trial.set_user_attr("batch_parts", result["batch_parts"])
             if pruned:
                 study.tell(trial, state=TrialState.PRUNED)
             elif value is None or not math.isfinite(float(value)):
+                trial.set_user_attr("error", f"검증 {spec.objective}가 NaN: 학습 발산 ({result.get('train_status')})")
                 study.tell(trial, state=TrialState.FAIL)
             else:
                 study.tell(trial, float(value))
@@ -847,6 +852,109 @@ def _reference_of(done: list[Any]) -> tuple[Any, int]:
     return ref, int(ref.user_attrs.get("ref_version", 1))
 
 
+FAIL_UNKNOWN = "기록 없음: 검증 지표가 NaN이었거나 작업자가 중간에 멈춤"
+_JOURNAL_FAILS: dict[tuple[str, str], tuple[int, dict[str, str]]] = {}
+
+
+def fail_kind(text: str) -> str:
+    """A short name for why a trial failed, from its error text."""
+
+    low = text.lower()
+    if "out of memory" in low or "outofmemory" in low:
+        return "GPU 메모리 부족"
+    if "NaN" in text or "not finite" in low:
+        return "학습 발산 (NaN)"
+    if "worker exited" in low:
+        return "작업자 중단"
+    return "오류"
+
+
+def journal_failures(paths: LabPaths, name: str) -> dict[str, str]:
+    """``label → error`` of the failed trial jobs of study ``name`` in the pipeline journal. Runs of older code kept
+    the error only there (newer runs also store it on the trial). Read incrementally: only new lines each call."""
+
+    path = Path(paths.journal_dir) / "journal.jsonl"
+    if not path.is_file():
+        return {}
+    key = (str(path), name)
+    size = path.stat().st_size
+    offset, found = _JOURNAL_FAILS.get(key, (0, {}))
+    if size < offset:  # the file was replaced: read it again
+        offset, found = 0, {}
+    if size > offset:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(size - offset)
+        whole = chunk.rfind(b"\n") + 1  # a line still being written waits for the next call
+        needle = f'"experiment": {json.dumps(name)}'
+        found = dict(found)
+        for raw in chunk[:whole].decode("utf-8", errors="replace").splitlines():
+            if '"status": "failed"' not in raw or needle not in raw:
+                continue
+            try:
+                doc = json.loads(raw)
+            except ValueError:
+                continue
+            config = doc.get("config") or {}
+            if config.get("experiment") == name and config.get("label"):
+                found[str(config["label"])] = str(doc.get("error") or "")
+        offset += whole
+        _JOURNAL_FAILS[key] = (offset, found)
+    return found
+
+
+def brief_settings(params: dict[str, Any]) -> str:
+    """The settings that decide memory and time: window, patch, patch count, size, batch."""
+
+    p = dict(params)
+    context, patch = p.get(CONTEXT_KEY), p.get("patch_seconds")
+    stride = p.get("stride_seconds")
+    if stride is None and patch is not None and p.get("stride_ratio") is not None:
+        stride = float(patch) * float(p["stride_ratio"])
+    parts = []
+    if context is not None:
+        parts.append(f"window {float(context):g}초")
+    if patch is not None:
+        parts.append(f"patch {float(patch):g}초" + (f" 간격 {float(stride):g}초" if stride else ""))
+    if context is not None and patch is not None and stride:
+        parts.append(f"patch {int((float(context) - float(patch)) // float(stride)) + 1}개")
+    for key, label in (("d_model", "d_model "), ("n_layers", "층 "), ("n_heads", "head "), ("d_ff", "d_ff "),
+                       ("train.batch_size", "batch "), ("train.lr", "lr ")):
+        if p.get(key) is not None:
+            value = p[key]
+            parts.append(f"{label}{value:.0e}" if key == "train.lr" else f"{label}{value}")
+    return ", ".join(parts)
+
+
+def failures(spec: StudySpec, trials: list[Any], paths: LabPaths) -> list[dict[str, Any]]:
+    """Every failed trial with a reason (``kind``), the error text and its memory-relevant settings."""
+
+    from optuna.trial import TrialState
+
+    out, logged = [], None
+    for t in trials:
+        if t.state != TrialState.FAIL:
+            continue
+        problems = list(t.user_attrs.get("problems") or [])
+        text = "; ".join(problems) or t.user_attrs.get("error")
+        if not text:
+            if logged is None:
+                logged = journal_failures(paths, spec.name)
+            role = "ref" if t.user_attrs.get("role") == "reference" else f"t{t.number:04d}"
+            text = logged.get(f"{spec.model}#{role}")
+        kind = "설정 조합 불가" if problems else (fail_kind(text) if text else "기록 없음")
+        out.append({"trial": t.number, "kind": kind, "error": (text or FAIL_UNKNOWN)[:300],
+                    "settings": brief_settings(_actual(t))})
+    return out
+
+
+def failure_kinds(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item["kind"]] = counts.get(item["kind"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
 def _actual(t: Any) -> dict[str, Any]:
     """The settings a trial really trained with (derived and extra keys resolved), else the sampled ones."""
 
@@ -872,7 +980,7 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
         rows.append({"number": t.number, "state": t.state.name, "value": t.value,
                      "role": t.user_attrs.get("role", ""), "epochs": t.user_attrs.get("epochs"),
                      "last_step": t.last_step, "seconds": t.duration.total_seconds() if t.duration else None,
-                     "problems": "; ".join(t.user_attrs.get("problems", [])),
+                     "problems": "; ".join(t.user_attrs.get("problems", [])), "error": t.user_attrs.get("error", ""),
                      **{f"p.{k}": v for k, v in _actual(t).items()}})
     frame = pd.DataFrame(rows)
     done = [t for t in trials if t.state == TrialState.COMPLETE]
@@ -904,6 +1012,7 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
         "expected_best": [{"n": i + 1, "value": v} for i, v in enumerate(expected)],
         "top": [{"number": t.number, "value": t.value, "params": _actual(t), "role": t.user_attrs.get("role", ""),
                  "ref_version": t.user_attrs.get("ref_version")} for t in top],
+        "failures": failures(spec, trials, paths),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     folder = study_dir(paths, spec.name)
@@ -982,6 +1091,11 @@ def study_text(summary: dict[str, Any]) -> str:
                   "trial 수  최고 기록  기대 최고치"]
         for n in marks:
             lines.append(f"{n:>8d}  {_fmt(curve[n - 1]):>9s}  {_fmt(expected[n - 1]):>10s}")
+    fails = summary.get("failures") or []
+    if fails:
+        kinds = ", ".join(f"{k} {v}" for k, v in failure_kinds(fails).items())
+        lines += ["", f"[실패] {len(fails)}개: {kinds}"]
+        lines += [f"- trial {f['trial']} ({f['kind']}): {f['settings']} | {f['error']}" for f in fails]
     imp = summary.get("importances") or {}
     if imp:
         lines += ["", "[설정 중요도] fANOVA, 성능 변동에 대한 기여 몫(합 1)"]
@@ -1057,6 +1171,9 @@ def _live_info(spec: StudySpec, paths: LabPaths, request: dict[str, Any] | None)
     values = [float(t.value) for t in done]
     best = min(done, key=lambda t: t.value) if done else None
     ref, version = _reference_of(done)
+    pending_ref = any(t.user_attrs.get("role") == "reference" and int(t.user_attrs.get("ref_version", 1)) > version
+                      and t.state in (TrialState.RUNNING, TrialState.WAITING) for t in trials)
+    fails = failures(spec, trials, paths)
     sat = saturation(values, spec.window, spec.min_gain_pct, _seed_sd_pct(spec, paths))
     running = bool(request and request.get("status") == "running")
     summary_path = study_dir(paths, spec.name) / "summary.json"
@@ -1066,7 +1183,8 @@ def _live_info(spec: StudySpec, paths: LabPaths, request: dict[str, Any] | None)
     imp = old.get("importances") or {}
     return {"counts": _counts(study), "finished": pace["finished"], "progress": pace,
             "best": best.value if best else None, "best_number": best.number if best else None,
-            "reference": ref.value if ref else None, "ref_version": version,
+            "reference": ref.value if ref else None, "ref_version": version, "ref_pending": pending_ref,
+            "failures": fails, "failure_kinds": failure_kinds(fails),
             "gain_pct": ((ref.value - best.value) / ref.value * 100) if ref and best and ref.value else None,
             "saturation": sat["verdict"], "saturation_reason": sat["reason"],
             "importance_top": max(imp, key=imp.get) if imp else None}

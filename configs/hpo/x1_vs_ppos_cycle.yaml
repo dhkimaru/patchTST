@@ -23,6 +23,7 @@ train:
   min_epochs: 20
   patience: 10
   loss: mae
+  max_minutes: 120
 fixed:
   channel_mode: mixing
 space:

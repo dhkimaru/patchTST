@@ -351,7 +351,8 @@ def run_job(
             training = train_model(model, train_ws, val_ws, settings, seed=job.seed, log=log, on_epoch=on_epoch)
             fit_seconds = time.perf_counter() - started
             infer_start = time.perf_counter()
-            pred = predict(model, val_ws, val_idx, batch_size=settings.eval_batch_size, amp=settings.amp)
+            pred = predict(model, val_ws, val_idx, batch_size=training.get("eval_batch_size") or settings.eval_batch_size,
+                           amp=settings.amp)
             if residual == "template":
                 pred = pred * scale + data.val.template[data.val.target_rows(val_idx)]
                 if save_artifacts:
@@ -401,7 +402,8 @@ def run_job(
             "improvement_pct": gain, "is_baseline": is_baseline, **_flat_metrics(metrics),
             "epochs": training.get("epochs"), "best_epoch": training.get("best_epoch"),
             "train_status": training.get("status"), "best_val_mae": training.get("best_val_mae"), "windows_per_second": training.get("windows_per_second"),
-            "peak_gpu_mb": training.get("peak_gpu_mb"), "job_dir": f"jobs/{job.job_id}",
+            "peak_gpu_mb": training.get("peak_gpu_mb"), "batch_parts": training.get("batch_parts"),
+            "job_dir": f"jobs/{job.job_id}",
         }
         (job_dir / "job.json").write_text(json.dumps({
             "job": job.to_dict(), "experiment": cfg.name, "task": cfg.task, "inputs": data.inputs,

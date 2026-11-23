@@ -18,7 +18,7 @@ from ald_lab.ledger import collect_ledger, main_records
 from ald_lab.models.deep import build_deep_model
 from ald_lab.training.config import load_experiment
 from ald_lab.training.runner import run_experiment
-from ald_lab.training.trainer import TrainSettings, _lr_factor, train_model
+from ald_lab.training.trainer import TrainSettings, _lr_factor, predict, train_model
 from ald_lab.training.windows import WindowSet
 
 from .test_training import _config, lab  # noqa: F401  (fixture)
@@ -197,6 +197,51 @@ def _tiny_sets():
     return make(), make()
 
 
+class _SmallGpu(torch.nn.Module):
+    """Runs out of "GPU memory" above 8 windows, like a 500-patch setting with batch 2048 on a 24 GB card."""
+
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if len(x) > 8:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 34.00 GiB")
+        return self.inner(x)
+
+
+def test_out_of_memory_splits_the_batch_and_keeps_its_meaning():
+    import copy
+
+    train, val = _tiny_sets()
+    plain = build_deep_model("dlinear", {"kernel": 5, "d_rep": 8}, n_channels=3, context=16, n_horizons=1,
+                             n_targets=1, target_channels=[0])
+    small = _SmallGpu(copy.deepcopy(plain))
+    settings = TrainSettings(batch_size=32, max_epochs=1, windows_per_epoch=32, val_windows=16, eval_batch_size=64,
+                             lr=1e-2, lr_schedule="constant", amp=False)
+    logs: list[str] = []
+    out = train_model(small, train, val, settings, log=logs.append)
+    ref = train_model(plain, train, val, settings, log=lambda m: None)
+    assert out["status"] == ref["status"] and out["batch_parts"] == 4 and out["eval_batch_size"] == 8
+    assert any("4조각" in m for m in logs) and any("검증 batch 64 → 8" in m for m in logs)
+    for a, b in zip(small.inner.parameters(), plain.parameters()):  # one step on 4 pieces = one step on the batch
+        assert torch.allclose(a, b, atol=1e-6)
+    pred = predict(small, val, np.arange(40), batch_size=64, amp=False)
+    assert pred.shape == (40, 1, 1) and np.allclose(pred, predict(plain, val, np.arange(40), amp=False), atol=1e-6)
+
+    with pytest.raises(RuntimeError):  # another error is not retried
+        train_model(_Broken(), train, val, settings, log=lambda m: None)
+
+
+class _Broken(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("shape mismatch")
+
+
 def test_trainer_prunes_waits_and_schedules():
     train, val = _tiny_sets()
     model = build_deep_model("dlinear", {"kernel": 5, "d_rep": 8}, n_channels=3, context=16, n_horizons=1,
@@ -284,6 +329,53 @@ def test_an_old_style_reference_is_replaced(lab, tmp_path):  # noqa: F811
     summary = json.loads((paths.work_root / "hpo" / "old_ref" / "summary.json").read_text())
     assert summary["reference"]["version"] == hpo.REF_VERSION and summary["reference"]["number"] == 1
     assert not hpo.enqueue_reference(spec, paths)  # already there: nothing queued twice
+
+
+def test_failed_trials_explain_themselves(lab, tmp_path, monkeypatch):  # noqa: F811
+    """Why a trial failed: the error kept on the trial (new code), a broken combination, or only the pipeline
+    journal (a study started by older code); the dashboard and the text report list each one with its settings."""
+
+    from optuna.trial import TrialState
+
+    from ald_lab.report.lab import hpo_html
+
+    paths, split_path = lab
+    base = _config(tmp_path, split_path, models=["ridge"])
+    path = _study(tmp_path, base, name="fails", trials=5, enqueue=[])
+    spec = hpo.load_study(path)
+    study = hpo.open_study(spec, paths)
+    settings = {"window.context_seconds": 16, "d_model": 16, "stride_ratio": 0.5}
+    for attrs in ({"error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 34.00 GiB"},
+                  {"problems": ["patchtst: patch 20초가 window 16초보다 깁니다"]}, {}, {}):
+        trial = study.ask()
+        for key, value in {**attrs, "actual": {**settings, "patch_seconds": 2, "train.batch_size": 2048}}.items():
+            trial.set_user_attr(key, value)
+        study.tell(trial, state=TrialState.FAIL)
+    journal = Path(paths.journal_dir) / "journal.jsonl"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    line = {"stage": "train", "status": "failed", "error": "torch.OutOfMemoryError: CUDA out of memory.",
+            "config": {"experiment": "fails", "label": "patchtst#t0002"}}
+    other = {**line, "config": {"experiment": "fails_other", "label": "patchtst#t0003"}}
+    journal.write_text(json.dumps(line, ensure_ascii=False) + "\n" + json.dumps(other) + "\n", encoding="utf-8")
+
+    found = hpo.failures(spec, study.get_trials(deepcopy=False), paths)
+    assert [f["kind"] for f in found] == ["GPU 메모리 부족", "설정 조합 불가", "GPU 메모리 부족", "기록 없음"]
+    assert "patch 15개" in found[0]["settings"] and "batch 2048" in found[0]["settings"]  # (16 - 2) // 1 + 1
+    assert found[3]["error"] == hpo.FAIL_UNKNOWN  # the other study's journal line is not taken
+    assert hpo.fail_kind("검증 mae가 NaN: 학습 발산 (NAN_LOSS)") == "학습 발산 (NaN)"
+
+    with journal.open("a", encoding="utf-8") as handle:  # read incrementally: a later line is still picked up
+        handle.write(json.dumps({**line, "config": {"experiment": "fails", "label": "patchtst#t0003"},
+                                 "error": "RuntimeError: worker exited"}) + "\n")
+    assert hpo.failures(spec, study.get_trials(deepcopy=False), paths)[3]["kind"] == "작업자 중단"
+
+    text = (Path(paths.work_root) / "reports" / "hpo_fails.txt")
+    hpo.report_study(spec, paths, importance=False)
+    assert "[실패] 4개: GPU 메모리 부족 2" in text.read_text(encoding="utf-8")
+    monkeypatch.setattr(hpo, "study_files", lambda folder_=None: [path])
+    page = hpo_html(paths, live=True)
+    assert 'class="tw lab-hpo-scroll"' in page and 'data-key="fail-fails"' in page
+    assert "실패 원인: GPU 메모리 부족 2, 설정 조합 불가 1, 작업자 중단 1" in page and "trial 0" in page
 
 
 def test_dashboard_lists_studies_with_progress_and_end_times(lab, tmp_path, monkeypatch):  # noqa: F811
