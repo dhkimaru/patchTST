@@ -19,7 +19,7 @@ from .launch import HP_SUFFIX, read_request
 from .training.selection import unit_of
 
 BASE_COLUMNS = ("when", "experiment", "base", "stamp", "status", "source", "memo", "task", "target", "unit", "model",
-                "label", "input_set", "seed", "settings", "mae", "improvement_pct", "mae_cycle", "mae_other",
+                "label", "input_set", "seed", "settings", "train", "mae", "improvement_pct", "mae_cycle", "mae_other",
                 "test_mae", "fit_minutes", "n_params", "context_seconds", "study", "exp_dir", "job_id")
 
 
@@ -87,6 +87,8 @@ def _run_rows(exp_dir: Path, request: dict[str, Any] | None) -> list[dict[str, A
             "label": job.get("label"),
             "input_set": job.get("input_set", "default"), "seed": job.get("seed"),
             "settings": settings_text(job.get("params") or {}), "params": job.get("params") or {},
+            # the run's train block (epochs, batch, schedule …): two runs with the same settings can train differently
+            "train": settings_text(config.get("train") or {}),
             "job_status": res.get("status", "ok"), "mae": res.get("mae"), "improvement_pct": res.get("improvement_pct"),
             "mae_cycle": res.get("mae_cycle"), "mae_other": res.get("mae_other"), "test_mae": test_mae,
             "fit_minutes": float(fit) / 60 if fit is not None and not pd.isna(fit) else None, "n_params": res.get("n_params"),

@@ -387,12 +387,20 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
         ref = row.get("reference")
         old_ref = ref is not None and row.get("ref_version", 0) < REF_VERSION
         ref_cell = "-" if ref is None else f"{_fmt(ref)} {r.e(unit)}"
+        check = row.get("ref_check") or {}
+        if check and not check.get("ok"):
+            ref_cell += (f'<div class="lab-warn" title="누적 기록의 seed 평균 {_fmt(check["mean"])} {r.e(unit)}에서 '
+                         f'허용 ±{check["limit_pct"]:.0f}% 밖입니다. 지금 설정이 재현되지 않아 지금 대비는 참고만 하세요">'
+                         f'⚠ 기록과 {check["gap_pct"]:+.0f}%</div>')
         if old_ref:
-            ref_cell += '<div class="lab-warn" title="기록에 없던 설정을 탐색기가 골라, 지금 설정과 다를 수 있습니다">⚠ 이전 방식</div>'
+            ref_cell += ('<div class="lab-warn" title="이전 방식으로 넣은 기준 trial이라 지금 설정과 다를 수 있습니다. '
+                         "'기준 trial 다시 넣기'로 바로잡습니다\">⚠ 이전 방식</div>")
         if row.get("ref_pending"):
             ref_cell += '<div class="sub">새 기준 trial 학습 중</div>'
         gain = row.get("gain_pct")
         gain_cell = "-" if gain is None else (f'<span class="st {"good" if gain > 0 else ""}">{-gain:+.1f}%</span>')
+        if gain is not None and check and not check.get("ok"):
+            gain_cell += '<div class="sub">참고</div>'
         sat = row.get("saturation") or "-"
         sat_cell = (f'<span class="st {"good" if sat == "포화" else ""}" title="{r.e(row.get("saturation_reason") or "")}">'
                     f"{r.e(sat)}</span>")

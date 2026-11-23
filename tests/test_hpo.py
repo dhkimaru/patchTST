@@ -316,6 +316,63 @@ def test_current_setting_trial_trains_exactly_as_recorded(lab, tmp_path):  # noq
     assert "{'n'" not in text and "[진행]" in text  # the curve prints numbers, the pace line is there
 
 
+def test_reference_keeps_runs_that_trained_differently_apart(lab, tmp_path):  # noqa: F811
+    """Two runs with the same model settings but another train block are two references: the mean and the
+    reproduced training come from the same runs (REF_VERSION 3). A trial far from its recorded mean is flagged."""
+
+    from types import SimpleNamespace
+
+    paths, split_path = lab
+    base = _ledger_reference(tmp_path, split_path, paths)  # seeds 1, 2 with max_epochs 2
+    model = [{"name": "patchtst", "params": {**SMALL, "d_model": 8, "d_ff": 16, "stride_seconds": 2}}]
+    # a dashboard run of the same experiment (base "synthetic") that trained otherwise
+    other = _config(tmp_path, split_path, name="synthetic__hp", seeds=[3], models=model,
+                    train={"batch_size": 64, "max_epochs": 1, "windows_per_epoch": 128, "val_windows": 128,
+                           "patience": 2, "lr_schedule": "cosine"})
+    run_experiment(other, paths, devices=["cpu"])
+    led = collect_ledger(paths.work_root)
+    assert led["train"].nunique() == 2 and led["train"].str.contains("lr_schedule=cosine").any()
+    rows = hpo.reference_rows(paths.work_root, "synthetic", min_seeds=2)
+    assert int(rows.iloc[0]["seeds"]) == 2 and "max_epochs=2" in rows.iloc[0]["train"]  # not the 3-seed mix
+    spec = hpo.load_study(_study(tmp_path, base, name="v3_ref", enqueue_from={"experiment": "synthetic", "min_seeds": 2},
+                                 space={"d_model": [8, 16], "train.lr_schedule": ["plateau", "cosine"]}))
+    in_space, extra, expected = hpo._reference_trial(spec, paths.work_root, load_experiment(base))
+    assert in_space["train.lr_schedule"] == "plateau" and extra["train.max_epochs"] == 2
+    assert expected["seeds"] == 2 and expected["mean"] == pytest.approx(float(rows.iloc[0]["mean"]))
+
+    trial = lambda value, attrs: SimpleNamespace(value=value, user_attrs=attrs)
+    ok = hpo.reference_check(spec, paths, trial(1.05, {"expected": {"mean": 1.0, "sd": 0.01, "seeds": 3}}))
+    assert ok["ok"] and ok["limit_pct"] == hpo.REF_TOLERANCE_PCT and ok["gap_pct"] == pytest.approx(5.0)
+    bad = hpo.reference_check(spec, paths, trial(1.425, {"expected": {"mean": 1.0, "sd": 0.064, "seeds": 3}}))
+    assert not bad["ok"] and bad["limit_pct"] == pytest.approx(19.2)  # 3 seed SD is wider than 10 %
+    assert hpo.reference_check(spec, paths, trial(1.0, {})) is None  # no record: nothing to compare
+    hpo.main(["reference", "--experiment", "synthetic", "--min-seeds", "2", "--work-root", str(paths.work_root),
+              "--data-root", str(paths.data_root)])  # a trial queued before the expectation was kept uses this table
+    old = hpo.reference_check(spec, paths, trial(float(rows.iloc[0]["mean"]) * 2, {}))
+    assert old is not None and not old["ok"] and old["gap_pct"] == pytest.approx(100.0)
+    assert "train" in (paths.work_root / "reports" / "hpo_reference.txt").read_text(encoding="utf-8")
+
+
+def test_dashboard_flags_a_reference_that_did_not_reproduce(monkeypatch):
+    from ald_lab.report.lab import hpo_html
+
+    row = {"name": "x1_demo", "file": "x1_demo.yaml", "description": "", "target": "MFCMon_NH3", "model": "patchtst",
+           "objective": "mae", "unit": "slm", "budget": 150, "task": "virtual_sensor", "request": None,
+           "report": "hpo_x1_demo.txt", "finished": 40, "state": "running", "progress": {"per_trial_min": 1.8},
+           "counts": {"complete": 29, "pruned": 9, "fail": 2}, "reference": 0.07487, "ref_version": 2,
+           "ref_check": {"mean": 0.05253, "sd": 0.003367, "seeds": 3, "gap_pct": 42.5, "limit_pct": 19.2, "ok": False},
+           "best": 0.05345, "gain_pct": 28.6, "saturation": "판단 보류"}
+    status = {"rows": [row], "states": {"done": 0, "running": 1, "queued": 0, "partial": 0, "new": 0},
+              "finished": 40, "budget": 150, "queue_end": None}
+    monkeypatch.setattr(hpo, "studies_status", lambda paths, folder=None: status)
+    page = hpo_html(None, live=True)
+    assert "⚠ 기록과 +42%" in page and "⚠ 이전 방식" in page and "data-hpo-requeue" in page  # v2: put v3 in
+    assert '<div class="sub">참고</div>' in page  # 지금 대비 is only indicative
+    row.update(ref_version=hpo.REF_VERSION, ref_check={**row["ref_check"], "gap_pct": 3.0, "ok": True})
+    page = hpo_html(None, live=True)
+    assert "⚠" not in page and "data-hpo-requeue" not in page
+
+
 def test_an_old_style_reference_is_replaced(lab, tmp_path):  # noqa: F811
     paths, split_path = lab
     base = _ledger_reference(tmp_path, split_path, paths)

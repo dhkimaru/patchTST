@@ -47,7 +47,12 @@ DERIVED = {"stride_ratio": "stride_seconds = patch_seconds × stride_ratio",
 CONTEXT_KEY = "window.context_seconds"
 INPUT_KEY = "data.input_set"  # a named input set (all, core, core_ab, legacy_primary, A_all, A_plus) per trial
 STUDY_TAG = "hpo"  # experiment.yaml ``study``: search trials stay out of the main records (selection bias)
-REF_VERSION = 2  # 1: keys missing from the record were drawn by the sampler; 2: filled with the run's own defaults
+# 1: keys missing from the record were drawn by the sampler; 2: filled with the run's own defaults, but the train
+# block came from any run with the same model settings (runs that trained differently were averaged together);
+# 3: runs are grouped by their train block too, so the mean and the reproduced setting come from the same runs.
+REF_VERSION = 3
+# A current-setting trial further than this from its recorded mean (max of the %, 3 seed SD) is flagged.
+REF_TOLERANCE_PCT = 10.0
 LIVE_EVERY = 5  # rewrite the study report after this many finished trials (the dashboard reads it)
 
 
@@ -381,13 +386,15 @@ def reference_rows(work_root: Path, experiment: str, *, model: str = "patchtst",
               & led[metric].notna()]
     if not len(led):
         return pd.DataFrame()
-    led = led.assign(context=led["context_seconds"].astype(str))
+    led = led.assign(context=led["context_seconds"].astype(str),
+                     train=led["train"].fillna("") if "train" in led else "")
     rows = []
-    for (target, settings, context, input_set), g in led.groupby(["target", "settings", "context", "input_set"]):
+    for (target, settings, train, context, input_set), g in led.groupby(
+            ["target", "settings", "train", "context", "input_set"]):
         values = g[metric].astype(float)
         mean = float(values.mean())
         sd = float(values.std(ddof=1)) if len(values) > 1 else None
-        rows.append({"target": target, "unit": g["unit"].iloc[0], "settings": settings,
+        rows.append({"target": target, "unit": g["unit"].iloc[0], "settings": settings, "train": train,
                      "params": g["params"].iloc[0], "context_seconds": float(g["context_seconds"].iloc[0]),
                      "input_set": input_set, "seeds": int(g["seed"].nunique()), "metric": metric, "mean": mean,
                      "sd": sd, "sd_pct": (sd / mean * 100) if sd is not None and mean else None,
@@ -399,8 +406,10 @@ def reference_rows(work_root: Path, experiment: str, *, model: str = "patchtst",
     return best.sort_values("target").reset_index(drop=True)
 
 
-def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """Params of the current best settings (``enqueue_from``) split into space keys and the rest."""
+def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any
+                     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+    """Params of the current best settings (``enqueue_from``) split into space keys and the rest, and what the
+    record expects of them (seed mean, SD, seed count)."""
 
     conf = spec.enqueue_from
     if not conf:
@@ -434,7 +443,9 @@ def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any) -> tuple[dict[s
             in_space[key] = value
         else:
             extra[key] = value
-    return in_space, extra
+    expected = {"mean": float(row["mean"]), "sd": None if pd.isna(row["sd"]) else float(row["sd"]),
+                "seeds": int(row["seeds"]), "train": str(row.get("train") or "")}
+    return in_space, extra, expected
 
 
 def _model_defaults(model: str, sample_seconds: float) -> dict[str, Any]:
@@ -497,8 +508,9 @@ def enqueue_reference(spec: StudySpec, paths: LabPaths, cfg: Any = None, study: 
     ref = _reference_trial(spec, Path(paths.work_root), cfg)
     if ref is None:
         return False
-    in_space, extra = ref
-    study.enqueue_trial(in_space, user_attrs={"role": "reference", "ref_version": REF_VERSION, "extra_params": extra})
+    in_space, extra, expected = ref
+    study.enqueue_trial(in_space, user_attrs={"role": "reference", "ref_version": REF_VERSION, "extra_params": extra,
+                                              "expected": expected})
     return True
 
 
@@ -682,7 +694,7 @@ def run_study(path: str | Path, paths: LabPaths, *, devices: list[str], trials: 
     for t in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
         study.tell(t.number, state=TrialState.FAIL)  # left over by a stopped run
     fresh = not study.get_trials(deepcopy=False)
-    enqueue_reference(spec, paths, cfg, study)  # also for a study begun before REF_VERSION 2
+    enqueue_reference(spec, paths, cfg, study)  # also for a study begun before the current REF_VERSION
     if fresh:
         for params in spec.enqueue:
             study.enqueue_trial(params, user_attrs={"role": "enqueued"})
@@ -789,6 +801,31 @@ def _seed_sd_pct(spec: StudySpec, paths: LabPaths) -> float | None:
         for row in exact or mine:  # the study's own reference experiment first, any other run of the target next
             return float(row["sd_pct"])
     return None
+
+
+def reference_check(spec: StudySpec, paths: LabPaths, ref: Any) -> dict[str, Any] | None:
+    """How far the current-setting trial landed from the seed mean the record has for it. A trial outside
+    max(REF_TOLERANCE_PCT, 3 seed SD) did not reproduce the current setting, so '지금 대비' is not trustworthy."""
+
+    if ref is None or ref.value is None:
+        return None
+    expected = ref.user_attrs.get("expected")
+    if not expected:  # queued before the expectation was stored: the table of ``ald-hpo reference``
+        path = study_dir(paths, spec.name).parent / "reference.json"
+        rows = json.loads(path.read_text(encoding="utf-8")).get("rows", []) if path.is_file() else []
+        experiment = str(spec.enqueue_from.get("experiment") or "")
+        mine = [r for r in rows if r.get("target") == spec.target and r.get("experiment") == experiment
+                and r.get("model", spec.model) == spec.model and r.get("mean")]
+        expected = {"mean": mine[0]["mean"], "sd": mine[0].get("sd"), "seeds": mine[0].get("seeds")} if mine else None
+    if not expected or not expected.get("mean"):
+        return None
+    mean = float(expected["mean"])
+    sd = expected.get("sd")
+    sd = None if sd is None or (isinstance(sd, float) and not math.isfinite(sd)) else float(sd)
+    gap = (float(ref.value) - mean) / mean * 100
+    limit = max(REF_TOLERANCE_PCT, 3 * sd / mean * 100) if sd else REF_TOLERANCE_PCT
+    return {"mean": mean, "sd": sd, "seeds": expected.get("seeds"), "gap_pct": gap, "limit_pct": limit,
+            "ok": abs(gap) <= limit}
 
 
 def _fmt(value: Any, digits: int = 4) -> str:
@@ -1005,7 +1042,8 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
         "name": spec.name, "target": spec.target, "model": spec.model, "objective": spec.objective, "unit": unit,
         "base": spec.base, "budget": spec.trials, "counts": counts, "progress": pace, "run": run,
         "best": {"number": best.number, "value": best.value, "params": _actual(best)} if best else None,
-        "reference": {"number": ref.number, "value": ref.value, "version": ref_version} if ref else None,
+        "reference": {"number": ref.number, "value": ref.value, "version": ref_version,
+                      "check": reference_check(spec, paths, ref)} if ref else None,
         "gain_vs_reference_pct": ((ref.value - best.value) / ref.value * 100) if ref and best and ref.value else None,
         "saturation": sat, "importances": importances,
         "best_so_far": [{"n": i + 1, "value": float(v)} for i, v in enumerate(best_curve)],
@@ -1078,8 +1116,17 @@ def study_text(summary: dict[str, Any]) -> str:
         gain = summary.get("gain_vs_reference_pct")
         old = (" · 이전 방식 기준 trial(기록에 없던 설정을 탐색기가 골라 지금 설정과 다를 수 있음, "
                "ald-hpo requeue-reference로 다시 넣기)" if ref.get("version", 1) < REF_VERSION else "")
+        if ref.get("version", 1) == 2:
+            old = (" · 2판 기준 trial(학습 설정이 다른 run을 섞은 기록에서 학습 설정을 가져왔음, "
+                   "ald-hpo requeue-reference로 다시 넣기)")
         lines.append(f"[지금 설정] trial {ref['number']}: {_fmt(ref['value'])} {unit}"
                      + (f" · 최고 ÷ 지금 설정 - 1 = {-gain:.1f}%" if gain is not None else "") + old)
+        check = ref.get("check")
+        if check:
+            seeds = f"seed {check['seeds']}개 " if check.get("seeds") else ""
+            lines.append(f"[재현 확인] 누적 기록 {seeds}평균 {_fmt(check['mean'])} {unit}, 이번 trial과 차이 "
+                         f"{check['gap_pct']:+.1f}% (허용 ±{check['limit_pct']:.1f}%): "
+                         + ("재현됨" if check["ok"] else "재현 안 됨, '지금 대비'는 참고만"))
     lines += ["", f"[포화 판정] {sat['verdict']}: {sat['reason']}"
               + (f" · seed 표준편차 {sat['seed_sd_pct']:.2f}%" if sat.get("seed_sd_pct") is not None else
                  " · seed 표준편차 기록 없음(최소 개선 기준만 씀)")]
@@ -1184,6 +1231,7 @@ def _live_info(spec: StudySpec, paths: LabPaths, request: dict[str, Any] | None)
     return {"counts": _counts(study), "finished": pace["finished"], "progress": pace,
             "best": best.value if best else None, "best_number": best.number if best else None,
             "reference": ref.value if ref else None, "ref_version": version, "ref_pending": pending_ref,
+            "ref_check": reference_check(spec, paths, ref),
             "failures": fails, "failure_kinds": failure_kinds(fails),
             "gain_pct": ((ref.value - best.value) / ref.value * 100) if ref and best and ref.value else None,
             "saturation": sat["verdict"], "saturation_reason": sat["reason"],
@@ -1418,13 +1466,14 @@ def main(argv: list[str] | None = None) -> int:
         merged.update({key(r): r for r in new_rows.to_dict(orient="records")})
         all_rows = sorted(merged.values(), key=lambda r: (str(r.get("experiment")), r["target"]))
         _write_json(ref_path, {"updated": datetime.now().isoformat(timespec="seconds"), "rows": all_rows})
-        table = pd.DataFrame(all_rows)[["experiment", "target", "unit", "metric", "seeds", "mean", "sd", "sd_pct",
-                                        "context_seconds", "settings"]]
+        table = pd.DataFrame(all_rows).reindex(columns=["experiment", "target", "unit", "metric", "seeds", "mean", "sd",
+                                                        "sd_pct", "context_seconds", "settings", "train"])
         reports = Path(paths.work_root) / "reports"
         reports.mkdir(parents=True, exist_ok=True)
         (reports / "hpo_reference.txt").write_text(
             "## 지금 설정의 기준점 (누적 기록, 검증 run, 학습 없음)\n"
-            "실험·대상마다 seed 평균이 가장 낮은 설정. sd = seed 간 표준편차(단위는 대상 단위), sd_pct = sd ÷ 평균 × 100.\n\n"
+            "실험·대상마다 seed 평균이 가장 낮은 설정. sd = seed 간 표준편차(단위는 대상 단위), sd_pct = sd ÷ 평균 × 100.\n"
+            "settings = 모델 설정, train = 그 run의 실험 파일 학습 설정(같은 모델 설정이라도 학습 설정이 다르면 따로 묶음).\n\n"
             + table.to_string(index=False, float_format=lambda v: f"{v:.4g}") + "\n", encoding="utf-8")
         show = rows[["target", "unit", "seeds", "mean", "sd", "sd_pct", "context_seconds", "settings"]]
         print(f"## 지금 설정 ({args.experiment}, {args.model}, 검증 {args.metric}, seed {args.min_seeds}개 이상 우선)")
