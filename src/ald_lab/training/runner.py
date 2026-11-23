@@ -190,10 +190,14 @@ class DataCache:
         self.usable = [c for c in self.train_bundle.columns if c in set(self.val_bundle.columns)]
         # Copies (|r| ≥ COPY_THRESHOLD = 0.9999) measured on train runs only; virtual sensors drop them with the target.
         self.near_copies = find_near_copies(self.train_bundle, self.usable)
-        self._cache: OrderedDict[tuple[str, str], TargetData] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, str, int], TargetData] = OrderedDict()
 
-    def target_data(self, target: str, input_set: str = "default") -> TargetData:
-        key = (target, input_set)
+    def target_data(self, target: str, input_set: str = "default",
+                    cfg: ExperimentConfig | None = None) -> TargetData:
+        """Window sets of one target. ``cfg`` overrides the window length (a search trial); the cache key includes it."""
+
+        cfg = cfg or self.cfg
+        key = (target, input_set, cfg.context_steps)
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
@@ -209,7 +213,7 @@ class DataCache:
             inputs = [c for c in inputs if c not in constant]
         union = inputs + ([target] if target not in inputs else [])
         scaler = fit_scaler(self.train_bundle, union)
-        shape = {"context": self.cfg.context_steps, "horizons": self.cfg.horizon_steps, "region": self.cfg.region,
+        shape = {"context": cfg.context_steps, "horizons": self.cfg.horizon_steps, "region": self.cfg.region,
                  "device": self.device}
         train = make_window_set(self.train_bundle, inputs, target, scaler, **shape)
         val = make_window_set(self.val_bundle, inputs, target, scaler, **shape)
@@ -279,7 +283,16 @@ def run_job(
     parent_id: str | None,
     n_jobs: int,
     log_prefix: str = "",
+    on_epoch: Any = None,
+    save_artifacts: bool = True,
 ) -> dict[str, Any]:
+    """Train and score one job on validation runs.
+
+    ``on_epoch`` goes to :func:`train_model` (deep models; a search prunes through it). ``save_artifacts=False``
+    keeps only the metrics, settings and training history: no weights or prediction files (search trials, which
+    are retrained with their seeds once chosen).
+    """
+
     job_dir = exp_dir / "jobs" / job.job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     log_path = job_dir / "train.log"
@@ -302,7 +315,7 @@ def run_job(
               "train": cfg.train.to_dict() if job.kind == "deep" else None, "smoke": cfg.smoke}
     with journal.record(stage, title, config=config, parent_ids=[parent_id] if parent_id else None,
                         tags=[cfg.name, cfg.task, job.target, job.model]) as entry:
-        data = cache.target_data(job.target, job.input_set)
+        data = cache.target_data(job.target, job.input_set, cfg)
         log(f"inputs {len(data.inputs)}  train windows {len(data.train):,}  val windows {len(data.val):,}")
         val_idx = np.arange(len(data.val))
         training: dict[str, Any] = {}
@@ -335,14 +348,16 @@ def run_job(
                 log("target: correction to the recipe template")
             if settings.recency_halflife_runs > 0:
                 train_ws = with_recency_weights(train_ws, cache.train_bundle, settings.recency_halflife_runs)
-            training = train_model(model, train_ws, val_ws, settings, seed=job.seed, log=log)
+            training = train_model(model, train_ws, val_ws, settings, seed=job.seed, log=log, on_epoch=on_epoch)
             fit_seconds = time.perf_counter() - started
             infer_start = time.perf_counter()
             pred = predict(model, val_ws, val_idx, batch_size=settings.eval_batch_size, amp=settings.amp)
             if residual == "template":
                 pred = pred * scale + data.val.template[data.val.target_rows(val_idx)]
-                data.template.save(job_dir)
-            torch.save({"state_dict": model.state_dict(), "model_config": model_config}, job_dir / "model.pt")
+                if save_artifacts:
+                    data.template.save(job_dir)
+            if save_artifacts:
+                torch.save({"state_dict": model.state_dict(), "model_config": model_config}, job_dir / "model.pt")
             (job_dir / "history.json").write_text(json.dumps(training["history"], indent=1))
         else:
             model = CLASSIC_REGISTRY[job.model](job.params)
@@ -385,7 +400,7 @@ def run_job(
             "fit_seconds": round(fit_seconds, 2), "infer_seconds": round(infer_seconds, 2),
             "improvement_pct": gain, "is_baseline": is_baseline, **_flat_metrics(metrics),
             "epochs": training.get("epochs"), "best_epoch": training.get("best_epoch"),
-            "train_status": training.get("status"), "windows_per_second": training.get("windows_per_second"),
+            "train_status": training.get("status"), "best_val_mae": training.get("best_val_mae"), "windows_per_second": training.get("windows_per_second"),
             "peak_gpu_mb": training.get("peak_gpu_mb"), "job_dir": f"jobs/{job.job_id}",
         }
         (job_dir / "job.json").write_text(json.dumps({
@@ -398,9 +413,10 @@ def run_job(
         (job_dir / "metrics_validation.json").write_text(json.dumps(
             {"metrics": metrics, "training": train_summary, "result": result, "strengths": strengths,
              "weaknesses": weaknesses}, ensure_ascii=False, indent=1, default=str))
-        _prediction_sample(cache.val_bundle, data.val, val_idx, y_true, y_pred, cfg.horizon_labels).to_parquet(
-            job_dir / "predictions_sample.parquet", index=False)
-        if SAVE_VALIDATION_PREDICTIONS:
+        if save_artifacts:
+            _prediction_sample(cache.val_bundle, data.val, val_idx, y_true, y_pred, cfg.horizon_labels).to_parquet(
+                job_dir / "predictions_sample.parquet", index=False)
+        if SAVE_VALIDATION_PREDICTIONS and save_artifacts:
             _validation_predictions(cache.val_bundle, data.val, val_idx, y_true, y_pred, cfg.horizon_labels).to_parquet(
                 job_dir / "predictions_val.parquet", index=False)
 

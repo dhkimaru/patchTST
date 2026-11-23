@@ -90,7 +90,8 @@ def _run_rows(exp_dir: Path, request: dict[str, Any] | None) -> list[dict[str, A
             "job_status": res.get("status", "ok"), "mae": res.get("mae"), "improvement_pct": res.get("improvement_pct"),
             "mae_cycle": res.get("mae_cycle"), "mae_other": res.get("mae_other"), "test_mae": test_mae,
             "fit_minutes": float(fit) / 60 if fit is not None and not pd.isna(fit) else None, "n_params": res.get("n_params"),
-            "context_seconds": context, "study": str(config.get("study") or ""), "exp_dir": str(exp_dir), "job_id": job_id, "smoke": name.endswith("_smoke"),
+            "context_seconds": (job.get("params") or {}).get("window.context_seconds", context),
+            "study": str(config.get("study") or ""), "exp_dir": str(exp_dir), "job_id": job_id, "smoke": name.endswith("_smoke"),
             **{k: v for k, v in res.items() if k.startswith("mae_") and k[4:].endswith("s")
                and k[4:-1].replace(".", "").isdigit()},
         })

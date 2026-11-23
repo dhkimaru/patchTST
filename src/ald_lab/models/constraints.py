@@ -26,6 +26,6 @@ def combo_problems(name: str, params: dict[str, Any], context_seconds: float) ->
     if name == "dlinear" and float(params.get("kernel_seconds", defaults.DEEP["dlinear"]["kernel"])) > context_seconds:
         problems.append("dlinear: 이동평균 길이가 window보다 깁니다")
     for key, value in params.items():
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value <= 0 and key != "dropout":
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value <= 0 and not key.endswith("dropout"):
             problems.append(f"{name}: {key}는 0보다 커야 합니다 ({value})")
     return problems

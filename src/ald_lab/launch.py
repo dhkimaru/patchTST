@@ -382,6 +382,7 @@ def submit(work_root: Path, doc: dict[str, Any], *, gpus: str = "auto", smoke: b
     """Put an experiment in the queue; returns the request record."""
 
     work_root = Path(work_root)
+    kind = "hpo" if is_study_doc(doc) else "experiment"
     now = _now()  # ids sort in submission order (to the millisecond); the queue runs oldest first
     request_id = f"{now:%Y%m%d-%H%M%S}-{now.microsecond // 1000:03d}{uuid.uuid4().hex[:2]}"
     time.sleep(0.002)
@@ -389,10 +390,17 @@ def submit(work_root: Path, doc: dict[str, Any], *, gpus: str = "auto", smoke: b
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "experiment.yaml").write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False),
                                            encoding="utf-8")
+    if kind == "hpo":  # a hyperparameter search study (ald_lab.hpo): one target, one model, ``trials`` jobs
+        targets, models = [doc["target"]], [doc.get("model", "patchtst")]
+        memo = doc.get("description") or f"하이퍼파라미터 탐색: {doc['target']} · {models[0]}"
+        n_jobs = n_jobs or int(doc.get("trials", 150))
+    else:
+        targets, models = doc.get("targets"), [m["name"] if isinstance(m, dict) else m for m in doc["models"]]
+        memo = doc.get("description", "")
     record = {
-        "id": request_id, "status": "queued", "created": _now().isoformat(timespec="seconds"),
-        "name": doc["name"] + ("_smoke" if smoke else ""), "task": doc.get("task"), "memo": doc.get("description", ""),
-        "targets": doc.get("targets"), "models": [m["name"] if isinstance(m, dict) else m for m in doc["models"]],
+        "id": request_id, "status": "queued", "created": _now().isoformat(timespec="seconds"), "kind": kind,
+        "name": doc["name"] + ("_smoke" if smoke else ""), "task": doc.get("task"), "memo": memo,
+        "targets": targets, "models": models,
         "n_jobs": n_jobs, "gpus": gpus, "smoke": smoke, "report": report, "source": source,
         "work_root": str(work_root), "data_root": str(data_root) if data_root else None,
         "pid": None, "exp_dir": None, "returncode": None, "started": None, "finished": None,
@@ -416,8 +424,11 @@ def list_requests(work_root: Path, *, include_hidden: bool = False) -> list[dict
         doc["folder"] = str(folder)
         exp_dir = Path(doc["exp_dir"]) if doc.get("exp_dir") else None
         if exp_dir and exp_dir.is_dir():
-            total = len(json.loads((exp_dir / "jobs.json").read_text(encoding="utf-8"))) \
-                if (exp_dir / "jobs.json").is_file() else doc.get("n_jobs")
+            if doc.get("kind") == "hpo":  # jobs.json grows trial by trial; the budget (+ baseline) is the total
+                total = int(doc.get("n_jobs") or 0) + 1
+            else:
+                total = len(json.loads((exp_dir / "jobs.json").read_text(encoding="utf-8"))) \
+                    if (exp_dir / "jobs.json").is_file() else doc.get("n_jobs")
             done = sum(1 for _ in (exp_dir / "jobs").glob("*/metrics_validation.json"))
             doc["progress"] = (done, total)
         out.append(doc)
@@ -549,6 +560,13 @@ def _new_run(experiments: Path, name: str, before: set[str]) -> Path | None:
 
 
 _TRAIN = "import sys; from ald_lab.cli import train_main; sys.exit(train_main(sys.argv[1:]))"
+_HPO = "import sys; from ald_lab.hpo import main; sys.exit(main(['run', *sys.argv[1:]]))"
+
+
+def is_study_doc(doc: Any) -> bool:
+    """A hyperparameter search study (``configs/hpo/*.yaml``) rather than an experiment."""
+
+    return isinstance(doc, dict) and "space" in doc and "base" in doc
 _REPORT = "import sys; from ald_lab.cli import report_main; sys.exit(report_main(sys.argv[1:]))"
 
 
@@ -559,7 +577,8 @@ def run_request(folder: Path, *, poll: float = 3.0) -> dict[str, Any]:
     work_root = Path(doc["work_root"])
     experiments = work_root / "experiments"
     before = {p.name for p in (experiments / doc["name"]).iterdir()} if (experiments / doc["name"]).is_dir() else set()
-    cmd = [sys.executable, "-c", _TRAIN, str(folder / "experiment.yaml"), "--gpus", str(doc.get("gpus") or "auto"),
+    entry = _HPO if doc.get("kind") == "hpo" else _TRAIN
+    cmd = [sys.executable, "-c", entry, str(folder / "experiment.yaml"), "--gpus", str(doc.get("gpus") or "auto"),
            "--work-root", str(work_root)]
     if doc.get("data_root"):
         cmd += ["--data-root", doc["data_root"]]
@@ -667,7 +686,7 @@ def run_worker(work_root: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="실험 대기열: 대시보드에서 넣은 실험을 차례로 학습합니다.")
     sub = parser.add_subparsers(dest="command", required=True)
-    p_submit = sub.add_parser("submit", help="실험 YAML을 대기열에 넣고 작업자를 깨운다")
+    p_submit = sub.add_parser("submit", help="실험 YAML 또는 탐색 YAML(configs/hpo)을 대기열에 넣고 작업자를 깨운다")
     p_submit.add_argument("config")
     p_submit.add_argument("--gpus", default="auto")
     p_submit.add_argument("--smoke", action="store_true")
@@ -694,11 +713,17 @@ def main(argv: list[str] | None = None) -> int:
     paths = resolve_paths(work_root=args.work_root)
     if args.command == "submit":
         doc = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-        jobs = plan_jobs(doc)
+        if is_study_doc(doc):
+            from .hpo import load_study
+
+            n_jobs = load_study(args.config).trials  # validates the study before it waits in the queue
+        else:
+            n_jobs = len(plan_jobs(doc))
         record = submit(paths.work_root, doc, gpus=args.gpus, smoke=args.smoke, report=args.report,
-                        data_root=paths.data_root, n_jobs=len(jobs), source="terminal")
+                        data_root=paths.data_root, n_jobs=n_jobs, source="terminal")
         started = ensure_worker(paths.work_root)
-        print(f"대기열에 넣음: {record['id']} (작업 {len(jobs)}개)" + (" · 작업자 시작" if started else ""))
+        kind = "탐색 trial" if record["kind"] == "hpo" else "작업"
+        print(f"대기열에 넣음: {record['id']} ({kind} {n_jobs}개)" + (" · 작업자 시작" if started else ""))
     elif args.command == "list":
         for r in list_requests(paths.work_root):
             progress = r.get("progress")

@@ -9,6 +9,10 @@ Speed choices (the previous project took 2–8 h per model at ~3,600 windows/s):
 - early stopping is checked on a fixed, evenly spaced validation subset;
   the full validation set is scored once, after training;
 - bf16 autocast and TF32 matmuls on CUDA, large batches (1024 by default).
+
+Each epoch also records the validation MAE in model space (standardized, or the scaled correction to the recipe
+template); for one target and data setting it is proportional to the MAE in physical units, so it is comparable
+across losses. A hyperparameter search reads it through ``on_epoch`` to stop weak trials early (``hpo.py``).
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from torch import nn
 from .windows import WindowSet, evenly_spaced
 
 LOSSES = ("mse", "huber", "mae")
+LR_SCHEDULES = ("plateau", "cosine", "constant")
 
 
 @dataclass
@@ -35,10 +40,16 @@ class TrainSettings:
     windows_per_epoch: int = 200_000
     val_windows: int = 50_000
     patience: int = 8
+    # Early stopping never fires before this epoch (a run in 140~146 stopped at epoch 34 and was 25 % worse).
+    min_epochs: int = 0
     lr: float = 1e-3
     weight_decay: float = 1e-4
     loss: str = "mse"
     huber_delta: float = 1.0
+    # plateau: halve the rate when validation stalls (the original behaviour); cosine: decay to 1 % of ``lr`` over
+    # ``max_epochs``; constant. ``warmup_epochs`` ramps the rate up linearly first (cosine and constant).
+    lr_schedule: str = "plateau"
+    warmup_epochs: int = 0
     amp: bool = True
     grad_clip: float = 1.0
     max_minutes: float | None = None
@@ -61,6 +72,8 @@ class TrainSettings:
         out = cls(**doc)
         if out.loss not in LOSSES:
             raise ValueError(f"loss must be one of {LOSSES}: {out.loss}")
+        if out.lr_schedule not in LR_SCHEDULES:
+            raise ValueError(f"lr_schedule must be one of {LR_SCHEDULES}: {out.lr_schedule}")
         return out
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,16 +118,37 @@ def predict(model: nn.Module, ws: WindowSet, idx: np.ndarray, *, batch_size: int
 
 @torch.no_grad()
 def _val_loss(model: nn.Module, ws: WindowSet, idx: np.ndarray, settings: TrainSettings,
-              loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -> float:
+              loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -> tuple[float, float]:
+    """Validation loss and MAE (model space) on windows ``idx``."""
+
     model.eval()
-    total, count = 0.0, 0
+    total, abs_total, count = 0.0, 0.0, 0
     for _, tidx in ws.iter_batches(idx, settings.eval_batch_size):
         x, y = ws.gather(tidx)
         with _autocast(ws.device, settings.amp):
             pred = model(x)
-        total += float(loss_fn(pred.float(), y)) * len(tidx)
+        pred = pred.float()
+        total += float(loss_fn(pred, y)) * len(tidx)
+        abs_total += float((pred - y).abs().mean()) * len(tidx)
         count += len(tidx)
-    return total / max(count, 1)
+    return total / max(count, 1), abs_total / max(count, 1)
+
+
+def _lr_factor(settings: TrainSettings) -> Callable[[int], float]:
+    """Per-epoch multiplier of ``lr`` for the cosine and constant schedules (epoch counted from 0)."""
+
+    warm = max(0, int(settings.warmup_epochs))
+    span = max(1, settings.max_epochs - warm)
+
+    def factor(epoch: int) -> float:
+        if epoch < warm:
+            return (epoch + 1) / (warm + 1)
+        if settings.lr_schedule == "constant":
+            return 1.0
+        progress = min(1.0, (epoch - warm) / span)
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return factor
 
 
 def train_model(
@@ -125,8 +159,13 @@ def train_model(
     *,
     seed: int = 0,
     log: Callable[[str], None] = print,
+    on_epoch: Callable[[int, float], bool] | None = None,
 ) -> dict[str, Any]:
-    """Train with early stopping on validation loss; restores the best weights."""
+    """Train with early stopping on validation loss; restores the best weights.
+
+    ``on_epoch(epoch, val_mae)`` is called after every epoch; returning True stops training with status
+    ``PRUNED`` (a hyperparameter search gave up on this trial). The best weights so far are still restored.
+    """
 
     device = train.device
     configure_backend(device)
@@ -134,7 +173,11 @@ def train_model(
     model.to(device)
     runner = torch.compile(model) if settings.compile else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=settings.lr, weight_decay=settings.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=max(1, settings.patience // 3))
+    if settings.lr_schedule == "plateau":
+        scheduler: Any = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5,
+                                                                    patience=max(1, settings.patience // 3))
+    else:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_factor(settings))
     loss_fn = _loss_fn(settings)
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
@@ -186,11 +229,14 @@ def train_model(
             log(f"epoch {epoch}: loss is not finite; stopping")
             break
         train_seconds += time.perf_counter() - epoch_start
-        val_loss = _val_loss(runner, val, val_idx, settings, loss_fn)
-        scheduler.step(val_loss)
-        lr = optimizer.param_groups[0]["lr"]
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "lr": lr,
-                        "seconds": round(time.perf_counter() - epoch_start, 3)})
+        val_loss, val_mae = _val_loss(runner, val, val_idx, settings, loss_fn)
+        lr = optimizer.param_groups[0]["lr"]  # the rate this epoch trained with
+        if settings.lr_schedule == "plateau":
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_mae": val_mae,
+                        "lr": lr, "seconds": round(time.perf_counter() - epoch_start, 3)})
         improved = val_loss < best_loss * (1 - 1e-4)
         if improved:
             best_loss, best_epoch, bad_epochs = val_loss, epoch, 0
@@ -199,7 +245,11 @@ def train_model(
             bad_epochs += 1
         log(f"epoch {epoch:3d}  train {train_loss:.5f}  val {val_loss:.5f}  lr {lr:.2e}  "
             f"{history[-1]['seconds']:.1f}s{'  *' if improved else ''}")
-        if bad_epochs >= settings.patience:
+        if on_epoch is not None and on_epoch(epoch, val_mae):
+            status = "PRUNED"
+            log(f"epoch {epoch}: stopped by the search (pruned)")
+            break
+        if bad_epochs >= settings.patience and epoch >= settings.min_epochs:
             status = "EARLY_STOPPED"
             break
         if settings.max_minutes and (time.perf_counter() - started) / 60 > settings.max_minutes:
@@ -213,6 +263,7 @@ def train_model(
         "epochs": len(history),
         "best_epoch": best_epoch,
         "best_val_loss": best_loss,
+        "best_val_mae": min((h["val_mae"] for h in history), default=None),
         "history": history,
         "train_seconds": round(train_seconds, 2),
         "wall_seconds": round(time.perf_counter() - started, 2),

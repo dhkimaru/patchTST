@@ -1,0 +1,124 @@
+# 미래값 예측 APCValveMon: PatchTST 하이퍼파라미터 극한 탐색 (검증 MAE)
+# scripts/hpo_studies.py가 만든 파일. 고칠 때는 스크립트를 고치고 다시 만든다.
+# 실행: ald-queue submit configs/hpo/x1_fc_apc.yaml  (또는 ald-hpo run ... --gpus 0,1,2,3)
+name: x1_fc_apc
+description: '미래값 예측 APCValveMon: PatchTST 하이퍼파라미터 극한 탐색 (검증 MAE)'
+base: g1_forecast_params
+target: APCValveMon
+model: patchtst
+objective: mae
+trials: 150
+seed: 42
+sampler:
+  kind: tpe
+  multivariate: true
+  n_startup_trials: 20
+  constant_liar: true
+  seed: 0
+pruner:
+  kind: hyperband
+  min_resource: 40
+  reduction_factor: 3
+train:
+  min_epochs: 40
+  patience: 15
+fixed:
+  channel_mode: mixing
+space:
+  train.lr:
+    type: float
+    low: 3.0e-05
+    high: 0.003
+    log: true
+  train.lr_schedule:
+  - plateau
+  - cosine
+  train.warmup_epochs:
+  - 0
+  - 5
+  train.weight_decay:
+    type: float
+    low: 1.0e-06
+    high: 0.1
+    log: true
+  train.batch_size:
+  - 256
+  - 512
+  - 1024
+  - 2048
+  train.max_epochs:
+  - 80
+  - 120
+  - 200
+  - 300
+  train.loss:
+  - mae
+  - huber
+  n_layers:
+    type: int
+    low: 2
+    high: 10
+  d_model:
+  - 64
+  - 128
+  - 192
+  - 256
+  - 384
+  n_heads:
+  - 4
+  - 8
+  - 16
+  d_ff:
+  - 128
+  - 256
+  - 512
+  - 1024
+  dropout:
+  - 0.0
+  - 0.05
+  - 0.1
+  - 0.2
+  - 0.3
+  attn_dropout:
+  - 0.0
+  - 0.1
+  head_dropout:
+  - 0.0
+  - 0.1
+  norm:
+  - batch
+  - layer
+  stride_ratio:
+  - 0.25
+  - 0.5
+  - 1.0
+  patch_seconds:
+  - 8
+  - 13
+  - 16
+  - 19.5
+  - 32
+  - 39
+  revin:
+  - true
+  - false
+  revin_center:
+  - last
+  - mean
+  window.context_seconds:
+  - 64
+  - 96
+  - 128
+  - 192
+  - 256
+  - 384
+  - 512
+  - 768
+  - 1024
+enqueue_from:
+  experiment: g1_forecast_params
+  metric: mae
+  min_seeds: 2
+saturation:
+  window: 50
+  min_gain_pct: 1.0

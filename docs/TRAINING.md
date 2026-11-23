@@ -350,7 +350,11 @@ train:                         # 딥러닝 공통 설정
   max_epochs: 60
   windows_per_epoch: 200000
   patience: 8
+  min_epochs: 0                # 이 epoch 전에는 조기 종료하지 않는다
   lr: 0.001
+  weight_decay: 0.0001
+  lr_schedule: plateau         # plateau(검증이 멈추면 절반, 기본) | cosine(max_epochs에 걸쳐 1 %까지) | constant
+  warmup_epochs: 0             # cosine·constant 앞에 학습률을 선형으로 올리는 epoch 수
   loss: mse                    # mse | huber | mae
 seeds: [42, 43, 44]
 models:
@@ -362,7 +366,59 @@ models:
       train.lr: [0.001, 0.0003] # "train."으로 시작하면 이 모델의 학습 설정만 바꾼다
 ```
 
-## 10. 지켜야 할 것
+## 10. 하이퍼파라미터 극한 탐색 (`ald-hpo`)
+
+여러 설정을 함께 바꾸며 '탐색을 더 해도 검증 성능이 좋아지지 않는 지점(포화)'까지 찾는다. Optuna의 TPE가 다음
+설정을 제안하고, Hyperband가 epoch별 검증 MAE로 성적이 낮은 trial을 일찍 끊는다. GPU마다 작업자 하나가 같은 탐색 기록
+(`work/hpo/<이름>/study.journal`)에서 trial을 받아 가므로, 멈춘 탐색은 같은 명령으로 이어서 돈다.
+
+```bash
+python scripts/hpo_studies.py                          # 1단계 탐색 설정 19개 → configs/hpo/x1_*.yaml
+ald-hpo reference --experiment g1_forecast_params      # 지금 설정의 seed 평균 ± 표준편차 (학습 없음) → work/hpo/reference.json
+ald-queue submit configs/hpo/x1_vs_nh3_cycle.yaml      # 대기열로 (GPU 전부, 끝나면 보고서까지)
+ald-hpo run configs/hpo/x1_vs_nh3_cycle.yaml --gpus 0,1,2,3 --trials 150   # 또는 직접
+ald-hpo run configs/hpo/x1_vs_nh3_cycle.yaml --gpus cpu --smoke            # trial 3개 · epoch 2로 끝까지 도는지만
+ald-hpo report                                         # 전체 요약표 → work/reports/hpo_overview.txt
+ald-hpo top configs/hpo/x1_vs_nh3_cycle.yaml --k 5 --seeds 42,43,44 --submit   # 상위 5개를 seed 3개로 다시 학습
+```
+
+탐색 설정 파일 (`configs/hpo/*.yaml`):
+
+```yaml
+name: x1_vs_nh3_cycle
+base: g1_virtual_sensor_res05_cycleonly   # 데이터·window·학습 설정을 가져올 실험 (분할의 검증 run으로만 평가)
+target: MFCMon_NH3
+model: patchtst
+objective: mae               # mae | mae_cycle(사이클 안) | mae_other(사이클 밖)
+trials: 150                  # 예산: 완료 + 조기 중단 trial 수
+train: {min_epochs: 20, patience: 10, loss: mae}   # 기준 실험의 학습 설정 위에 덮어쓴다
+pruner: {kind: hyperband, min_resource: 20, reduction_factor: 3}   # hyperband | halving | median | none
+sampler: {kind: tpe, multivariate: true, n_startup_trials: 20, constant_liar: true, seed: 0}
+fixed: {channel_mode: mixing}                      # 모든 trial에 같은 값
+space:                                             # 목록 = 범주, {type: float|int, low, high, log} = 범위
+  train.lr: {type: float, low: 3.0e-5, high: 3.0e-3, log: true}
+  train.lr_schedule: [plateau, cosine]
+  n_layers: {type: int, low: 2, high: 10}
+  d_model: [64, 128, 192, 256, 384]
+  stride_ratio: [0.25, 0.5, 1.0]                  # stride_seconds = patch_seconds × 비율 (d_ff_mult도 같은 방식)
+  window.context_seconds: [32, 64, 128]           # trial마다 window 길이
+  data.input_set: [default, A_plus]               # trial마다 입력 묶음 (all, core, core_ab, A_all, A_plus, legacy_primary)
+enqueue_from: {experiment: g1_virtual_sensor_res05_cycleonly, metric: mae, min_seeds: 2}   # 첫 trial = 지금 최고 설정
+saturation: {window: 50, min_gain_pct: 1.0}       # 최근 50개 완료 trial의 최고 기록 개선이 max(1 %, seed 표준편차)보다 작으면 포화
+```
+
+- 첫 trial은 누적 기록에서 `enqueue_from` 실험의 최고 설정(seed 평균)을 그 실험의 학습 설정 그대로 다시 학습한다.
+  조기 중단하지 않으며, 보고서의 '지금 설정' 값이 된다.
+- trial은 지표와 학습 기록만 남긴다(가중치·예측 파일 없음). trial 결과는 study 표시(`hpo:<이름>`)가 붙어 보고서 본표와
+  최고 기록에서 빠진다. 검증 run 하나로 많은 설정을 고른 값이라 낙관적이기 때문이다. 상위 설정은 `ald-hpo top`으로
+  seed 3개 · 교차검증 분할에서 다시 학습해 판정한다(`--split configs/splits/cv1.yaml`).
+- 보고(`work/reports/hpo_<이름>.txt`, 대시보드 `/api/report`): 완료 trial 수별 최고 기록과 기대 최고치(그 수만큼만
+  돌렸다면 기대되는 최고값, Dodge et al. 2019), 포화 판정, fANOVA 설정 중요도, 상위 trial. seed 표준편차는
+  `ald-hpo reference`가 남긴 `work/hpo/reference.json`에서 읽는다.
+- 가상 센서 0.5초 조합은 공정 전체 모델을 사이클 밖 MAE로, 사이클 전용 모델을 사이클 안 MAE로 따로 탐색한다.
+  조합의 MAE가 두 부분의 행 가중 합이므로 두 탐색이 함께 조합을 최적화한다.
+
+## 11. 지켜야 할 것
 
 - 모델·하이퍼파라미터 선택은 검증 run으로만 한다. `ald-final-test`는 최종 후보가 정해진 뒤 한 번만 쓴다.
 - 분할은 run 단위(`split_v2`: 학습 51 / 검증 11 / 시험 11, 071 제외)이고 정규화 통계는 학습 run으로만 계산한다.
