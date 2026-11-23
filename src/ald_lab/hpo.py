@@ -29,7 +29,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,8 @@ DERIVED = {"stride_ratio": "stride_seconds = patch_seconds × stride_ratio",
 CONTEXT_KEY = "window.context_seconds"
 INPUT_KEY = "data.input_set"  # a named input set (all, core, core_ab, legacy_primary, A_all, A_plus) per trial
 STUDY_TAG = "hpo"  # experiment.yaml ``study``: search trials stay out of the main records (selection bias)
+REF_VERSION = 2  # 1: keys missing from the record were drawn by the sampler; 2: filled with the run's own defaults
+LIVE_EVERY = 5  # rewrite the study report after this many finished trials (the dashboard reads it)
 
 
 class StudyError(ValueError):
@@ -414,12 +416,13 @@ def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any) -> tuple[dict[s
         run_doc = yaml.safe_load((Path(row["exp_dir"]) / "experiment.yaml").read_text(encoding="utf-8")) or {}
     except OSError:
         run_doc = {}
-    for key, value in (run_doc.get("train") or {}).items():
+    run_train = dict(run_doc.get("train") or {})
+    for key, value in run_train.items():
         params.setdefault(f"train.{key}", value)
-    if abs(float(row["context_seconds"]) - cfg.context_seconds) > 1e-9:
-        params[CONTEXT_KEY] = float(row["context_seconds"])
+    params[CONTEXT_KEY] = float(row["context_seconds"])
     if row["input_set"] not in ("default", next(iter(cfg.input_sets))):
         params[INPUT_KEY] = row["input_set"]
+    params.update(_unrecorded_defaults(spec, cfg, params, run_train))
     in_space, extra = {}, {}
     for key, value in params.items():
         dist = spec.space.get(key)
@@ -432,6 +435,71 @@ def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any) -> tuple[dict[s
         else:
             extra[key] = value
     return in_space, extra
+
+
+def _model_defaults(model: str, sample_seconds: float) -> dict[str, Any]:
+    """Constructor defaults of a deep model as the job params name them (seconds for patch, stride, kernel)."""
+
+    from .models import defaults
+
+    out: dict[str, Any] = {"revin": True, "revin_center": "mean", "head_dropout": 0.0}  # build_deep_model
+    seconds = {"patch_len": "patch_seconds", "stride": "stride_seconds", "kernel": "kernel_seconds"}
+    for key, value in defaults.DEEP.get(model, {}).items():
+        if key in seconds:
+            out[seconds[key]] = value * sample_seconds
+        else:
+            out[key] = value
+    return out
+
+
+def _unrecorded_defaults(spec: StudySpec, cfg: Any, params: dict[str, Any], run_train: dict[str, Any]) -> dict[str, Any]:
+    """Values the current setting used for keys its record does not name: the run's train settings or the
+    defaults (TrainSettings, model constructor). Without them the sampler would fill them in, and the first trial
+    would not be the current setting (REF_VERSION 1)."""
+
+    from .training.trainer import TrainSettings
+
+    train_defaults = TrainSettings().to_dict()
+    model_defaults = _model_defaults(spec.model, cfg.sample_seconds)
+    out: dict[str, Any] = {}
+    for key in spec.train:  # the study's own training rules (min_epochs, patience …) do not apply to it
+        out.setdefault(f"train.{key}", run_train.get(key, train_defaults.get(key)))
+    for key in [*spec.space, *spec.fixed]:
+        if key in params or key in out:
+            continue
+        if key.startswith("train."):
+            name = key[len("train."):]
+            out[key] = run_train.get(name, train_defaults.get(name))
+        elif key == INPUT_KEY:
+            out[key] = "default"
+        elif key == "stride_ratio":
+            patch = float(params.get("patch_seconds", model_defaults.get("patch_seconds", 16)))
+            stride = float(params.get("stride_seconds", model_defaults.get("stride_seconds", 8)))
+            out[key] = round(stride / patch, 4) if patch else None
+        elif key == "d_ff_mult":
+            d_model = float(params.get("d_model", model_defaults.get("d_model", 128)))
+            d_ff = float(params.get("d_ff", model_defaults.get("d_ff", 256)))
+            out[key] = round(d_ff / d_model, 4) if d_model else None
+        elif key in model_defaults:
+            out[key] = model_defaults[key]
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def enqueue_reference(spec: StudySpec, paths: LabPaths, cfg: Any = None, study: Any = None) -> bool:
+    """Put the current setting (REF_VERSION) first in line unless the study already has it. True when queued.
+    Works on a running study too: its workers take the waiting trial next."""
+
+    cfg = cfg or study_experiment(spec)
+    study = study or open_study(spec, paths, max_epochs=max_epochs_of(spec, cfg))
+    if any(int(t.user_attrs.get("ref_version", 1)) >= REF_VERSION and t.user_attrs.get("role") == "reference"
+           for t in study.get_trials(deepcopy=False)):
+        return False
+    ref = _reference_trial(spec, Path(paths.work_root), cfg)
+    if ref is None:
+        return False
+    in_space, extra = ref
+    study.enqueue_trial(in_space, user_attrs={"role": "reference", "ref_version": REF_VERSION, "extra_params": extra})
+    return True
 
 
 # ----------------------------------------------------------------------------- running
@@ -451,8 +519,9 @@ def _trial_job(spec: StudySpec, cfg: Any, number: int, params: dict[str, Any], r
 
 def run_trials(spec: StudySpec, cfg: Any, paths: LabPaths, split: Any, exp_dir: Path, baselines: dict[str, Any],
                parent_id: str | None, device: str, worker: int, n_jobs: int, results: Any = None,
-               cache: Any = None) -> list[dict[str, Any]]:
-    """One worker: ask, train, tell until the budget is used. Returns (and puts on ``results``) trial records."""
+               cache: Any = None, on_record: Any = None) -> list[dict[str, Any]]:
+    """One worker: ask, train, tell until the budget is used. Returns trial records and hands each one to
+    ``results`` (a queue, worker processes) or ``on_record`` (the main process) as soon as it is done."""
 
     import torch
 
@@ -488,6 +557,7 @@ def run_trials(spec: StudySpec, cfg: Any, paths: LabPaths, split: Any, exp_dir: 
             continue
         if abs(context - cfg.context_seconds) > 1e-9:
             job_params[CONTEXT_KEY] = context
+        trial.set_user_attr("actual", {**job_params, CONTEXT_KEY: context, INPUT_KEY: input_set or "default"})
         tcfg = with_context(cfg, context)
         job = _trial_job(spec, tcfg, trial.number, job_params, role, input_set)
         run_params = {k: v for k, v in job_params.items() if k != CONTEXT_KEY}
@@ -526,6 +596,8 @@ def run_trials(spec: StudySpec, cfg: Any, paths: LabPaths, split: Any, exp_dir: 
         out.append(record)
         if results is not None:
             results.put(record)
+        if on_record is not None:
+            on_record(record)
     del optuna
     return out
 
@@ -604,14 +676,13 @@ def run_study(path: str | Path, paths: LabPaths, *, devices: list[str], trials: 
     study = open_study(spec, paths, max_epochs=max_epochs_of(spec, cfg))
     for t in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
         study.tell(t.number, state=TrialState.FAIL)  # left over by a stopped run
-    if not study.get_trials(deepcopy=False):
-        ref = _reference_trial(spec, Path(paths.work_root), cfg)
-        if ref is not None:
-            in_space, extra = ref
-            study.enqueue_trial(in_space, user_attrs={"role": "reference", "extra_params": extra})
+    fresh = not study.get_trials(deepcopy=False)
+    enqueue_reference(spec, paths, cfg, study)  # also for a study begun before REF_VERSION 2
+    if fresh:
         for params in spec.enqueue:
             study.enqueue_trial(params, user_attrs={"role": "enqueued"})
     del optuna
+    run_info = {"started": datetime.now().isoformat(timespec="seconds"), "workers": len(devices)}
     print(f"study {spec.name}: {spec.target} · {spec.model} · objective {spec.objective} · "
           f"{spec.trials} trials on {', '.join(devices)} (journal {study_dir(paths, spec.name)})", flush=True)
 
@@ -619,12 +690,16 @@ def run_study(path: str | Path, paths: LabPaths, *, devices: list[str], trials: 
         results.append({k: v for k, v in record.items() if k != "job"})
         jobs_doc.append(record["job"])
         _write_json(exp_dir / "jobs.json", jobs_doc)
+        if (len(results) - 1) % LIVE_EVERY == 0:  # the dashboard follows the study while it runs
+            try:
+                report_study(spec, paths, importance=False, run=run_info)
+            except Exception as exc:  # noqa: BLE001  (a report problem must not stop the search)
+                print(f"live report skipped: {type(exc).__name__}: {exc}", flush=True)
 
     n_jobs = max(1, (os.cpu_count() or 1) // len(devices))
     if len(devices) == 1:
-        for record in run_trials(spec, cfg, paths, split, exp_dir, baselines, parent_id, main_device, 0, n_jobs,
-                                 cache=cache):
-            collect(record)
+        run_trials(spec, cfg, paths, split, exp_dir, baselines, parent_id, main_device, 0, n_jobs, cache=cache,
+                   on_record=collect)
     else:
         del cache
         if main_device.startswith("cuda"):
@@ -647,7 +722,7 @@ def run_study(path: str | Path, paths: LabPaths, *, devices: list[str], trials: 
         while not queue.empty():
             collect(queue.get_nowait())
     summarize(cfg, results, exp_dir, journal, wall_seconds=time.perf_counter() - started)
-    report_study(spec, paths, exp_dir=exp_dir, journal=journal)
+    report_study(spec, paths, exp_dir=exp_dir, journal=journal, run={**run_info, "finished": True})
     return exp_dir
 
 
@@ -719,10 +794,70 @@ def _fmt(value: Any, digits: int = 4) -> str:
     return str(value)
 
 
+def _local(when: Any) -> datetime | None:
+    """A naive local time (Optuna's clock) from an ISO string or datetime."""
+
+    if when is None:
+        return None
+    if isinstance(when, str):
+        try:
+            when = datetime.fromisoformat(when)
+        except ValueError:
+            return None
+    return when.astimezone().replace(tzinfo=None) if when.tzinfo else when
+
+
+def progress(trials: list[Any], budget: int, *, since: Any = None, workers: int | None = None,
+             now: datetime | None = None) -> dict[str, Any]:
+    """Finished trials, pace and the expected end of a study. The pace is finished trials per hour of wall time
+    since ``since`` (the run's start: it already includes the workers in parallel); without it, the median
+    trial duration divided by ``workers``."""
+
+    from optuna.trial import TrialState
+
+    now = now or datetime.now()
+    finished = [t for t in trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)]
+    left = max(0, budget - len(finished))
+    out: dict[str, Any] = {"finished": len(finished), "budget": budget, "left": left, "per_trial_min": None,
+                           "eta_min": None, "eta_at": None, "basis": ""}
+    start = _local(since)
+    recent = [t for t in finished if start and t.datetime_complete and t.datetime_complete >= start]
+    if start and recent:
+        elapsed = (now - start).total_seconds() / 60
+        per = elapsed / len(recent)
+        out.update(per_trial_min=per, basis=f"이번 실행 {len(recent)}개 기준")
+    else:
+        durations = [t.duration.total_seconds() / 60 for t in finished if t.duration]
+        if durations:
+            per = float(np.median(durations)) / max(1, workers or 1)
+            out.update(per_trial_min=per, basis=f"trial {len(durations)}개 중앙값 ÷ 작업자 {max(1, workers or 1)}")
+    if out["per_trial_min"] is not None:
+        eta = out["per_trial_min"] * left
+        out.update(eta_min=eta, eta_at=(now + timedelta(minutes=eta)).isoformat(timespec="minutes"))
+    return out
+
+
+def _reference_of(done: list[Any]) -> tuple[Any, int]:
+    """The newest current-setting trial of the newest version (an old version stays in the record, unused)."""
+
+    refs = [t for t in done if t.user_attrs.get("role") == "reference"]
+    if not refs:
+        return None, 0
+    ref = max(refs, key=lambda t: (int(t.user_attrs.get("ref_version", 1)), t.number))
+    return ref, int(ref.user_attrs.get("ref_version", 1))
+
+
+def _actual(t: Any) -> dict[str, Any]:
+    """The settings a trial really trained with (derived and extra keys resolved), else the sampled ones."""
+
+    return dict(t.user_attrs.get("actual") or t.params)
+
+
 def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path | None = None,
-                 journal: Any = None) -> dict[str, Any]:
-    """Saturation curve, importances and top trials of a study → ``work/hpo/<name>/summary.*`` and
-    ``work/reports/hpo_<name>.txt`` (read through the lab server's /api/report)."""
+                 journal: Any = None, importance: bool = True, run: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Saturation curve, importances, top trials and pace of a study → ``work/hpo/<name>/summary.*`` and
+    ``work/reports/hpo_<name>.txt`` (read through the lab server's /api/report). ``run`` holds the start time
+    and worker count of the run in progress; ``importance=False`` skips fANOVA (the live updates)."""
 
     from optuna.trial import TrialState
 
@@ -737,7 +872,8 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
         rows.append({"number": t.number, "state": t.state.name, "value": t.value,
                      "role": t.user_attrs.get("role", ""), "epochs": t.user_attrs.get("epochs"),
                      "last_step": t.last_step, "seconds": t.duration.total_seconds() if t.duration else None,
-                     "problems": "; ".join(t.user_attrs.get("problems", [])), **{f"p.{k}": v for k, v in t.params.items()}})
+                     "problems": "; ".join(t.user_attrs.get("problems", [])),
+                     **{f"p.{k}": v for k, v in _actual(t).items()}})
     frame = pd.DataFrame(rows)
     done = [t for t in trials if t.state == TrialState.COMPLETE]
     done.sort(key=lambda t: (t.datetime_complete or datetime.max, t.number))
@@ -746,23 +882,28 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
     expected = expected_best(values)
     sd_pct = _seed_sd_pct(spec, paths)
     sat = saturation(values, spec.window, spec.min_gain_pct, sd_pct)
-    importances = _importances(study) if len(done) >= 10 else {}
-    ref = next((t for t in done if t.user_attrs.get("role") == "reference"), None)
+    old = study_dir(paths, spec.name) / "summary.json"
+    importances = (_importances(study) if importance and len(done) >= 10
+                   else (json.loads(old.read_text(encoding="utf-8")).get("importances") or {}) if old.is_file() else {})
+    ref, ref_version = _reference_of(done)
     best = min(done, key=lambda t: t.value) if done else None
     unit = unit_of(spec.target, None)
     counts = _counts(study)
     top = sorted(done, key=lambda t: t.value)[:10]
+    run = dict(run or {})
+    pace = progress(trials, spec.trials, since=None if run.get("finished") else run.get("started"),
+                    workers=run.get("workers"))
     summary = {
         "name": spec.name, "target": spec.target, "model": spec.model, "objective": spec.objective, "unit": unit,
-        "base": spec.base, "budget": spec.trials, "counts": counts,
-        "best": {"number": best.number, "value": best.value, "params": best.params} if best else None,
-        "reference": {"number": ref.number, "value": ref.value} if ref else None,
+        "base": spec.base, "budget": spec.trials, "counts": counts, "progress": pace, "run": run,
+        "best": {"number": best.number, "value": best.value, "params": _actual(best)} if best else None,
+        "reference": {"number": ref.number, "value": ref.value, "version": ref_version} if ref else None,
         "gain_vs_reference_pct": ((ref.value - best.value) / ref.value * 100) if ref and best and ref.value else None,
         "saturation": sat, "importances": importances,
         "best_so_far": [{"n": i + 1, "value": float(v)} for i, v in enumerate(best_curve)],
         "expected_best": [{"n": i + 1, "value": v} for i, v in enumerate(expected)],
-        "top": [{"number": t.number, "value": t.value, "params": t.params, "role": t.user_attrs.get("role", "")}
-                for t in top],
+        "top": [{"number": t.number, "value": t.value, "params": _actual(t), "role": t.user_attrs.get("role", ""),
+                 "ref_version": t.user_attrs.get("ref_version")} for t in top],
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     folder = study_dir(paths, spec.name)
@@ -799,27 +940,42 @@ def report_study(spec: StudySpec | str | Path, paths: LabPaths, *, exp_dir: Path
     return summary
 
 
+def _minutes(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value < 1:
+        return f"{value * 60:.0f}초"
+    return f"{value:.1f}분" if value < 90 else f"{value / 60:.1f}시간"
+
+
 def study_text(summary: dict[str, Any]) -> str:
     unit = summary.get("unit") or ""
     c = summary["counts"]
     sat = summary["saturation"]
+    pace = summary.get("progress") or {}
     lines = [f"## 하이퍼파라미터 탐색: {summary['name']} ({summary['target']} · {summary['model']})",
              (f"기준 실험 {summary['base']} · 목표 지표 검증 {summary['objective']} ({unit or '단위 없음'}) · "
               f"예산 {summary['budget']} trial · 갱신 {summary['updated']}"),
-             f"완료 {c['complete']} · 조기 중단 {c['pruned']} · 실패 {c['fail']} · 실행 중 {c['running']} · 대기 {c['waiting']}",
-             ""]
+             f"완료 {c['complete']} · 조기 중단 {c['pruned']} · 실패 {c['fail']} · 실행 중 {c['running']} · 대기 {c['waiting']}"]
+    if pace.get("per_trial_min") is not None:
+        end = (f" · 남은 {pace['left']}개 예상 {_minutes(pace['eta_min'])} (끝 {pace['eta_at'].replace('T', ' ')})"
+               if pace.get("left") else "")
+        lines.append(f"[진행] trial당 {_minutes(pace['per_trial_min'])} ({pace['basis']}){end}")
+    lines.append("")
     best, ref = summary.get("best"), summary.get("reference")
     if best:
         lines.append(f"[최고] trial {best['number']}: {_fmt(best['value'])} {unit}")
     if ref:
         gain = summary.get("gain_vs_reference_pct")
+        old = (" · 이전 방식 기준 trial(기록에 없던 설정을 탐색기가 골라 지금 설정과 다를 수 있음, "
+               "ald-hpo requeue-reference로 다시 넣기)" if ref.get("version", 1) < REF_VERSION else "")
         lines.append(f"[지금 설정] trial {ref['number']}: {_fmt(ref['value'])} {unit}"
-                     + (f" · 최고가 {gain:.1f}% 낮음 (최고 ÷ 지금 설정 - 1 = {-gain:.1f}%)" if gain is not None else ""))
+                     + (f" · 최고 ÷ 지금 설정 - 1 = {-gain:.1f}%" if gain is not None else "") + old)
     lines += ["", f"[포화 판정] {sat['verdict']}: {sat['reason']}"
               + (f" · seed 표준편차 {sat['seed_sd_pct']:.2f}%" if sat.get("seed_sd_pct") is not None else
                  " · seed 표준편차 기록 없음(최소 개선 기준만 씀)")]
-    curve = summary.get("best_so_far") or []
-    expected = summary.get("expected_best") or []
+    curve = [p["value"] for p in summary.get("best_so_far") or []]
+    expected = [p["value"] for p in summary.get("expected_best") or []]
     if curve:
         marks = sorted({n for n in (1, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, len(curve)) if n <= len(curve)})
         lines += ["", "[포화 곡선] 완료 trial 수별 최고 기록과 기대 최고치(그만큼만 돌렸다면 기대되는 최고값)",
@@ -832,7 +988,7 @@ def study_text(summary: dict[str, Any]) -> str:
         lines += [f"- {k}: {v:.3f}" for k, v in sorted(imp.items(), key=lambda kv: -kv[1])]
     top = summary.get("top") or []
     if top:
-        lines += ["", "[상위 trial]"]
+        lines += ["", "[상위 trial] 실제로 학습한 설정"]
         for t in top:
             params = " · ".join(f"{k}={_fmt(v, 3)}" for k, v in sorted(t["params"].items()))
             role = " (지금 설정)" if t.get("role") == "reference" else ""
@@ -855,6 +1011,8 @@ def write_overview(paths: LabPaths) -> Path:
             "지금 설정": _fmt((s.get("reference") or {}).get("value")), "최고": _fmt((s.get("best") or {}).get("value")),
             "지금 대비 (%)": _fmt(-s["gain_vs_reference_pct"], 3) if s.get("gain_vs_reference_pct") is not None else "-",
             "포화": sat["verdict"], "중요도 1위": max(imp, key=imp.get) if imp else "-",
+            "예상 끝": ((s.get("progress") or {}).get("eta_at") or "-").replace("T", " ")
+            if (s.get("progress") or {}).get("left") else "-",
         })
     text = ["## 하이퍼파라미터 탐색 전체 (검증 run, 시험 run 미사용)",
             "'지금 대비' = 최고 ÷ 지금 설정 - 1 (음수면 나아짐). '포화' = 최근 판정 구간에서 최고 기록 개선이 기준 미만.", ""]
@@ -864,6 +1022,136 @@ def write_overview(paths: LabPaths) -> Path:
     out = reports / "hpo_overview.txt"
     out.write_text("\n".join(text) + "\n", encoding="utf-8")
     return out
+
+
+# ----------------------------------------------------------------------------- dashboard status
+
+STATE_NAMES = {"running": "실행 중", "queued": "대기", "done": "완료", "partial": "멈춤", "new": "미실행",
+               "failed": "실패", "cancelled": "취소"}
+_STATUS_CACHE: dict[str, tuple[Any, dict[str, Any]]] = {}
+
+
+def study_files(folder: Path | None = None) -> list[Path]:
+    folder = folder or PROJECT_ROOT / "configs" / "hpo"
+    return sorted(folder.glob("*.yaml")) if folder.is_dir() else []
+
+
+def _workers(gpus: Any) -> int:
+    text = str(gpus or "auto")
+    if text == "cpu":
+        return 1
+    if text == "auto":
+        return max(1, len([g for g in os.environ.get("GPUS", "0,1,2,3").split(",") if g.strip()]))
+    return max(1, len([g for g in text.split(",") if g.strip()]))
+
+
+def _live_info(spec: StudySpec, paths: LabPaths, request: dict[str, Any] | None) -> dict[str, Any]:
+    """Counts, best, current setting, saturation and pace of one study straight from its journal."""
+
+    from optuna.trial import TrialState
+
+    study = open_study(spec, paths)
+    trials = study.get_trials(deepcopy=False)
+    done = sorted((t for t in trials if t.state == TrialState.COMPLETE),
+                  key=lambda t: (t.datetime_complete or datetime.max, t.number))
+    values = [float(t.value) for t in done]
+    best = min(done, key=lambda t: t.value) if done else None
+    ref, version = _reference_of(done)
+    sat = saturation(values, spec.window, spec.min_gain_pct, _seed_sd_pct(spec, paths))
+    running = bool(request and request.get("status") == "running")
+    summary_path = study_dir(paths, spec.name) / "summary.json"
+    old = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
+    workers = _workers(request.get("gpus")) if request else int((old.get("run") or {}).get("workers") or 4)
+    pace = progress(trials, spec.trials, since=request.get("started") if running else None, workers=workers)
+    imp = old.get("importances") or {}
+    return {"counts": _counts(study), "finished": pace["finished"], "progress": pace,
+            "best": best.value if best else None, "best_number": best.number if best else None,
+            "reference": ref.value if ref else None, "ref_version": version,
+            "gain_pct": ((ref.value - best.value) / ref.value * 100) if ref and best and ref.value else None,
+            "saturation": sat["verdict"], "saturation_reason": sat["reason"],
+            "importance_top": max(imp, key=imp.get) if imp else None}
+
+
+def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any]:
+    """Every study file with its state, progress and expected end, for the dashboard. Queued studies get an end
+    time from the pace of finished or running studies of the same task, in the order the queue runs them."""
+
+    from .launch import list_requests
+    from .training.config import load_experiment
+    from .training.selection import unit_of
+
+    requests = list_requests(Path(paths.work_root), include_hidden=True)  # newest first
+    latest: dict[str, dict[str, Any]] = {}
+    for r in requests:
+        if r.get("kind") == "hpo" and not r.get("smoke"):
+            latest.setdefault(str(r["name"]), r)
+    rows: list[dict[str, Any]] = []
+    for path in study_files(folder):
+        try:
+            spec = load_study(path)
+            task = load_experiment(_base_path(spec.base)).task
+        except Exception as exc:  # noqa: BLE001  (a broken file shows as an error row)
+            rows.append({"name": path.stem, "file": path.name, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        req = latest.get(spec.name)
+        row: dict[str, Any] = {
+            "name": spec.name, "file": path.name, "description": spec.description, "target": spec.target,
+            "model": spec.model, "objective": spec.objective, "unit": unit_of(spec.target, None), "budget": spec.trials,
+            "task": task, "request": req.get("id") if req else None, "request_status": req.get("status") if req else None,
+            "report": f"hpo_{spec.name}.txt", "finished": 0, "counts": None, "progress": None,
+        }
+        journal = study_dir(paths, spec.name) / "study.journal"
+        if journal.is_file():
+            key = (journal.stat().st_mtime, row["request_status"], (req or {}).get("started"))
+            cached = _STATUS_CACHE.get(spec.name)
+            if cached and cached[0] == key and row["request_status"] != "running":
+                info = cached[1]
+            else:
+                try:
+                    info = _live_info(spec, paths, req)
+                except Exception as exc:  # noqa: BLE001  (optuna missing, journal being written …)
+                    info = {"error": f"{type(exc).__name__}: {exc}"}
+                _STATUS_CACHE[spec.name] = (key, info)
+            row.update(info)
+        status = row["request_status"]
+        if status in ("running", "queued"):
+            row["state"] = status
+        elif row["finished"] >= spec.trials:
+            row["state"] = "done"
+        elif journal.is_file():
+            row["state"] = "partial"
+        else:
+            row["state"] = status if status in ("failed", "cancelled") else "new"
+        rows.append(row)
+
+    now = datetime.now()
+    paces: dict[str, list[float]] = {}
+    for row in rows:
+        per = (row.get("progress") or {}).get("per_trial_min")
+        if per:
+            paces.setdefault(row.get("task", ""), []).append(per)
+    every = [v for vs in paces.values() for v in vs]
+    clock = now
+    for row in rows:  # one request runs at a time: running first, then the queue in order
+        if row.get("state") == "running" and (row.get("progress") or {}).get("eta_min") is not None:
+            clock = max(clock, now + timedelta(minutes=row["progress"]["eta_min"]))
+            row["end_at"] = clock.isoformat(timespec="minutes")
+    order = {r["id"]: i for i, r in enumerate(reversed([q for q in requests if q.get("status") == "queued"]))}
+    queued = sorted((r for r in rows if r.get("state") == "queued"), key=lambda r: order.get(r["request"], 0))
+    for row in queued:
+        per = float(np.median(paces.get(row.get("task", "")) or every)) if every else None
+        if per is None:
+            row["end_basis"] = "첫 탐색의 속도를 잰 뒤 계산"
+            continue
+        left = max(0, row["budget"] - row["finished"])
+        clock = clock + timedelta(minutes=per * left)
+        row["end_at"] = clock.isoformat(timespec="minutes")
+        row["end_basis"] = f"같은 과제 탐색의 trial당 {_minutes(per)} 기준"
+    states = {k: sum(1 for r in rows if r.get("state") == k) for k in STATE_NAMES}
+    return {"rows": rows, "states": states, "finished": sum(r.get("finished", 0) for r in rows),
+            "budget": sum(r.get("budget", 0) for r in rows if "error" not in r),
+            "queue_end": clock.isoformat(timespec="minutes") if clock > now else None,
+            "updated": now.isoformat(timespec="seconds")}
 
 
 # ----------------------------------------------------------------------------- follow-up experiments
@@ -942,6 +1230,9 @@ def main(argv: list[str] | None = None) -> int:
     p_top.add_argument("--study-tag", help="실험 YAML의 study 값 (기본 hpo_top:<탐색 이름>, 빈 값이면 본 기록)")
     p_top.add_argument("--out", help="저장 폴더 (기본: configs/experiments)")
     p_top.add_argument("--submit", action="store_true", help="대기열에 바로 넣는다")
+    p_req = sub.add_parser("requeue-reference",
+                           help="지금 설정 trial을 (다시) 맨 앞에 넣는다 · 실행 중인 탐색에도 바로 들어감")
+    p_req.add_argument("study")
     p_ref = sub.add_parser("reference", help="지금 설정의 seed 평균 ± 표준편차 (누적 기록에서, 학습 없음)")
     p_ref.add_argument("--experiment", required=True, help="기준 실험 이름 (예: g1_forecast_params)")
     p_ref.add_argument("--model", default="patchtst")
@@ -950,7 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ref.add_argument("--write-configs", action="store_true",
                        help="대상마다 지금 설정을 다시 재는 실험 YAML을 configs/experiments/에 쓴다")
     p_ref.add_argument("--seeds", default="42,43,44")
-    for p in (p_run, p_report, p_top, p_ref):
+    for p in (p_run, p_report, p_top, p_ref, p_req):
         p.add_argument("--work-root")
         p.add_argument("--data-root")
     args = parser.parse_args(argv)
@@ -960,6 +1251,13 @@ def main(argv: list[str] | None = None) -> int:
 
         exp_dir = run_study(args.study, paths, devices=parse_devices(args.gpus), trials=args.trials, smoke=args.smoke)
         print(f"\n결과: {exp_dir}/hpo_summary.txt")
+        return 0
+    if args.command == "requeue-reference":
+        spec = load_study(args.study)
+        if enqueue_reference(spec, paths):
+            print(f"{spec.name}: 지금 설정 trial을 맨 앞에 넣었습니다 (실행 중이면 다음 trial로 학습)")
+        else:
+            print(f"{spec.name}: 이미 들어가 있거나, 누적 기록에서 지금 설정을 찾지 못했습니다")
         return 0
     if args.command == "report":
         if args.study:

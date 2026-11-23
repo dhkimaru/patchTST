@@ -72,7 +72,18 @@ CARDS = {
     14: ("L", 1060, "next", "14", "시험 run 확인 · VG11 구간", "11-21 · 학습 없음, 재사용 참고", "시험 run에서도 레시피 평균보다 나음",
          "10개 중 9개", ["VG11 공정 압력 구간은 레시피 평균이 나음", "→ step × 압력 구간으로 다시 고름"], "확인", None),
     15: ("L", 1262, "solve", "15", "VG11 step × 압력 구간", "11-22 · 학습 없음", "공정 압력 구간 개선율 (레시피 평균 대비)",
-         "+15~21 %", ["교차검증 +21 · 시험 run +15 (재사용, 참고)", "대기압 근처는 따로 표시"], "채택", "지금"),
+         "+15~21 %", ["교차검증 +21 · 시험 run +15 (재사용, 참고)", "대기압 근처는 따로 표시"], "채택", None),
+    16: ("M", 1262, "problem", "16", "방향 점검", "11-23", "지금까지의 하이퍼파라미터 탐색", "하나씩 바꿈",
+         ["가상 센서는 거의 탐색 안 함", "→ 극한 탐색으로 방향 재정렬"], "정정", None),
+    17: ("R", 1262, "next", "17", "최신 논문 원문 검토", "11-23 · 원문 38편", "효과가 보고된 새 기법", "34개",
+         ["그중 먼저 할 5개를 고름", "다변수 탐색 · 사전학습 등"], "확인", None),
+    18: ("L", 1490, "solve", "18", "극한 탐색 0단계", "11-24 · 코드", "탐색 실행기 · 대시보드 패널", "탐색 19개",
+         ["다변수 탐색 · 도중 중단 · 포화", "첫 trial = 지금 설정 (기준점)"], "채택", None),
+    19: ("M", 1490, "next", "19", "1단계 하이퍼파라미터", "11-24 ~ · 진행 중", "탐색 19개 × 150 trial", "2,850 trial",
+         ["미래값 4 · 가상 센서 15", "포화 → 상위 5개 seed 3개"], "계획", "지금"),
+    20: ("R", 1490, "next", "20", "2~4단계", "계획", "1단계 최고 설정을 고정하고", "공정 · 새 기법",
+         ["입력 신호 계열 · 데이터 처리 조건", "새 기법 5개 → 교차검증", "두께는 병행 (GP · TabPFN)"],
+         "계획", None),
 }
 VERDICT_COLOR = {"채택": "good", "채택 유지": "good", "일부 채택": "good", "유력": "good", "확인": "fact", "정정": "warn",
                  "문제 발견": "problem", "계획": "next"}
@@ -172,7 +183,7 @@ def figure(t):
 
     # header + hero number
     p.append(T(40, 46, "실험 로드맵", t, 26, "ink", 800))
-    p.append(T(40, 73, "가상 센서의 새 run 오차 원인 추적과 해결 과정 · 1~654차, 11-22 기준", t, 13.5, "ink2"))
+    p.append(T(40, 73, "가상 센서 오차의 원인 추적과 해결, 그리고 극한 탐색으로 · 1~654차, 11-24 기준", t, 13.5, "ink2"))
     v1, v2 = "1.0~2.2배", "0.4~1.2배"
     w2 = tw(v2, 22, True); w1 = tw(v1, 22, True)
     x2 = 940 - w2; xa = x2 - 30; x1 = xa - 6 - w1
@@ -203,6 +214,7 @@ def figure(t):
     section(p, t, 40, 240, "탐색 → 문제 발견", "explore")
     section(p, t, 40, 436, "원인 추적 · 두 갈래", "cause")
     section(p, t, 378, 810, "해결 → 확인 → 다음", "solve")
+    section(p, t, 378, 1246, "방향 재정렬 → 극한 탐색", "next")
 
     # arrows (drawn under the cards)
     y1 = my(1)
@@ -230,6 +242,15 @@ def figure(t):
           via=((cx("9b"), my(13)), (rgt(13) + 52, my(13))))
     arrow(p, t, (lft(13), my(14)), (rgt(14) + GAP, my(14)), "l", "next")
     arrow(p, t, (cx(14), bot(14)), (cx(15), top(15) - GAP), "d", "solve")
+    y15 = my(15)
+    arrow(p, t, (rgt(15), y15), (lft(16) - GAP, y15), "r", "problem")
+    arrow(p, t, (rgt(16), y15), (lft(17) - GAP, y15), "r", "next")
+    mid = (bot(16) + top(18)) / 2
+    arrow(p, t, (cx(16), bot(16)), (cx(18), top(18) - GAP), "d", "solve", via=((cx(16), mid), (cx(18), mid)))
+    arrow(p, t, (cx(17), bot(17)), (cx(20), top(20) - GAP), "d", "next")
+    y18 = my(18)
+    arrow(p, t, (rgt(18), y18), (lft(19) - GAP, y18), "r", "next")
+    arrow(p, t, (rgt(19), y18), (lft(20) - GAP, y18), "r", "next")
 
     for k in CARDS:
         draw_card(p, t, k)
@@ -250,9 +271,15 @@ def figure(t):
     pill(p, t, (rgt(13) + cx("9b")) / 2 - 10, my(13) + 30, "저압 구간 → step별 선택", "next")
     pill(p, t, (rgt(14) + lft(13)) / 2, my(14) - 27, "채택 → 시험 run", "next")
     pill(p, t, cx(14) + 18, (bot(14) + top(15)) / 2, "공정 압력 구간 → 칸 단위 선택", "solve", "start")
+    pill(p, t, g1, y15 - 27, "목표 재정렬", "problem")
+    pill(p, t, g2, y15 - 27, "새 기법 → 원문", "next")
+    pill(p, t, (cx(16) + cx(18)) / 2, mid, "기반부터 → 0단계", "solve")
+    pill(p, t, cx(17), mid, "먼저 할 5개 → 3단계", "next")
+    pill(p, t, g1, y18 - 27, "완료 → 실행", "next")
+    pill(p, t, g2, y18 - 27, "포화 → 다음", "next")
 
     # experiments that did not lead on
-    fy = max(bot(13), bot(15)) + 36
+    fy = max(bot(k) for k in CARDS) + 36
     section(p, t, 40, fy, "이어지지 않은 실험과 이유", "fact")
     gap = 12; cw = (W - 80 - gap * (len(DEAD) - 1)) / len(DEAD)
     for i, (name, why) in enumerate(DEAD):
@@ -269,7 +296,8 @@ def figure(t):
             "시험 run은 설정 선택에 쓰지 않은 마지막 11개 run, 11-04 · 11-16 · 11-21 · 11-22(재사용, 참고)에서만 사용."]):
         p.append(T(40, ny + 18 * i, line, t, 11.5, "muted"))
     H = ny + 70
-    title = "실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이기까지 (1~654차)"
+    title = ("실험 로드맵: 가상 센서의 검증 대비 시험 run 오차를 1.0~2.2배에서 0.4~1.2배로 줄이고, "
+             "하이퍼파라미터 · 공정 파라미터 극한 탐색으로 넘어가기까지 (1~654차, 11-24)")
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
             f'aria-label="{escape(title)}" font-family="{FONT}"><title>{escape(title)}</title>{"".join(p)}</svg>')
 

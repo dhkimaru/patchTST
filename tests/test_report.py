@@ -206,7 +206,7 @@ def test_report_hyperparameter_and_code_tabs(lab, tmp_path):  # noqa: F811
                  "window와 patch를 GPU에서 자르기", "GPU 여러 장을 동시에 쓰기", 'aria-label="hpgrid 작업 타임라인"',
                  "모델별 처리 속도", "prepared_cache.py",
                  "② 단계별 상세 설계", 'id="design-prepare"', "데이터 누설 · 재현성 점검표", "검토 포인트",
-                 "def run_arrays", "<b>이번 데이터</b>:", "다음 실험", 'id="plan-A1"', "먼저 할 것",
+                 "def run_arrays", "<b>이번 데이터</b>:", "다음 실험", 'id="plan-X1"', "먼저 할 것",
                  '<html lang="ko" data-theme="dark">'):
         assert text in html, text
     for banned in ("\uc13c\ud130\uc7a5", "반출"):  # a job title kept out of the report, the old weights note

@@ -270,6 +270,58 @@ class Lab:
         return {"ids": [r["id"] for r in records]}
 
 
+    # -- 극한 탐색 (ald-hpo studies) ---------------------------------------------------------------------------
+    def hpo_submit(self, form: dict[str, Any]) -> dict[str, Any]:
+        records = launch.submit_studies(self.paths.work_root, [str(n) for n in form.get("names") or []],
+                                        gpus=str(form.get("gpus") or "auto"), report=bool(form.get("report", True)),
+                                        data_root=self.paths.data_root, source="dashboard")
+        return {"ids": [r["id"] for r in records]}
+
+    def hpo_reference(self) -> dict[str, Any]:
+        """The current settings' seed mean ± SD for every reference experiment the studies name (no training)."""
+
+        from . import hpo
+
+        pairs = []
+        for path in hpo.study_files():
+            spec = hpo.load_study(path)
+            if spec.enqueue_from:
+                pair = (str(spec.enqueue_from["experiment"]), str(spec.enqueue_from.get("metric", spec.objective)))
+                if pair not in pairs:
+                    pairs.append(pair)
+        if not pairs:
+            raise launch.LaunchError("기준 실험을 가리키는 탐색이 없습니다 (enqueue_from)")
+        done = []
+        for experiment, metric in pairs:
+            code = hpo.main(["reference", "--experiment", experiment, "--metric", metric,
+                             "--work-root", str(self.paths.work_root)])
+            if code == 0:
+                done.append(f"{experiment} ({metric})")
+        return {"experiments": done}
+
+    def hpo_top(self, form: dict[str, Any]) -> dict[str, Any]:
+        from . import hpo
+
+        name = str(form.get("name") or "")
+        files = {p.stem: p for p in hpo.study_files()}
+        if name not in files:
+            raise launch.LaunchError(f"탐색 설정이 없습니다: {name}")
+        seeds = [int(x) for x in str(form.get("seeds") or "42,43,44").replace(";", ",").split(",") if x.strip()]
+        docs = hpo.top_configs(files[name], self.paths, k=int(form.get("k") or 5), seeds=seeds)
+        records = launch.submit_docs(self.paths.work_root, docs, gpus=str(form.get("gpus") or "auto"), report=True,
+                                     data_root=self.paths.data_root, source="dashboard")
+        return {"ids": [r["id"] for r in records]}
+
+    def hpo_requeue(self, form: dict[str, Any]) -> dict[str, Any]:
+        from . import hpo
+
+        name = str(form.get("name") or "")
+        files = {p.stem: p for p in hpo.study_files()}
+        if name not in files:
+            raise launch.LaunchError(f"탐색 설정이 없습니다: {name}")
+        return {"queued": hpo.enqueue_reference(hpo.load_study(files[name]), self.paths)}
+
+
 def launch_enabled() -> bool:
     return os.environ.get("ALD_DASHBOARD_RUN", "1") != "0"
 
@@ -312,6 +364,10 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                     from .report.lab import queue_html
 
                     self._html(queue_html(lab.paths.work_root, live=launch_enabled()))
+                elif url.path == "/api/fragment/hpo":
+                    from .report.lab import hpo_html
+
+                    self._html(hpo_html(lab.paths, live=launch_enabled()))
                 elif url.path == "/api/fragment/explore":
                     from .report.lab import explore_html
 
@@ -366,6 +422,14 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                     self._json({"status": launch.hide_request(lab.paths.work_root, str(form.get("id")))})
                 elif url.path == "/api/hide-finished":
                     self._json({"hidden": launch.hide_finished(lab.paths.work_root)})
+                elif url.path == "/api/hpo/submit":
+                    self._json(lab.hpo_submit(form))
+                elif url.path == "/api/hpo/reference":
+                    self._json(lab.hpo_reference())
+                elif url.path == "/api/hpo/top":
+                    self._json(lab.hpo_top(form))
+                elif url.path == "/api/hpo/requeue":
+                    self._json(lab.hpo_requeue(form))
                 elif url.path == "/api/rebuild":
                     threading.Thread(target=lab.rebuild, daemon=True).start()
                     self._json({"status": "rebuilding"})

@@ -258,18 +258,9 @@ def first_html(ledger: pd.DataFrame, *, live: bool = False) -> str:
 def _remaining(q: dict[str, Any]) -> str:
     """At the current pace: wall time per finished job and what is left (running requests)."""
 
-    progress, started = q.get("progress"), q.get("started")
-    if q.get("status") != "running" or not progress or not started or not progress[0]:
-        return ""
-    try:
-        start = datetime.fromisoformat(started)
-    except ValueError:
-        return ""
-    elapsed = (datetime.now(start.tzinfo) - start).total_seconds() / 60
-    done, total = progress
-    per_job = elapsed / done
-    r = _h()
-    return f" · 작업당 평균 {r.minutes(per_job)} · 예상 남은 시간 약 {r.minutes(per_job * max(0, total - done))}"
+    from ..launch import remaining_text
+
+    return remaining_text(q)
 
 
 def queue_html(work_root: Path, limit: int = 60, *, live: bool = True) -> str:
@@ -328,6 +319,100 @@ def queue_html(work_root: Path, limit: int = 60, *, live: bool = True) -> str:
     return head + f'<div class="{cls}">' + "".join(cards) + "</div>"
 
 
+# ----------------------------------------------------------------------------- 극한 탐색 (ald-hpo studies)
+
+HPO_STATE_CLASS = {"running": "warn", "queued": "", "done": "good", "partial": "warn", "new": "", "failed": "bad",
+                   "cancelled": "bad"}
+
+
+def _when(iso: str | None) -> str:
+    """'11-24 14:05' from an ISO time (today's time only)."""
+
+    if not iso:
+        return "-"
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return t.strftime("%H:%M") if t.date() == datetime.now().date() else t.strftime("%m-%d %H:%M")
+
+
+def hpo_html(paths: Any, *, live: bool = True) -> str:
+    """The study table: state, progress, current setting, best, saturation and expected end of every study in
+    ``configs/hpo/``; with ``live`` also check boxes and buttons (queue, current-setting trial, top settings)."""
+
+    r = _h()
+    try:
+        from ..hpo import REF_VERSION, STATE_NAMES, _fmt, studies_status
+
+        st = studies_status(paths)
+    except Exception as exc:  # noqa: BLE001  (optuna missing on this server, unreadable file …)
+        return f'<p class="empty">탐색 현황을 읽지 못했습니다: {r.e(type(exc).__name__)}: {r.e(exc)}</p>'
+    rows = st["rows"]
+    if not rows:
+        return '<p class="empty">탐색 설정이 없습니다. 서버에서 <code>python scripts/hpo_studies.py</code>로 만드세요.</p>'
+    n = st["states"]
+    end = f" · 대기열의 탐색이 모두 끝나는 예상 시각 <b>{r.e(_when(st['queue_end']))}</b>" if st.get("queue_end") else ""
+    head = (f'<p class="sub lab-qhead">탐색 {len(rows)}개: 완료 {n["done"]} · 실행 중 {n["running"]} · 대기 {n["queued"]} · '
+            f'멈춤 {n["partial"]} · 미실행 {n["new"]} · trial {st["finished"]:,} / {st["budget"]:,}{end} · 10초마다 새로 고침</p>')
+    actions = ('<div class="lab-actions" id="lab-hpo-actions">'
+               '<button type="button" class="pl-btn pl-main" data-hpo-submit>▶ 선택한 탐색을 대기열에 넣기</button>'
+               '<button type="button" class="pl-btn" data-hpo-reference title="누적 기록에서 지금 설정의 seed 평균·표준편차를 다시 계산 (학습 없음)">'
+               '기준점 다시 뽑기</button><span class="lab-msg"></span></div>') if live else ""
+    body = []
+    for row in rows:
+        name = r.e(row["name"])
+        if "error" in row and "target" not in row:
+            body.append(f"<tr><td></td><td><b>{name}</b></td><td colspan='9' class='lab-err'>{r.e(row['error'])}</td></tr>")
+            continue
+        state = row.get("state", "new")
+        pick = state in ("new", "partial", "failed", "cancelled")
+        box = (f'<input type="checkbox" class="lab-hpo-pick" value="{name}"{"" if pick else " disabled"}>'
+               if live else "")
+        c = row.get("counts") or {"complete": 0, "pruned": 0, "fail": 0}
+        pace = row.get("progress") or {}
+        share = min(1.0, row.get("finished", 0) / max(1, row["budget"]))
+        bar = (f'<div class="lab-bar"><i style="width:{100 * share:.1f}%"></i></div>'
+               f'<div class="sub">완료 {c["complete"]} · 중단 {c["pruned"]} · 실패 {c["fail"]} / 예산 {row["budget"]}'
+               + (f' · trial당 {r.e(r.minutes(pace["per_trial_min"]))}' if pace.get("per_trial_min") else "") + "</div>")
+        unit = row.get("unit") or ""
+        ref = row.get("reference")
+        old_ref = ref is not None and row.get("ref_version", 0) < REF_VERSION
+        ref_cell = "-" if ref is None else f"{_fmt(ref)} {r.e(unit)}"
+        if old_ref:
+            ref_cell += '<div class="lab-warn" title="기록에 없던 설정을 탐색기가 골라, 지금 설정과 다를 수 있습니다">⚠ 이전 방식</div>'
+        gain = row.get("gain_pct")
+        gain_cell = "-" if gain is None else (f'<span class="st {"good" if gain > 0 else ""}">{-gain:+.1f}%</span>')
+        sat = row.get("saturation") or "-"
+        sat_cell = (f'<span class="st {"good" if sat == "포화" else ""}" title="{r.e(row.get("saturation_reason") or "")}">'
+                    f"{r.e(sat)}</span>")
+        if state == "running" and pace.get("eta_at"):
+            end_cell = r.e(_when(row.get("end_at") or pace["eta_at"]))
+        elif state == "queued":
+            end_cell = r.e(_when(row.get("end_at"))) if row.get("end_at") else f'<span class="sub">{r.e(row.get("end_basis") or "-")}</span>'
+        else:
+            end_cell = "-"
+        acts = [f'<a href="/api/report?name={r.e(row["report"])}" target="_blank" rel="noopener">보고서</a>']
+        if live and c["complete"] >= 10:
+            acts.append(f'<button type="button" class="pl-btn" data-hpo-top="{name}" title="상위 5개 설정을 seed 3개로 다시 학습 (대기열)">상위 5개 재학습</button>')
+        if live and (old_ref or (ref is None and c["complete"] + c["pruned"] > 0)):
+            acts.append(f'<button type="button" class="pl-btn" data-hpo-requeue="{name}" title="지금 설정을 정확히 재현한 trial을 맨 앞에 넣습니다 (실행 중이면 다음 trial)">기준 trial 다시 넣기</button>')
+        body.append(
+            f"<tr><td>{box}</td><td><b>{name}</b><div class='sub'>{r.e(row.get('description') or '')}</div></td>"
+            f"<td>{r.e(row['target'])}<div class='sub'>{r.e(row['objective'])}</div></td>"
+            f'<td><span class="st {HPO_STATE_CLASS.get(state, "")}">{r.e(STATE_NAMES.get(state, state))}</span></td>'
+            f"<td style='min-width:170px'>{bar}</td><td>{ref_cell}</td>"
+            f"<td>{_fmt(row.get('best'))} {r.e(unit) if row.get('best') is not None else ''}</td><td>{gain_cell}</td>"
+            f"<td>{sat_cell}</td><td>{end_cell}</td><td class='lab-hpo-acts'>{' '.join(acts)}</td></tr>")
+    table = ('<div class="tw"><table class="lab-hpo"><tr><th></th><th>탐색</th><th>대상 · 지표</th><th>상태</th><th>진행</th>'
+             "<th>지금 설정</th><th>최고</th><th>지금 대비</th><th>포화</th><th>예상 끝</th><th>보기 · 동작</th></tr>"
+             + "".join(body) + "</table></div>")
+    note = ('<p class="sub">지금 대비 = 최고 ÷ 지금 설정 - 1 (음수면 나아짐). 포화 = 최근 50개 trial에서 최고 기록 개선이 '
+            "max(1%, seed 표준편차)보다 작음. 예상 끝은 지금 속도 기준이며, 대기열의 다른 실험 시간은 빠져 있습니다. "
+            "trial은 검증 run 하나로 고른 값이라 낙관적입니다. 상위 설정은 seed 3개로 다시 학습해 판정합니다.</p>")
+    return head + actions + table + note
+
+
 # ----------------------------------------------------------------------------- the tab
 
 def lab_section(ledger: pd.DataFrame) -> str:
@@ -343,6 +428,11 @@ def lab_section(ledger: pd.DataFrame) -> str:
         '<div id="lab-live" hidden>'
         '<div class="lab-note" id="lab-readonly" hidden><b>보기 전용 화면입니다.</b> 학습은 담당자가 별도로 실행하며, '
         "이 화면에서는 진행 상황과 결과를 확인할 수 있습니다. 학습이 끝나면 화면 상단에 새 결과 알림이 표시됩니다.</div>"
+        '<h3>극한 탐색 (Optuna, 포화까지)</h3>'
+        '<p class="note">탐색 하나 = 대상 하나 · 모델 하나의 하이퍼파라미터를 여러 개 함께 바꾸는 trial 150개입니다. '
+        "첫 trial은 지금 최고 설정이고, 성적이 낮은 trial은 학습 도중에 끊습니다. 체크한 탐색을 대기열에 넣으면 GPU 4장을 모두 "
+        "쓰며 하나씩 차례로 돕니다(멈춘 탐색은 이어서). 끝난 탐색은 <b>상위 5개 재학습</b>으로 seed 3개를 돌려 판정합니다.</p>"
+        '<div id="lab-hpo"><p class="sub">읽는 중…</p></div>'
         '<div id="lab-new"><h3>새 실험 등록 (하이퍼파라미터 조합)</h3>'
         '<p class="note">칸에 값을 쉼표로 여러 개 넣으면(예: <code>8, 32</code>) 가능한 조합을 모두 만듭니다. '
         "<b>빠른 설정</b>의 \"탐색용\"은 대표 대상 · seed 2개 · 짧은 학습, \"정식 학습\"은 모든 대상 · seed 3개 · 실험 기본 "
@@ -396,6 +486,9 @@ table.lab-params td:first-child{white-space:nowrap;width:180px} table.lab-params
 table.lab-filelist td:nth-child(n+3){white-space:nowrap}
 .lab-qhead{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px} .lab-qhead .pl-btn{margin-left:auto;padding:2px 10px}
 .lab-hide{opacity:.85} .lab-hide:hover{opacity:1}
+table.lab-hpo td{vertical-align:middle} table.lab-hpo td:nth-child(n+3){white-space:nowrap}
+table.lab-hpo td.lab-hpo-acts{white-space:normal;min-width:150px} .lab-hpo-acts .pl-btn{padding:2px 8px;margin:2px 0}
+table.lab-hpo td:nth-child(2){min-width:220px}
 table.lab-xlist tr[data-xsel]{cursor:pointer} table.lab-xlist tr[data-xsel]:hover td{background:var(--shade)}
 table.lab-xlist tr.on td{background:var(--shade);font-weight:600} table.lab-xlist tr.on td:first-child{box-shadow:inset 3px 0 0 var(--s1)}
 table.lab-xlist td:nth-child(n+3){white-space:nowrap} .lab-xpanel{margin-top:12px}
@@ -439,7 +532,27 @@ get('/api/meta').then(meta=>{M=meta;$('lab-offline').hidden=true;$('lab-live').h
   if(!M.run_enabled){$('lab-readonly').hidden=false;$('lab-new').hidden=true;}
   else{pickBase(M.default_base);wireFile();
     if(!location.hash){const b=document.querySelector("nav button[data-tab='lab']");if(b)b.click();}}
-  queue();setInterval(queue,5000);first();setInterval(first,20000);}).catch(()=>{});
+  queue();setInterval(queue,5000);first();setInterval(first,20000);hpo();setInterval(hpo,10000);}).catch(()=>{});
+// 극한 탐색: study table, queue the checked studies, current-setting trial, top settings again with seeds
+function hpo(){const box=$('lab-hpo');if(!box)return;const keep=new Set([...box.querySelectorAll('.lab-hpo-pick:checked')].map(i=>i.value));
+  const msg=(box.querySelector('#lab-hpo-actions .lab-msg')||{}).textContent||'';
+  get('/api/fragment/hpo').then(html=>{box.innerHTML=html;box.querySelectorAll('.lab-hpo-pick').forEach(i=>{if(keep.has(i.value))i.checked=true;});
+    const m=box.querySelector('#lab-hpo-actions .lab-msg');if(m)m.textContent=msg;
+    const say=t=>{const x=box.querySelector('#lab-hpo-actions .lab-msg');if(x)x.textContent=t;};
+    const gpus=()=>F?[...F.gpus].sort().join(',')||'cpu':'auto';
+    const sub=box.querySelector('[data-hpo-submit]');if(sub)sub.onclick=()=>{const names=[...box.querySelectorAll('.lab-hpo-pick:checked')].map(i=>i.value);
+      if(!names.length){say('탐색을 하나 이상 체크하세요');return;}
+      if(!confirm('탐색 '+names.length+'개를 이 순서대로 대기열에 넣을까요? 하나씩 차례로 GPU '+gpus()+'를 씁니다.'))return;
+      sub.disabled=true;say('대기열에 넣는 중…');post('/api/hpo/submit',{names:names,gpus:gpus(),report:true}).then(r=>{
+        say(r.error?'오류: '+r.error:'대기열에 넣었습니다: '+r.ids.join(', '));sub.disabled=false;queue();hpo();});};
+    const ref=box.querySelector('[data-hpo-reference]');if(ref)ref.onclick=()=>{ref.disabled=true;say('기준점을 계산하는 중… (학습 없음)');
+      post('/api/hpo/reference',{}).then(r=>{say(r.error?'오류: '+r.error:'기준점을 다시 뽑았습니다: '+r.experiments.join(', '));ref.disabled=false;hpo();});};
+    box.querySelectorAll('[data-hpo-top]').forEach(b=>b.onclick=()=>{if(!confirm(b.dataset.hpoTop+': 상위 5개 설정을 seed 3개(42·43·44)로 다시 학습할까요?'))return;
+      b.disabled=true;post('/api/hpo/top',{name:b.dataset.hpoTop,k:5,seeds:'42,43,44',gpus:gpus()}).then(r=>{
+        say(r.error?'오류: '+r.error:'대기열에 넣었습니다: '+r.ids.join(', '));queue();hpo();});});
+    box.querySelectorAll('[data-hpo-requeue]').forEach(b=>b.onclick=()=>{b.disabled=true;post('/api/hpo/requeue',{name:b.dataset.hpoRequeue}).then(r=>{
+      say(r.error?'오류: '+r.error:(r.queued?b.dataset.hpoRequeue+': 지금 설정 trial을 맨 앞에 넣었습니다':'이미 들어가 있거나 누적 기록에서 지금 설정을 찾지 못했습니다'));hpo();});});
+  }).catch(()=>{});}
 // a whole plan file (markdown): preview every request, then queue them all in the order written
 function planText(){return $('lab-file-text').value;}
 function fileBody(){return {text:planText(),gpus:F?[...F.gpus].sort().join(',')||'cpu':'auto'};}

@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -728,7 +728,8 @@ def main(argv: list[str] | None = None) -> int:
         for r in list_requests(paths.work_root):
             progress = r.get("progress")
             done = f" {progress[0]}/{progress[1]}" if progress else ""
-            print(f"{r['id']}  {STATUS_NAMES.get(r['status'], r['status'])}{done}  {r['name']}  {r.get('memo', '')}")
+            print(f"{r['id']}  {STATUS_NAMES.get(r['status'], r['status'])}{done}{remaining_text(r)}  {r['name']}  "
+                  f"{r.get('memo', '')}")
     elif args.command == "cancel":
         print(cancel(paths.work_root, args.request_id))
     elif args.command == "worker":
@@ -763,6 +764,51 @@ def submit_docs(work_root: Path, docs: list[dict[str, Any]], *, gpus: str, repor
     if records:
         ensure_worker(work_root)
     return records
+
+
+def submit_studies(work_root: Path, names: list[str], *, gpus: str, report: bool, data_root: Path | None,
+                   source: str) -> list[dict[str, Any]]:
+    """Queue hyperparameter search studies (``configs/hpo/<name>.yaml``) in the given order, then wake the worker.
+    A study already waiting or running is refused; nothing is queued unless every name is valid."""
+
+    from .hpo import load_study, study_files
+
+    files = {p.stem: p for p in study_files()}
+    active = {r["name"] for r in list_requests(work_root) if r.get("status") in ("queued", "running")}
+    if not names:
+        raise LaunchError("탐색을 하나 이상 고르세요")
+    for name in names:
+        if name not in files:
+            raise LaunchError(f"탐색 설정이 없습니다: {name}")
+        if name in active:
+            raise LaunchError(f"{name}: 이미 대기열에 있거나 실행 중입니다")
+    specs = [(name, load_study(files[name])) for name in names]
+    records = [submit(work_root, yaml.safe_load(files[name].read_text(encoding="utf-8")), gpus=gpus, report=report,
+                      data_root=data_root, n_jobs=spec.trials, source=source) for name, spec in specs]
+    ensure_worker(work_root)
+    return records
+
+
+def remaining_text(q: dict[str, Any]) -> str:
+    """'작업당 평균 … · 예상 남은 시간 …' for a running request at its pace so far (wall time per finished job)."""
+
+    progress, started = q.get("progress"), q.get("started")
+    if q.get("status") != "running" or not progress or not started or not progress[0]:
+        return ""
+    try:
+        start = datetime.fromisoformat(started)
+    except ValueError:
+        return ""
+    elapsed = (datetime.now(start.tzinfo) - start).total_seconds() / 60
+    done, total = progress
+    per_job = elapsed / done
+    left = per_job * max(0, total - done)
+    end = datetime.now() + timedelta(minutes=left)
+
+    def text(m: float) -> str:
+        return f"{m * 60:.0f}초" if m < 1 else (f"{m:.1f}분" if m < 90 else f"{m / 60:.1f}시간")
+
+    return f" · 작업당 평균 {text(per_job)} · 예상 남은 시간 약 {text(left)} (끝 {end:%m-%d %H:%M})"
 
 
 def _stage_command(args: argparse.Namespace, paths: Any) -> None:

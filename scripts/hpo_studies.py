@@ -55,7 +55,7 @@ FORECAST = {
         "train.max_epochs": [80, 120, 200, 300],
         "train.loss": ["mae", "huber"],
         **MODEL_SPACE,
-        # 1 s samples: 13 · 19.5 · 39 s are a third, half and one ALD cycle.
+        # 1 s samples: patch lengths from a few seconds to a few tens of seconds.
         "patch_seconds": [8, 13, 16, 19.5, 32, 39],
         "revin": [True, False],
         "revin_center": ["last", "mean"],
@@ -67,7 +67,7 @@ VS_SPACE = {
     **TRAIN_SPACE,
     "train.max_epochs": [40, 80, 120, 200],
     **MODEL_SPACE,
-    # 0.5 s samples: 6.5 · 13 s are a sixth and a third of an ALD cycle.
+    # 0.5 s samples: shorter patches than the 1 s search.
     "patch_seconds": [2, 4, 6.5, 8, 13, 16],
     "revin": [True, False],
     "revin_center": ["last", "mean"],
