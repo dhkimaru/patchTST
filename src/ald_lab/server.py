@@ -31,6 +31,7 @@ from . import launch
 from .paths import LabPaths, resolve_paths
 
 REBUILD_CHECK_SECONDS = 15
+HPO_PAGE_SECONDS = 5.0  # the 극한 탐색 panel is computed at most once in this many seconds
 REPORT_NAME = re.compile(r"^[A-Za-z0-9_.-]+\.(txt|log)$")  # result files under work/reports/, no folders
 REPORT_MAX_BYTES = 8_000_000
 TASK_NAMES = {"forecast": "미래값 예측", "virtual_sensor": "가상 센서", "thickness": "두께 예측"}
@@ -52,6 +53,8 @@ class Lab:
         self._ledger: tuple[float, Any] | None = None
         self._lock = threading.Lock()
         self._building = False
+        self._hpo_lock = threading.Lock()
+        self._hpo_page: tuple[float, str] | None = None
 
     # -- report ---------------------------------------------------------------------------------------------
     def signature(self) -> float:
@@ -315,10 +318,38 @@ class Lab:
         if name not in files:
             raise launch.LaunchError(f"탐색 설정이 없습니다: {name}")
         seeds = [int(x) for x in str(form.get("seeds") or "42,43,44").replace(";", ",").split(",") if x.strip()]
+        gpus = str(form.get("gpus") or "auto")
         docs = hpo.top_configs(files[name], self.paths, k=int(form.get("k") or 5), seeds=seeds)
-        records = launch.submit_docs(self.paths.work_root, docs, gpus=str(form.get("gpus") or "auto"), report=True,
+        records = launch.submit_docs(self.paths.work_root, docs, gpus=gpus, report=True,
                                      data_root=self.paths.data_root, source="dashboard")
+        per_job = hpo.full_trial_minutes(hpo.load_study(files[name]), self.paths)
+        for doc, record in zip(docs, records):  # so the queue can show when what follows will start
+            if per_job:
+                jobs = len(doc["models"]) * len(doc["seeds"])
+                launch.update_request(launch.queue_dir(self.paths.work_root) / record["id"],
+                                      estimate_minutes=round(per_job * -(-jobs // hpo._workers(gpus)), 2))
         return {"ids": [r["id"] for r in records]}
+
+    def queue_next(self, form: dict[str, Any]) -> dict[str, Any]:
+        return {"priority": launch.move_to_front(self.paths.work_root, str(form.get("id") or ""))}
+
+    def hpo_fragment(self, max_age: float = HPO_PAGE_SECONDS) -> str:
+        """The 극한 탐색 panel, computed by one request at a time: pages polling every 10 s (several browsers, or a
+        slow moment on the server) share the last result instead of piling up computations."""
+
+        from .report.lab import hpo_html
+
+        with self._hpo_lock:
+            if self._hpo_page and time.time() - self._hpo_page[0] < max_age:
+                return self._hpo_page[1]
+            page = hpo_html(self.paths, live=launch_enabled())
+            self._hpo_page = (time.time(), page)
+            return page
+
+    def hpo_changed(self) -> None:
+        """Forget the cached panel after a button changed the queue, so the next poll shows it."""
+
+        self._hpo_page = None
 
     def hpo_refcheck(self, form: dict[str, Any]) -> dict[str, Any]:
         """Queue the reproduction experiment of a study's current setting (record seeds + the study's seed)."""
@@ -334,8 +365,12 @@ class Lab:
             doc, record = hpo.refcheck_doc(spec, self.paths)
         except hpo.StudyError as exc:
             raise launch.LaunchError(str(exc)) from exc
-        records = launch.submit_docs(self.paths.work_root, [doc], gpus=str(form.get("gpus") or "auto"), report=True,
+        gpus = str(form.get("gpus") or "auto")
+        records = launch.submit_docs(self.paths.work_root, [doc], gpus=gpus, report=True,
                                      data_root=self.paths.data_root, source="dashboard")
+        if record.get("fit_minutes"):  # seeds train side by side, one per GPU
+            launch.update_request(launch.queue_dir(self.paths.work_root) / records[0]["id"],
+                                  estimate_minutes=round(record["fit_minutes"] * -(-len(doc["seeds"]) // hpo._workers(gpus)), 1))
         folder = hpo.study_dir(self.paths, name)
         folder.mkdir(parents=True, exist_ok=True)
         hpo._write_json(folder / "refcheck.json", record)
@@ -394,9 +429,7 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
 
                     self._html(queue_html(lab.paths.work_root, live=launch_enabled()))
                 elif url.path == "/api/fragment/hpo":
-                    from .report.lab import hpo_html
-
-                    self._html(hpo_html(lab.paths, live=launch_enabled()))
+                    self._html(lab.hpo_fragment())
                 elif url.path == "/api/fragment/explore":
                     from .report.lab import explore_html
 
@@ -430,6 +463,7 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 form = json.loads(self.rfile.read(length) or b"{}")
+                lab.hpo_changed()  # a button may change the queue: the next panel poll computes afresh
                 if url.path == "/api/plan":
                     self._json(lab.plan(form))
                     return
@@ -461,6 +495,8 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                     self._json(lab.hpo_requeue(form))
                 elif url.path == "/api/hpo/refcheck":
                     self._json(lab.hpo_refcheck(form))
+                elif url.path == "/api/queue/next":
+                    self._json(lab.queue_next(form))
                 elif url.path == "/api/rebuild":
                     threading.Thread(target=lab.rebuild, daemon=True).start()
                     self._json({"status": "rebuilding"})
@@ -470,6 +506,8 @@ def make_handler(lab: Lab) -> type[BaseHTTPRequestHandler]:
                 self._json({"error": str(exc)})
             except Exception as exc:  # noqa: BLE001
                 self._json({"error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                lab.hpo_changed()  # and once more after it, so no poll in between keeps the old queue
 
     return Handler
 

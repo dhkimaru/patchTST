@@ -386,27 +386,42 @@ def test_refcheck_retrains_the_record_through_the_normal_path(lab, tmp_path, mon
     hpo.report_study(spec, paths, importance=False)
     assert "[재현 실험]" in (paths.work_root / "reports" / "hpo_rc.txt").read_text(encoding="utf-8")
     page = hpo_html(paths, live=True)
-    assert 'data-hpo-refcheck="rc"' in page and "재현 실험: 기록" in page
+    assert "data-hpo-refcheck" not in page and "재현 확인: 기록 seed" in page  # the result, no button
 
 
-def test_dashboard_flags_a_reference_that_did_not_reproduce(monkeypatch):
+def test_result_compares_with_the_record_and_the_queue_reads_in_order(monkeypatch):
     from ald_lab.report.lab import hpo_html
 
-    row = {"name": "x1_demo", "file": "x1_demo.yaml", "description": "", "target": "MFCMon_NH3", "model": "patchtst",
-           "objective": "mae", "unit": "slm", "budget": 150, "task": "virtual_sensor", "request": None,
-           "report": "hpo_x1_demo.txt", "finished": 40, "state": "running", "progress": {"per_trial_min": 1.8},
-           "counts": {"complete": 29, "pruned": 9, "fail": 2}, "reference": 0.07487, "ref_version": 2,
-           "ref_check": {"mean": 0.05253, "sd": 0.003367, "seeds": 3, "gap_pct": 42.5, "limit_pct": 19.2, "ok": False},
-           "best": 0.05345, "gain_pct": 28.6, "saturation": "판단 보류"}
+    row = {"name": "x1_demo", "file": "x1_demo.yaml", "description": "", "label": "가상 센서 0.5초 사이클 전용 모델, 사이클 안 MAE",
+           "target": "MFCMon_NH3", "model": "patchtst", "objective": "mae", "unit": "slm", "budget": 150,
+           "task": "virtual_sensor", "request": "r1", "report": "hpo_x1_demo.txt", "finished": 40, "state": "running",
+           "progress": {"per_trial_min": 1.8}, "counts": {"complete": 29, "pruned": 9, "fail": 2},
+           "reference": 0.07487, "ref_version": 2, "best": 0.05345, "saturation": "판단 보류", "end_at": None,
+           "record": {"mean": 0.05253, "sd": 0.003367, "seeds": 3},
+           "ref_check": {"mean": 0.05253, "gap_pct": 42.5, "limit_pct": 19.2, "ok": False},
+           "followups": [{"kind": "재현 확인", "status": "queued", "place": 1}], "top": None, "refcheck": None}
+    queue = [{"id": "r1", "status": "running", "place": 0, "kind": "극한 탐색", "study": "x1_demo",
+              "title": "극한 탐색 x1_demo", "n_jobs": 150, "progress": (41, 151), "start_at": None,
+              "end_at": "2026-11-24T05:57", "basis": ""},
+             {"id": "r2", "status": "queued", "place": 1, "kind": "재현 확인", "study": "x1_demo",
+              "title": "재현 확인 x1_demo", "n_jobs": 4, "progress": None, "start_at": "2026-11-24T05:57",
+              "end_at": "2026-11-24T06:10", "basis": "기록의 학습 시간으로 추정"},
+             {"id": "r3", "status": "queued", "place": 2, "kind": "극한 탐색", "study": "x1_other",
+              "title": "극한 탐색 x1_other", "n_jobs": 150, "progress": None, "start_at": "2026-11-24T06:10",
+              "end_at": None, "basis": ""}]
     status = {"rows": [row], "states": {"done": 0, "running": 1, "queued": 0, "partial": 0, "new": 0},
-              "finished": 40, "budget": 150, "queue_end": None}
+              "finished": 40, "budget": 150, "queue_end": None, "queue": queue}
     monkeypatch.setattr(hpo, "studies_status", lambda paths, folder=None: status)
     page = hpo_html(None, live=True)
-    assert "⚠ 기록과 +42%" in page and "⚠ 이전 방식" in page and "data-hpo-requeue" in page  # v2: put v3 in
-    assert '<div class="sub">참고</div>' in page  # 지금 대비 is only indicative
-    row.update(ref_version=hpo.REF_VERSION, ref_check={**row["ref_check"], "gap_pct": 3.0, "ok": True})
+    assert "기록 0.05253 slm" in page and "seed 3개 평균" in page and "탐색 최고 0.05345 slm" in page
+    assert "+1.8%" in page and "seed 1개 값, 확정 전" in page and "재현 확인: 2번째로 대기" in page
+    assert "⚠" not in page and "data-hpo-requeue" not in page  # the current-setting trial lives in the report only
+    assert page.index("극한 탐색 x1_demo") < page.index("재현 확인 x1_demo") < page.index("극한 탐색 x1_other")
+    assert 'data-q-stop="r1"' in page and 'data-q-next="r3"' in page and 'data-q-next="r2"' not in page
+    assert "06:10 시작 예상, 끝 시각 모름" in page or "시작 예상, 끝 시각 모름" in page
+    row.update(top={"label": "x1_demo_r1", "mean": 0.049, "seeds": 3, "settings": 5}, followups=[])
     page = hpo_html(None, live=True)
-    assert "⚠" not in page and "data-hpo-requeue" not in page
+    assert "확정 0.049 slm" in page and "-6.7%" in page and "seed 3개 평균" in page
 
 
 def test_an_old_style_reference_is_replaced(lab, tmp_path, monkeypatch):  # noqa: F811
@@ -497,7 +512,7 @@ def test_failed_trials_explain_themselves(lab, tmp_path, monkeypatch):  # noqa: 
     monkeypatch.setattr(hpo, "study_files", lambda folder_=None: [path])
     page = hpo_html(paths, live=True)
     assert 'class="tw lab-hpo-scroll"' in page and 'data-key="fail-fails"' in page
-    assert "실패 원인: GPU 메모리 부족 2, 설정 조합 불가 1, 작업자 중단 1" in page and "trial 0" in page
+    assert "실패 4: GPU 메모리 부족 2, 설정 조합 불가 1, 작업자 중단 1" in page and "trial 0" in page
 
 
 def test_dashboard_lists_studies_with_progress_and_end_times(lab, tmp_path, monkeypatch):  # noqa: F811
@@ -527,21 +542,76 @@ def test_dashboard_lists_studies_with_progress_and_end_times(lab, tmp_path, monk
     assert rows["study_next"]["state"] == "queued" and rows["study_next"]["request"] == ids[0]
     assert rows["study_next"]["end_at"] and status["queue_end"]  # from the pace of the finished study
     assert rows["study_next"]["end_basis"].startswith("같은 과제")  # same task: not marked as borrowed
+    assert rows["study_next"]["place"] == 0 and status["queue"][0]["title"] == "극한 탐색 study_next"
     assert rows["study_new"]["state"] == "new" and status["states"]["done"] == 1
     doc = yaml.safe_load((paths.work_root / "queue" / ids[0] / "experiment.yaml").read_text(encoding="utf-8"))
     assert launch.is_study_doc(doc) and doc["name"] == "study_next"
 
     page = hpo_html(paths, live=True)
-    assert "study_done" in page and "완료" in page and "대기" in page and "미실행" in page
+    assert "study_done" in page and "완료" in page and "대기 1번째" in page and "아직 넣지 않은 탐색 1개" in page
     assert 'data-hpo-submit' in page and 'value="study_new"' in page and "hpo_study_done.txt" in page
-    assert 'class="lab-hpo-pick" value="study_next" disabled' in page  # waiting: cannot be queued twice
-    assert "data-hpo-submit" not in hpo_html(paths, live=False)  # view-only: no buttons
+    assert 'value="study_next"' not in page  # waiting: no check box, it cannot be queued twice
+    assert 'data-q-cancel="' + ids[0] + '"' in page and "data-q-next" not in page  # first in line: nothing to move
+    assert 'data-hpo-top="study_done"' in page and "data-arm=" in page and "confirm(" not in page
+    for gone in ("data-hpo-reference", "data-hpo-requeue", "data-hpo-refcheck", "⚠"):  # internal tools left the panel
+        assert gone not in page
+    assert "data-hpo-submit" not in hpo_html(paths, live=False) and "data-q-" not in hpo_html(paths, live=False)
 
     assert server.hpo_requeue({"name": "study_done"}) == {"queued": False}  # no enqueue_from: nothing to add
     top = server.hpo_top({"name": "study_done", "k": 2, "seeds": "1"})  # the best settings again with seeds
     queued = [yaml.safe_load((paths.work_root / "queue" / i / "experiment.yaml").read_text(encoding="utf-8"))
               for i in top["ids"]]
     assert all(d["study"] == "hpo_top:study_done" and d["seeds"] == [1] for d in queued)
+    request = json.loads((paths.work_root / "queue" / top["ids"][0] / "request.json").read_text())
+    assert request["estimate_minutes"] is not None  # from the study's full trials: the queue times what follows
+
+    # 먼저 실행: the confirmation moves ahead of the waiting study; the worker takes it first too
+    server.queue_next({"id": top["ids"][0]})
+    status = hpo.studies_status(paths, folder)
+    assert [i["title"] for i in status["queue"]][:2] == ["상위 5개 확정 study_done", "극한 탐색 study_next"]
+    assert status["queue"][1]["start_at"] and status["queue"][1]["basis"]  # timed after the confirmation
+    assert launch._next(paths.work_root).name == top["ids"][0]
+    rows = {r["name"]: r for r in status["rows"]}
+    assert {i["kind"] for i in rows["study_done"]["followups"]} == {"상위 5개 확정"}  # one per window length
+    page = hpo_html(paths, live=True)
+    assert "상위 5개 확정: 1번째로 대기" in page and 'data-hpo-top="study_done"' not in page  # already waiting
+
+    for i, doc in zip(top["ids"], queued):  # what the worker runs; the result then shows as 확정
+        file = tmp_path / f"{i}.yaml"
+        file.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+        run_experiment(file, paths, devices=["cpu"])
+        launch.update_request(paths.work_root / "queue" / i, status="done")
+    found = hpo.top_results(hpo.load_study(done), paths)
+    assert found and found["seeds"] == 1 and found["settings"] == 2
+    assert "확정 " in hpo_html(paths, live=True) and "seed 1개 평균" in hpo_html(paths, live=True)
+
+
+def test_a_waiting_study_runs_its_current_file(lab, tmp_path, monkeypatch):  # noqa: F811
+    """A study file edited while its request waits (e.g. a new time limit) is the one that runs."""
+
+    paths, split_path = lab
+    base = _config(tmp_path, split_path, models=["ridge"])
+    folder = tmp_path / "hpo_cfg2"
+    folder.mkdir()
+    path = _study(folder, base, name="study_edit", trials=3, enqueue=[])
+    monkeypatch.setattr(hpo, "study_files", lambda folder_=None: sorted(folder.glob("*.yaml")))
+    record = launch.submit(paths.work_root, yaml.safe_load(path.read_text(encoding="utf-8")), gpus="cpu")
+    path.write_text(path.read_text(encoding="utf-8").replace("trials: 3", "trials: 7"), encoding="utf-8")
+
+    class Done:  # the training process, finished at once
+        returncode, pid = 0, 1
+
+        def __init__(self, cmd, **kwargs):
+            self.cmd = cmd
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(launch.subprocess, "Popen", Done)
+    folder_q = paths.work_root / "queue" / record["id"]
+    out = launch.run_request(folder_q, poll=0)
+    assert out["status"] == "done" and out["study_file"] == str(path)
+    assert yaml.safe_load((folder_q / "experiment.yaml").read_text(encoding="utf-8"))["trials"] == 7
 
 
 def test_queue_list_shows_the_expected_end():
@@ -551,3 +621,19 @@ def test_queue_list_shows_the_expected_end():
     text = launch.remaining_text({"status": "running", "progress": (10, 40), "started": started})
     assert "작업당 평균 3.0분" in text and "약 1.5시간" in text and "(끝 " in text
     assert launch.remaining_text({"status": "queued", "progress": None}) == ""
+
+
+def test_panel_is_computed_once_for_polls_close_together(lab, monkeypatch):  # noqa: F811
+    """Browsers poll the panel every 10 s; while one computation runs or is fresh, the others share it."""
+
+    import ald_lab.report.lab as lab_page
+    from ald_lab.server import Lab
+
+    paths, _ = lab
+    calls = []
+    monkeypatch.setattr(lab_page, "hpo_html", lambda p, live=True: calls.append(1) or f"page {len(calls)}")
+    server = Lab(paths, examples=False)
+    assert server.hpo_fragment() == "page 1" and server.hpo_fragment() == "page 1" and len(calls) == 1
+    server.hpo_changed()  # a button changed the queue
+    assert server.hpo_fragment() == "page 2"
+    assert server.hpo_fragment(max_age=0) == "page 3"  # an old one is computed again

@@ -16,6 +16,7 @@ import copy
 import itertools
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -462,6 +463,36 @@ def hide_finished(work_root: Path) -> int:
     return hidden
 
 
+def run_key(doc: dict[str, Any]) -> tuple[int, str]:
+    """Where a queued request stands: a higher ``priority`` first ('먼저 실행'), then the order of submission."""
+
+    return (-int(doc.get("priority") or 0), str(doc.get("id") or ""))
+
+
+def run_order(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The running request, then the queued ones in the order the worker takes them."""
+
+    running = [q for q in requests if q.get("status") == "running"]
+    queued = sorted((q for q in requests if q.get("status") == "queued"), key=run_key)
+    return running + queued
+
+
+def move_to_front(work_root: Path, request_id: str) -> int:
+    """Make a queued request the next one the worker takes (after the running one). Returns its priority."""
+
+    folder = queue_dir(Path(work_root)) / request_id
+    doc = read_request(folder)
+    if doc is None:
+        raise LaunchError(f"없는 요청: {request_id}")
+    if doc["status"] != "queued":
+        raise LaunchError("대기 중인 요청만 앞으로 옮길 수 있습니다")
+    top = max((int(q.get("priority") or 0) for q in list_requests(work_root, include_hidden=True)
+               if q.get("status") == "queued"), default=0)
+    priority = top + 1
+    update_request(folder, priority=priority)
+    return priority
+
+
 def cancel(work_root: Path, request_id: str) -> str:
     """Cancel a queued request, or stop a running one (its whole process group)."""
 
@@ -544,11 +575,12 @@ def ensure_worker(work_root: Path) -> bool:
 
 def _next(work_root: Path) -> Path | None:
     root = queue_dir(work_root)
-    for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+    queued = []
+    for folder in (p for p in root.iterdir() if p.is_dir()):
         doc = read_request(folder)
         if doc and doc.get("status") == "queued":
-            return folder
-    return None
+            queued.append((run_key({**doc, "id": doc.get("id") or folder.name}), folder))
+    return min(queued)[1] if queued else None
 
 
 def _new_run(experiments: Path, name: str, before: set[str]) -> Path | None:
@@ -576,6 +608,13 @@ def run_request(folder: Path, *, poll: float = 3.0) -> dict[str, Any]:
     doc = read_request(folder) or {}
     work_root = Path(doc["work_root"])
     experiments = work_root / "experiments"
+    if doc.get("kind") == "hpo" and not doc.get("smoke"):
+        from .hpo import study_files
+
+        current = next((p for p in study_files() if p.stem == doc["name"]), None)
+        if current is not None:  # the study file as it is now: an edit made while the request waited applies
+            shutil.copyfile(current, folder / "experiment.yaml")
+            update_request(folder, study_file=str(current))
     before = {p.name for p in (experiments / doc["name"]).iterdir()} if (experiments / doc["name"]).is_dir() else set()
     entry = _HPO if doc.get("kind") == "hpo" else _TRAIN
     cmd = [sys.executable, "-c", entry, str(folder / "experiment.yaml"), "--gpus", str(doc.get("gpus") or "auto"),
@@ -694,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="요청 목록")
     p_cancel = sub.add_parser("cancel", help="요청 취소 (실행 중이면 멈춤)")
     p_cancel.add_argument("request_id")
+    p_next = sub.add_parser("next", help="대기 중인 요청을 다음 차례로 (실행 중인 것 바로 뒤)")
+    p_next.add_argument("request_id")
     sub.add_parser("worker", help="대기열이 빌 때까지 실행 (보통 자동으로 뜬다)")
     sub.add_parser("results", help="결과 정리 스크립트를 지금 실행 (학습 없음, work/reports/)")
     p_first = sub.add_parser("first", help="모델 선정 단계: 대상별 PatchTST 최고 · 기준선 대비 판정 (LightGBM 참고)")
@@ -724,14 +765,19 @@ def main(argv: list[str] | None = None) -> int:
         started = ensure_worker(paths.work_root)
         kind = "탐색 trial" if record["kind"] == "hpo" else "작업"
         print(f"대기열에 넣음: {record['id']} ({kind} {n_jobs}개)" + (" · 작업자 시작" if started else ""))
-    elif args.command == "list":
-        for r in list_requests(paths.work_root):
+    elif args.command == "list":  # running, queued in the order they will run, then the rest newest first
+        requests = list_requests(paths.work_root)
+        active = run_order(requests)
+        for r in active + [q for q in requests if q not in active]:
             progress = r.get("progress")
             done = f" {progress[0]}/{progress[1]}" if progress else ""
             print(f"{r['id']}  {STATUS_NAMES.get(r['status'], r['status'])}{done}{remaining_text(r)}  {r['name']}  "
                   f"{r.get('memo', '')}")
     elif args.command == "cancel":
         print(cancel(paths.work_root, args.request_id))
+    elif args.command == "next":
+        move_to_front(paths.work_root, args.request_id)
+        print(f"{args.request_id}: 다음 차례로 옮김")
     elif args.command == "worker":
         print(f"요청 {run_worker(paths.work_root)}개 처리")
     elif args.command == "results":
@@ -789,20 +835,34 @@ def submit_studies(work_root: Path, names: list[str], *, gpus: str, report: bool
     return records
 
 
-def remaining_text(q: dict[str, Any]) -> str:
-    """'작업당 평균 … · 예상 남은 시간 …' for a running request at its pace so far (wall time per finished job)."""
+def _pace(q: dict[str, Any]) -> tuple[float, float] | None:
+    """(minutes per finished job, minutes left) of a running request at its pace so far."""
 
     progress, started = q.get("progress"), q.get("started")
     if q.get("status") != "running" or not progress or not started or not progress[0]:
-        return ""
+        return None
     try:
         start = datetime.fromisoformat(started)
     except ValueError:
-        return ""
+        return None
     elapsed = (datetime.now(start.tzinfo) - start).total_seconds() / 60
     done, total = progress
     per_job = elapsed / done
-    left = per_job * max(0, total - done)
+    return per_job, per_job * max(0, total - done)
+
+
+def remaining_minutes(q: dict[str, Any]) -> float | None:
+    pace = _pace(q)
+    return pace[1] if pace else None
+
+
+def remaining_text(q: dict[str, Any]) -> str:
+    """'작업당 평균 … · 예상 남은 시간 …' for a running request at its pace so far (wall time per finished job)."""
+
+    pace = _pace(q)
+    if pace is None:
+        return ""
+    per_job, left = pace
     end = datetime.now() + timedelta(minutes=left)
 
     def text(m: float) -> str:

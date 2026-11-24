@@ -374,12 +374,13 @@ def _budget_left(study: Any, budget: int) -> bool:
 # ----------------------------------------------------------------------------- reference (current settings)
 
 def reference_rows(work_root: Path, experiment: str, *, model: str = "patchtst", metric: str = "mae",
-                   min_seeds: int = 1) -> pd.DataFrame:
-    """Per target the settings with the lowest seed-mean ``metric`` among runs of ``experiment`` (any study tag)."""
+                   min_seeds: int = 1, ledger: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Per target the settings with the lowest seed-mean ``metric`` among runs of ``experiment`` (any study tag).
+    ``ledger`` reuses an already collected record."""
 
     from .ledger import collect_ledger
 
-    led = collect_ledger(work_root)
+    led = collect_ledger(work_root) if ledger is None else ledger
     if not len(led):
         return pd.DataFrame()
     led = led[(led["base"] == experiment) & (led["model"] == model) & (led["job_status"] == "ok")
@@ -395,8 +396,9 @@ def reference_rows(work_root: Path, experiment: str, *, model: str = "patchtst",
         mean = float(values.mean())
         sd = float(values.std(ddof=1)) if len(values) > 1 else None
         per_seed = {int(s): float(v) for s, v in g.groupby("seed")[metric].mean().items()}
+        fit = g["fit_minutes"].dropna() if "fit_minutes" in g else pd.Series(dtype=float)
         rows.append({"target": target, "unit": g["unit"].iloc[0], "settings": settings, "train": train,
-                     "per_seed": per_seed,
+                     "per_seed": per_seed, "fit_minutes": float(fit.mean()) if len(fit) else None,
                      "params": g["params"].iloc[0], "context_seconds": float(g["context_seconds"].iloc[0]),
                      "input_set": input_set, "seeds": int(g["seed"].nunique()), "metric": metric, "mean": mean,
                      "sd": sd, "sd_pct": (sd / mean * 100) if sd is not None and mean else None,
@@ -406,6 +408,68 @@ def reference_rows(work_root: Path, experiment: str, *, model: str = "patchtst",
     frame = enough if len(enough) else frame
     best = frame.loc[frame.groupby("target")["mean"].idxmin()]
     return best.sort_values("target").reset_index(drop=True)
+
+
+def save_reference_rows(paths: LabPaths, experiment: str, model: str, rows: pd.DataFrame) -> Path:
+    """Merge ``rows`` of :func:`reference_rows` into ``work/hpo/reference.json`` (one row per experiment, model and
+    target; a later call wins) and rewrite ``work/reports/hpo_reference.txt``."""
+
+    folder = Path(paths.work_root) / "hpo"
+    folder.mkdir(parents=True, exist_ok=True)
+    new_rows = rows.drop(columns=["params"]).assign(experiment=experiment, model=model)
+    ref_path = folder / "reference.json"
+    old = json.loads(ref_path.read_text(encoding="utf-8")) if ref_path.is_file() else {}
+    key = lambda r: f"{r.get('experiment')}|{r.get('model')}|{r['target']}"
+    merged = {key(r): r for r in old.get("rows", [])}
+    merged.update({key(r): r for r in new_rows.to_dict(orient="records")})
+    all_rows = sorted(merged.values(), key=lambda r: (str(r.get("experiment")), r["target"]))
+    _write_json(ref_path, {"updated": datetime.now().isoformat(timespec="seconds"), "rows": all_rows})
+    table = pd.DataFrame(all_rows).reindex(columns=["experiment", "target", "unit", "metric", "seeds", "mean", "sd",
+                                                    "sd_pct", "context_seconds", "settings", "train"])
+    reports = Path(paths.work_root) / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / "hpo_reference.txt").write_text(
+        "## 지금 설정의 기준점 (누적 기록, 검증 run, 학습 없음)\n"
+        "실험·대상마다 seed 평균이 가장 낮은 설정. sd = seed 간 표준편차(단위는 대상 단위), sd_pct = sd ÷ 평균 × 100.\n"
+        "settings = 모델 설정, train = 그 run의 실험 파일 학습 설정(같은 모델 설정이라도 학습 설정이 다르면 따로 묶음).\n\n"
+        + table.to_string(index=False, float_format=lambda v: f"{v:.4g}") + "\n", encoding="utf-8")
+    return ref_path
+
+
+_BASELINE_MISS: dict[str, float] = {}
+
+
+def record_baseline(spec: StudySpec, paths: LabPaths, cache: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """What a study is measured against: the seed mean of the current setting in the cumulative record
+    (``enqueue_from``). Read from ``work/hpo/reference.json``; the first time it is missing it is taken from the
+    record and saved (``cache`` shares one collected record between studies). None without a record."""
+
+    conf = spec.enqueue_from
+    if not conf:
+        return None
+    experiment, metric = str(conf["experiment"]), str(conf.get("metric", spec.objective))
+    key = f"{experiment}|{spec.model}|{spec.target}|{metric}"
+    path = Path(paths.work_root) / "hpo" / "reference.json"
+    rows = json.loads(path.read_text(encoding="utf-8")).get("rows", []) if path.is_file() else []
+    for r in rows:
+        if (f"{r.get('experiment')}|{r.get('model', spec.model)}|{r.get('target')}|{r.get('metric', metric)}" == key
+                and r.get("mean") is not None):
+            return r
+    if time.time() - _BASELINE_MISS.get(key, 0.0) < 600:  # looked a few minutes ago and found nothing
+        return None
+    from .ledger import collect_ledger
+
+    cache = {} if cache is None else cache
+    if "ledger" not in cache:
+        cache["ledger"] = collect_ledger(paths.work_root)
+    found = reference_rows(paths.work_root, experiment, model=spec.model, metric=metric,
+                           min_seeds=int(conf.get("min_seeds", 1)), ledger=cache["ledger"])
+    mine = found[found["target"] == spec.target] if len(found) else found
+    if not len(mine):
+        _BASELINE_MISS[key] = time.time()
+        return None
+    save_reference_rows(paths, experiment, spec.model, found)
+    return {**mine.drop(columns=["params"]).iloc[0].to_dict(), "experiment": experiment, "model": spec.model}
 
 
 def _reference_trial(spec: StudySpec, work_root: Path, cfg: Any
@@ -1331,9 +1395,115 @@ def _live_info(spec: StudySpec, paths: LabPaths, request: dict[str, Any] | None)
             "importance_top": max(imp, key=imp.get) if imp else None}
 
 
+METRIC_NAMES = {"mae": "검증 MAE", "mae_cycle": "사이클 안 MAE", "mae_other": "사이클 밖 MAE"}
+
+
+def study_label(spec: StudySpec, task: str) -> str:
+    """What a study searches, in a few words: the task, the kind of model and the metric it optimizes."""
+
+    metric = METRIC_NAMES.get(spec.objective, spec.objective)
+    if task == "forecast":
+        return f"미래값 예측, {metric}"
+    if "cycleonly" in spec.base:  # its validation windows all lie inside the ALD cycles
+        return "가상 센서 0.5초 사이클 전용 모델, " + ("사이클 안 MAE" if spec.objective == "mae" else metric)
+    if "res05" in spec.base:
+        return f"가상 센서 0.5초 공정 전체 모델, {metric}"
+    return f"가상 센서 1초 공정 전체 모델, {metric}"
+
+
+def request_label(q: dict[str, Any]) -> tuple[str, str | None]:
+    """(kind, study) of a queue request: 극한 탐색, 재현 확인 or 상위 5개 확정 of a study, or 실험."""
+
+    name = str(q.get("name") or "")
+    if q.get("kind") == "hpo":
+        return "극한 탐색", name.removesuffix("_smoke")
+    if name.endswith(REFCHECK_SUFFIX):
+        return "재현 확인", name[: -len(REFCHECK_SUFFIX)]
+    match = re.match(r"^(.*)_top\d+(?:_w.*)?$", name)
+    if match:
+        return "상위 5개 확정", match.group(1)
+    return "실험", None
+
+
+def top_results(spec: StudySpec, paths: LabPaths) -> dict[str, Any] | None:
+    """The best of the top settings retrained with several seeds (상위 5개 확정): seed mean of the study's metric."""
+
+    from .ledger import _run_rows
+
+    root = Path(paths.work_root) / "experiments"
+    dirs = sorted(d for d in root.glob(f"{spec.name}_top*") if d.is_dir()) if root.is_dir() else []
+    values: dict[str, dict[int, float]] = {}
+    for folder in dirs:
+        for exp_dir in sorted(p for p in folder.iterdir() if p.is_dir()):
+            for r in _run_rows(exp_dir, None):
+                value = r.get(spec.objective)
+                if (r["model"] == spec.model and r["target"] == spec.target and r.get("job_status", "ok") == "ok"
+                        and value is not None and not pd.isna(value)):
+                    values.setdefault(str(r.get("label")), {})[int(r["seed"])] = float(value)
+    if not values:
+        return None
+    means = {label: (float(np.mean(list(v.values()))), len(v)) for label, v in values.items()}
+    best = min(means, key=lambda k: means[k][0])
+    return {"label": best, "mean": means[best][0], "seeds": means[best][1], "settings": len(means)}
+
+
+def queue_plan(rows: list[dict[str, Any]], requests: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """The running request and the queued ones in the order the worker takes them, each with its place, a readable
+    title and expected start and end. A study's time comes from the pace of studies of the same task (or another
+    task's, marked), another request's from its ``estimate_minutes``; after a request of unknown length the later
+    times are left open."""
+
+    from .launch import remaining_minutes, run_order
+
+    by_request = {r["request"]: r for r in rows if r.get("request")}
+    by_name = {r["name"]: r for r in rows if "name" in r}
+    paces: dict[str, list[float]] = {}
+    for row in rows:
+        per = (row.get("progress") or {}).get("per_trial_min")
+        if per:
+            paces.setdefault(row.get("task", ""), []).append(per)
+    every = [v for vs in paces.values() for v in vs]
+    clock, known = now, True
+    plan = []
+    for place, q in enumerate(run_order(requests)):
+        kind, study = request_label(q)
+        row = by_request.get(q["id"]) if kind == "극한 탐색" else None
+        item = {"id": q["id"], "status": q["status"], "place": place, "kind": kind, "study": study,
+                "title": f"{kind} {study}" if study else str(q.get("memo") or q.get("name")),
+                "n_jobs": q.get("n_jobs"), "progress": q.get("progress"), "start_at": None, "end_at": None, "basis": ""}
+        minutes = None
+        if q["status"] == "running":
+            item["start_at"] = q.get("started")
+            eta = (row.get("progress") or {}).get("eta_min") if row else None
+            minutes = eta if eta is not None else remaining_minutes(q)
+        else:
+            item["start_at"] = clock.isoformat(timespec="minutes") if known else None
+            if row is not None and every:
+                same = paces.get(row.get("task", ""))
+                minutes = float(np.median(same or every)) * max(0, row["budget"] - row["finished"])
+                item["basis"] = "같은 과제 탐색의 속도로 계산" if same else "다른 과제 탐색의 속도를 빌린 추정"
+            elif q.get("estimate_minutes") is not None:
+                minutes = float(q["estimate_minutes"])
+                item["basis"] = "기록의 학습 시간으로 추정"
+            elif kind == "재현 확인" and study in by_name and (by_name[study].get("record") or {}).get("fit_minutes"):
+                fit = float(by_name[study]["record"]["fit_minutes"])  # seeds train side by side, one per GPU
+                minutes = fit * -(-int(q.get("n_jobs") or 1) // _workers(q.get("gpus")))
+                item["basis"] = "기록의 학습 시간으로 추정"
+        if minutes is None or not known:
+            known = False
+        else:
+            clock = (now if q["status"] == "running" else clock) + timedelta(minutes=float(minutes))
+            item["end_at"] = clock.isoformat(timespec="minutes")
+        plan.append(item)
+        if row is not None:  # a study counts its trials (the request also counts the baseline job)
+            item.update(progress=(row.get("finished", 0), row["budget"]), unit="trial")
+            row.update(place=place, start_at=item["start_at"], end_at=item["end_at"], end_basis=item["basis"])
+    return plan
+
+
 def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any]:
-    """Every study file with its state, progress and expected end, for the dashboard. Queued studies get an end
-    time from the pace of finished or running studies of the same task, in the order the queue runs them."""
+    """Every study file with its state, progress, result against the record and place in the queue, plus the queue
+    itself in run order (studies, reproduction checks, top-5 confirmations and other experiments), for the panel."""
 
     from .launch import list_requests
     from .training.config import load_experiment
@@ -1344,6 +1514,7 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
     for r in requests:
         if r.get("kind") == "hpo" and not r.get("smoke"):
             latest.setdefault(str(r["name"]), r)
+    ledger_cache: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
     for path in study_files(folder):
         try:
@@ -1354,11 +1525,12 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
             continue
         req = latest.get(spec.name)
         row: dict[str, Any] = {
-            "name": spec.name, "file": path.name, "description": spec.description, "target": spec.target,
-            "model": spec.model, "objective": spec.objective, "unit": unit_of(spec.target, None), "budget": spec.trials,
-            "task": task, "request": req.get("id") if req else None, "request_status": req.get("status") if req else None,
+            "name": spec.name, "file": path.name, "description": spec.description, "label": study_label(spec, task),
+            "target": spec.target, "model": spec.model, "objective": spec.objective,
+            "unit": unit_of(spec.target, None), "budget": spec.trials, "task": task,
+            "request": req.get("id") if req else None, "request_status": req.get("status") if req else None,
             "report": f"hpo_{spec.name}.txt", "finished": 0, "counts": None, "progress": None,
-            "has_reference_source": bool(spec.enqueue_from), "refcheck": None,
+            "has_reference_source": bool(spec.enqueue_from), "refcheck": None, "record": None, "top": None,
         }
         journal = study_dir(paths, spec.name) / "study.journal"
         if journal.is_file():
@@ -1373,10 +1545,13 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
                     info = {"error": f"{type(exc).__name__}: {exc}"}
                 _STATUS_CACHE[spec.name] = (key, info)
             row.update(info)
-        try:  # the reproduction experiment can exist before the study ever ran
-            row["refcheck"] = refcheck_results(spec, paths)
-        except Exception as exc:  # noqa: BLE001  (a half-written result file: try again on the next refresh)
-            row["refcheck"] = {"verdict": f"읽지 못함: {type(exc).__name__}", "gap_pct": None, "rerun": {}}
+        for key_name, reader, extra in (("record", record_baseline, (ledger_cache,)),
+                                        ("refcheck", refcheck_results, ()), ("top", top_results, ())):
+            try:  # each can exist before the study ever ran
+                row[key_name] = reader(spec, paths, *extra)
+            except Exception as exc:  # noqa: BLE001  (a half-written file: try again on the next refresh)
+                row[key_name] = None
+                row.setdefault("notes", []).append(f"{key_name}: {type(exc).__name__}: {exc}")
         status = row["request_status"]
         if status in ("running", "queued"):
             row["state"] = status
@@ -1389,34 +1564,14 @@ def studies_status(paths: LabPaths, folder: Path | None = None) -> dict[str, Any
         rows.append(row)
 
     now = datetime.now()
-    paces: dict[str, list[float]] = {}
-    for row in rows:
-        per = (row.get("progress") or {}).get("per_trial_min")
-        if per:
-            paces.setdefault(row.get("task", ""), []).append(per)
-    every = [v for vs in paces.values() for v in vs]
-    clock = now
-    for row in rows:  # one request runs at a time: running first, then the queue in order
-        if row.get("state") == "running" and (row.get("progress") or {}).get("eta_min") is not None:
-            clock = max(clock, now + timedelta(minutes=row["progress"]["eta_min"]))
-            row["end_at"] = clock.isoformat(timespec="minutes")
-    order = {r["id"]: i for i, r in enumerate(reversed([q for q in requests if q.get("status") == "queued"]))}
-    queued = sorted((r for r in rows if r.get("state") == "queued"), key=lambda r: order.get(r["request"], 0))
-    for row in queued:
-        same = paces.get(row.get("task", ""))
-        per = float(np.median(same or every)) if every else None
-        if per is None:
-            row["end_basis"] = "첫 탐색의 속도를 잰 뒤 계산"
-            continue
-        left = max(0, row["budget"] - row["finished"])
-        clock = clock + timedelta(minutes=per * left)
-        row["end_at"] = clock.isoformat(timespec="minutes")
-        row["end_basis"] = (f"같은 과제 탐색의 trial당 {_minutes(per)} 기준" if same else
-                            f"다른 과제 탐색의 trial당 {_minutes(per)}를 빌린 값(참고, 이 과제 첫 탐색이 시작되면 다시 계산)")
+    plan = queue_plan(rows, requests, now)
+    for row in rows:  # follow-up requests of a study (재현 확인, 상위 5개 확정) waiting or running
+        row["followups"] = [i for i in plan if i["study"] == row["name"] and i["kind"] != "극한 탐색"]
+    ends = [i["end_at"] for i in plan if i["end_at"]]
     states = {k: sum(1 for r in rows if r.get("state") == k) for k in STATE_NAMES}
     return {"rows": rows, "states": states, "finished": sum(r.get("finished", 0) for r in rows),
-            "budget": sum(r.get("budget", 0) for r in rows if "error" not in r),
-            "queue_end": clock.isoformat(timespec="minutes") if clock > now else None,
+            "budget": sum(r.get("budget", 0) for r in rows if "error" not in r), "queue": plan,
+            "queue_end": ends[-1] if ends and all(i["end_at"] for i in plan) else None,
             "updated": now.isoformat(timespec="seconds")}
 
 
@@ -1473,6 +1628,16 @@ def top_configs(spec: StudySpec | str | Path, paths: LabPaths, *, k: int = 5, se
 REFCHECK_SUFFIX = "_refcheck"
 
 
+def full_trial_minutes(spec: StudySpec, paths: LabPaths) -> float | None:
+    """Median minutes of the study's trials that trained to the end (not pruned): the length of one retraining."""
+
+    from optuna.trial import TrialState
+
+    done = [t.duration.total_seconds() / 60 for t in open_study(spec, paths).get_trials(deepcopy=False)
+            if t.state == TrialState.COMPLETE and t.duration]
+    return float(np.median(done)) if done else None
+
+
 def refcheck_doc(spec: StudySpec, paths: LabPaths) -> tuple[dict[str, Any], dict[str, Any]]:
     """An experiment that retrains the current setting through the normal training path (not the search) with the
     record's seeds and the study's seed, from the record run's own experiment file: data, window and train exactly
@@ -1503,6 +1668,8 @@ def refcheck_doc(spec: StudySpec, paths: LabPaths) -> tuple[dict[str, Any], dict
     doc["description"] = (f"{spec.name}: 지금 설정을 일반 학습 경로로 다시 학습 (기록 seed {record_seeds} + 탐색 seed "
                           f"{spec.seed}, 기록 run의 실험 파일 그대로)")
     record = {"experiment": doc["name"], "metric": metric, "mean": float(row["mean"]),
+              "fit_minutes": None if row.get("fit_minutes") is None or pd.isna(row.get("fit_minutes"))
+              else float(row["fit_minutes"]),
               "sd": None if pd.isna(row["sd"]) else float(row["sd"]),
               "per_seed": {str(k): float(v) for k, v in dict(row["per_seed"] or {}).items()},
               "record_run": str(row["exp_dir"]), "submitted": datetime.now().isoformat(timespec="seconds")}
@@ -1639,25 +1806,7 @@ def main(argv: list[str] | None = None) -> int:
         if not len(rows):
             print(f"{args.experiment}: 누적 기록에 {args.model} 결과가 없습니다")
             return 1
-        folder = Path(paths.work_root) / "hpo"
-        folder.mkdir(parents=True, exist_ok=True)
-        new_rows = rows.drop(columns=["params"]).assign(experiment=args.experiment, model=args.model)
-        ref_path = folder / "reference.json"
-        old = json.loads(ref_path.read_text(encoding="utf-8")) if ref_path.is_file() else {}
-        key = lambda r: f"{r.get('experiment')}|{r.get('model')}|{r['target']}"
-        merged = {key(r): r for r in old.get("rows", [])}
-        merged.update({key(r): r for r in new_rows.to_dict(orient="records")})
-        all_rows = sorted(merged.values(), key=lambda r: (str(r.get("experiment")), r["target"]))
-        _write_json(ref_path, {"updated": datetime.now().isoformat(timespec="seconds"), "rows": all_rows})
-        table = pd.DataFrame(all_rows).reindex(columns=["experiment", "target", "unit", "metric", "seeds", "mean", "sd",
-                                                        "sd_pct", "context_seconds", "settings", "train"])
-        reports = Path(paths.work_root) / "reports"
-        reports.mkdir(parents=True, exist_ok=True)
-        (reports / "hpo_reference.txt").write_text(
-            "## 지금 설정의 기준점 (누적 기록, 검증 run, 학습 없음)\n"
-            "실험·대상마다 seed 평균이 가장 낮은 설정. sd = seed 간 표준편차(단위는 대상 단위), sd_pct = sd ÷ 평균 × 100.\n"
-            "settings = 모델 설정, train = 그 run의 실험 파일 학습 설정(같은 모델 설정이라도 학습 설정이 다르면 따로 묶음).\n\n"
-            + table.to_string(index=False, float_format=lambda v: f"{v:.4g}") + "\n", encoding="utf-8")
+        ref_path = save_reference_rows(paths, args.experiment, args.model, rows)
         show = rows[["target", "unit", "seeds", "mean", "sd", "sd_pct", "context_seconds", "settings"]]
         print(f"## 지금 설정 ({args.experiment}, {args.model}, 검증 {args.metric}, seed {args.min_seeds}개 이상 우선)")
         print(show.to_string(index=False, formatters={"mean": "{:.4g}".format,

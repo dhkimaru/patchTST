@@ -17,7 +17,13 @@ from typing import Any
 import pandas as pd
 
 from .. import stages
-from ..launch import INPUT_SET_NAMES, STATUS_NAMES, list_requests, worker_running
+from ..launch import (
+    INPUT_SET_NAMES,
+    STATUS_NAMES,
+    list_requests,
+    run_order,
+    worker_running,
+)
 from .charts import improvement_bars
 
 TASKS = {"forecast": "미래값 예측", "virtual_sensor": "가상 센서"}
@@ -270,11 +276,9 @@ def queue_html(work_root: Path, limit: int = 60, *, live: bool = True) -> str:
 
     r = _h()
     requests = list_requests(work_root)
-    running = [q for q in requests if q.get("status") == "running"]
-    queued = [q for q in requests if q.get("status") == "queued"][::-1]
+    active = run_order(requests)  # the order the worker takes them ('먼저 실행' moves one up)
     rest = [q for q in requests if q.get("status") not in ("running", "queued")]
-    requests = running + queued + rest
-    active = running + queued
+    requests = active + rest
     shown = requests[:limit]
     more = f" · 최근 {len(shown)}건 표시" if len(requests) > len(shown) else ""
     scroll = " · 목록 안에서 스크롤" if len(shown) > QUEUE_SHOWN else ""
@@ -337,13 +341,103 @@ def _when(iso: str | None) -> str:
     return t.strftime("%H:%M") if t.date() == datetime.now().date() else t.strftime("%m-%d %H:%M")
 
 
+def _gap(value: float | None, base: float | None) -> float | None:
+    return (value - base) / base * 100 if value is not None and base else None
+
+
+def _gap_span(gap: float | None) -> str:
+    if gap is None:
+        return ""
+    return f' <span class="st {"good" if gap < 0 else "bad"}">{gap:+.1f}%</span>'
+
+
+def _hpo_queue(plan: list[dict[str, Any]], *, live: bool) -> str:
+    """The queue in run order: what runs now, what comes next and when, with stop, run-next and cancel."""
+
+    r = _h()
+    if not plan:
+        return '<p class="empty">대기열이 비어 있습니다. 아래에서 탐색을 골라 넣으세요.</p>'
+    items = []
+    for i in plan:
+        running = i["status"] == "running"
+        place = '<span class="st warn">실행 중</span>' if running else f'<span class="st">{i["place"] + 1}번째</span>'
+        done, total = i.get("progress") or (0, i.get("n_jobs") or 0)
+        unit = i.get("unit") or "작업"
+        if running and total:
+            size = f"{unit} {done} / {total}"
+        elif i.get("unit") and total:
+            size = f"{unit} {total - done}개 남음" if done else f"{unit} {total}개"
+        else:
+            size = f"작업 {i['n_jobs']}개" if i.get("n_jobs") else ""
+        if running:
+            when = f"{_when(i['end_at'])} 끝 예상" if i.get("end_at") else "끝 시각 계산 중"
+        elif i.get("start_at") and i.get("end_at"):
+            when = f"{_when(i['start_at'])} 시작, {_when(i['end_at'])} 끝 예상"
+        elif i.get("start_at"):
+            when = f"{_when(i['start_at'])} 시작 예상, 끝 시각 모름"
+        else:
+            when = "앞 작업이 끝난 뒤 시작 (시각 모름)"
+        basis = f' <span class="sub">({r.e(i["basis"])})</span>' if i.get("basis") and not running else ""
+        buttons = ""
+        if live and running:
+            buttons = (f'<button type="button" class="pl-btn" data-arm="한 번 더 누르면 멈춥니다" data-q-stop="{r.e(i["id"])}" '
+                       'title="실행을 멈춥니다. 극한 탐색은 나중에 다시 넣으면 이어서 합니다">멈추기</button>')
+        elif live:
+            nxt = (f'<button type="button" class="pl-btn" data-q-next="{r.e(i["id"])}" title="실행 중인 것 바로 다음으로 옮깁니다">'
+                   "먼저 실행</button>" if i["place"] > 1 else "")
+            buttons = nxt + (f'<button type="button" class="pl-btn" data-arm="한 번 더 누르면 취소합니다" '
+                             f'data-q-cancel="{r.e(i["id"])}">취소</button>')
+        items.append(f'<li>{place} <b>{r.e(i["title"])}</b> <span class="sub">{r.e(size)}{" · " if size else ""}'
+                     f'{r.e(when)}</span>{basis}<span class="lab-hpo-qbtn">{buttons}</span></li>')
+    return '<ol class="lab-hpo-queue">' + "".join(items) + "</ol>"
+
+
+def _hpo_result(row: dict[str, Any]) -> str:
+    """The study against its record: record mean, best trial (one seed, not final), top-5 confirmation, check."""
+
+    r = _h()
+    from ..hpo import _fmt
+
+    unit = r.e(row.get("unit") or "")
+    record = row.get("record") or {}
+    base = record.get("mean")
+    lines = []
+    if base is not None:
+        seeds = f"seed {int(record['seeds'])}개 평균" if record.get("seeds") else "기록"
+        lines.append(f"<div>기록 {_fmt(base)} {unit} <span class='sub'>({seeds})</span></div>")
+    best = row.get("best")
+    if best is not None:
+        lines.append(f"<div>탐색 최고 {_fmt(best)} {unit}{_gap_span(_gap(best, base))} "
+                     "<span class='sub'>seed 1개 값, 확정 전</span></div>")
+    top = row.get("top")
+    pending: dict[str, dict[str, Any]] = {}
+    for i in sorted(row.get("followups") or [], key=lambda x: x["place"]):  # the first one to run of each kind
+        pending.setdefault(i["kind"], i)
+    if top:
+        lines.append(f"<div><b>확정 {_fmt(top['mean'])} {unit}</b>{_gap_span(_gap(top['mean'], base))} "
+                     f"<span class='sub'>상위 {top['settings']}개 중 최고, seed {top['seeds']}개 평균</span></div>")
+    elif "상위 5개 확정" in pending:
+        i = pending["상위 5개 확정"]
+        lines.append(f"<div class='sub'>상위 5개 확정: {'실행 중' if i['status'] == 'running' else str(i['place'] + 1) + '번째로 대기'}</div>")
+    check = row.get("refcheck")
+    if "재현 확인" in pending and not (check and check.get("common")):
+        i = pending["재현 확인"]
+        lines.append(f"<div class='sub'>재현 확인: {'실행 중' if i['status'] == 'running' else str(i['place'] + 1) + '번째로 대기'}</div>")
+    elif check and check.get("common"):
+        lines.append(f"<div class='sub' title='{r.e(check.get('verdict') or '')}'>재현 확인: 기록 seed {_fmt(check['record_common'])} "
+                     f"→ 다시 {_fmt(check['rerun_common'])}" + (f", seed {check['study_seed']} {_fmt(check['rerun'][check['study_seed']])}"
+                                                                if check["study_seed"] in check["rerun"] else "") + " (보고서)</div>")
+    return "".join(lines) or "-"
+
+
 def hpo_html(paths: Any, *, live: bool = True) -> str:
-    """The study table: state, progress, current setting, best, saturation and expected end of every study in
-    ``configs/hpo/``; with ``live`` also check boxes and buttons (queue, current-setting trial, top settings)."""
+    """The 극한 탐색 panel: the queue in run order (stop, run next, cancel), the studies that have started (state,
+    progress, result against the record, top-5 confirmation) and, folded, the studies not started yet (pick and
+    queue). Destructive buttons ask for a second click on the button itself instead of a browser dialog."""
 
     r = _h()
     try:
-        from ..hpo import REF_VERSION, STATE_NAMES, _fmt, studies_status
+        from ..hpo import STATE_NAMES, studies_status
 
         st = studies_status(paths)
     except Exception as exc:  # noqa: BLE001  (optuna missing on this server, unreadable file …)
@@ -352,102 +446,82 @@ def hpo_html(paths: Any, *, live: bool = True) -> str:
     if not rows:
         return '<p class="empty">탐색 설정이 없습니다. 서버에서 <code>python scripts/hpo_studies.py</code>로 만드세요.</p>'
     n = st["states"]
-    end = f" · 대기열의 탐색이 모두 끝나는 예상 시각 <b>{r.e(_when(st['queue_end']))}</b>" if st.get("queue_end") else ""
-    head = (f'<p class="sub lab-qhead">탐색 {len(rows)}개: 완료 {n["done"]} · 실행 중 {n["running"]} · 대기 {n["queued"]} · '
-            f'멈춤 {n["partial"]} · 미실행 {n["new"]} · trial {st["finished"]:,} / {st["budget"]:,}{end} · 10초마다 새로 고침</p>')
-    actions = ('<div class="lab-actions" id="lab-hpo-actions">'
-               '<button type="button" class="pl-btn pl-main" data-hpo-submit>▶ 선택한 탐색을 대기열에 넣기</button>'
-               '<button type="button" class="pl-btn" data-hpo-reference title="누적 기록에서 지금 설정의 seed 평균·표준편차를 다시 계산 (학습 없음)">'
-               '기준점 다시 뽑기</button><span class="lab-msg"></span></div>') if live else ""
-    body = []
-    order = {s: i for i, s in enumerate(("running", "queued", "partial", "failed", "cancelled", "done", "new"))}
-    for row in sorted(rows, key=lambda x: (order.get(x.get("state", "new"), 9), x["name"])):
+    end = f" · 대기열이 모두 끝나는 예상 시각 <b>{r.e(_when(st['queue_end']))}</b>" if st.get("queue_end") else ""
+    head = (f'<p class="sub lab-qhead">탐색 {len(rows)}개: 실행 중 {n["running"]} · 대기 {n["queued"]} · 멈춤 {n["partial"]} · '
+            f'완료 {n["done"]} · 아직 안 넣음 {n["new"]}{end} · 10초마다 새로 고침</p>')
+    queue = "<h4>대기열 (실행 순서)</h4>" + _hpo_queue(st.get("queue") or [], live=live)
+
+    started, fresh = [], []
+    order = {s: i for i, s in enumerate(("running", "queued", "partial", "cancelled", "failed", "done", "new"))}
+    for row in sorted(rows, key=lambda x: (order.get(x.get("state", "new"), 9), x.get("place") or 0, x["name"])):
         name = r.e(row["name"])
         if "error" in row and "target" not in row:
-            body.append(f"<tr><td></td><td><b>{name}</b></td><td colspan='9' class='lab-err'>{r.e(row['error'])}</td></tr>")
+            started.append(f"<tr><td></td><td><b>{name}</b></td><td colspan='4' class='lab-err'>{r.e(row['error'])}</td></tr>")
             continue
         state = row.get("state", "new")
         pick = state in ("new", "partial", "failed", "cancelled")
-        box = (f'<input type="checkbox" class="lab-hpo-pick" value="{name}"{"" if pick else " disabled"}>'
-               if live else "")
+        box = (f'<input type="checkbox" class="lab-hpo-pick" value="{name}">' if live and pick else "")
+        title = f"<b>{name}</b><div class='sub'>{r.e(row.get('label') or '')}</div>"
+        if state == "new":
+            line = (f"<tr><td>{box}</td><td title='{r.e(row.get('description') or '')}'>{title}</td>"
+                    f"<td>{r.e(row['target'])}</td></tr>")
+            fresh.append((row.get("task") or "", line))
+            continue
         c = row.get("counts") or {"complete": 0, "pruned": 0, "fail": 0}
-        pace = row.get("progress") or {}
+        if state == "queued":
+            state_cell = f'<span class="st">대기 {row.get("place", 0) + 1}번째</span>' if row.get("place") is not None else "대기"
+        else:
+            label = {"partial": "멈춤 (이어서 가능)", "cancelled": "취소됨 (이어서 가능)"}.get(state, STATE_NAMES.get(state, state))
+            state_cell = f'<span class="st {HPO_STATE_CLASS.get(state, "")}">{r.e(label)}</span>'
         share = min(1.0, row.get("finished", 0) / max(1, row["budget"]))
-        bar = (f'<div class="lab-bar"><i style="width:{100 * share:.1f}%"></i></div>'
-               f'<div class="sub">완료 {c["complete"]} · 중단 {c["pruned"]} · 실패 {c["fail"]} / 예산 {row["budget"]}'
-               + (f' · trial당 {r.e(r.minutes(pace["per_trial_min"]))}' if pace.get("per_trial_min") else "") + "</div>")
+        when = ""
+        if state == "running" and row.get("end_at"):
+            when = f" · {_when(row['end_at'])} 끝 예상"
+        elif state == "queued" and row.get("start_at"):
+            when = f" · {_when(row['start_at'])} 시작 예상"
+        sat = row.get("saturation")
+        progress = (f'<div class="lab-bar"><i style="width:{100 * share:.1f}%"></i></div>'
+                    f'<div class="sub">trial {row.get("finished", 0)} / {row["budget"]}{when}</div>'
+                    + (f'<div class="sub" title="{r.e(row.get("saturation_reason") or "")}">포화 판정: {r.e(sat)}</div>'
+                       if sat and c["complete"] else ""))
         fails = row.get("failures") or []
         if fails:
             kinds = ", ".join(f"{r.e(k)} {v}" for k, v in (row.get("failure_kinds") or {}).items())
             items = "".join(f"<li><b>trial {f['trial']}</b> {r.e(f['kind'])}: {r.e(f['settings'])}"
                             f"<div class='sub'>{r.e(f['error'])}</div></li>" for f in fails)
-            bar += (f'<details class="lab-hpo-fail" data-key="fail-{name}"><summary>실패 원인: {kinds}</summary>'
-                    f"<ul>{items}</ul></details>")
-        unit = row.get("unit") or ""
-        ref = row.get("reference")
-        old_ref = ref is not None and row.get("ref_version", 0) < REF_VERSION
-        ref_cell = "-" if ref is None else f"{_fmt(ref)} {r.e(unit)}"
-        check = row.get("ref_check") or {}
-        if check and not check.get("ok"):
-            ref_cell += (f'<div class="lab-warn" title="누적 기록의 seed 평균 {_fmt(check["mean"])} {r.e(unit)}에서 '
-                         f'허용 ±{check["limit_pct"]:.0f}% 밖입니다. 지금 설정이 재현되지 않아 지금 대비는 참고만 하세요">'
-                         f'⚠ 기록과 {check["gap_pct"]:+.0f}%</div>')
-        if old_ref:
-            ref_cell += ('<div class="lab-warn" title="이전 방식으로 넣은 기준 trial이라 지금 설정과 다를 수 있습니다. '
-                         "'기준 trial 다시 넣기'로 바로잡습니다\">⚠ 이전 방식</div>")
-        if row.get("ref_pending"):
-            ref_cell += '<div class="sub">새 기준 trial 학습 중</div>'
-        rc = row.get("refcheck")
-        if rc:
-            if rc.get("gap_pct") is None:
-                ref_cell += '<div class="sub">재현 실험 기다리는 중</div>'
-            else:
-                mine = rc["rerun"].get(rc["study_seed"])
-                ref_cell += (f'<div class="sub" title="{r.e(rc["verdict"])}">재현 실험: 기록 {_fmt(rc["record_common"])} → '
-                             f'다시 {_fmt(rc["rerun_common"])}'
-                             + (f', seed {rc["study_seed"]} {_fmt(mine)}' if mine is not None else "") + "</div>")
-        gain = row.get("gain_pct")
-        gain_cell = "-" if gain is None else (f'<span class="st {"good" if gain > 0 else ""}">{-gain:+.1f}%</span>')
-        if gain is not None and check and not check.get("ok"):
-            gain_cell += '<div class="sub">참고</div>'
-        sat = row.get("saturation") or "-"
-        sat_cell = (f'<span class="st {"good" if sat == "포화" else ""}" title="{r.e(row.get("saturation_reason") or "")}">'
-                    f"{r.e(sat)}</span>")
-        if state == "running" and pace.get("eta_at"):
-            end_cell = r.e(_when(row.get("end_at") or pace["eta_at"]))
-        elif state == "queued" and row.get("end_at"):
-            basis = row.get("end_basis") or ""
-            mark = '<br><span class="sub">참고</span>' if basis.startswith("다른 과제") else ""
-            end_cell = f'<span title="{r.e(basis)}">{r.e(_when(row["end_at"]))}</span>{mark}'
-        elif state == "queued":
-            end_cell = f'<span class="sub">{r.e(row.get("end_basis") or "-")}</span>'
-        else:
-            end_cell = "-"
+            progress += (f'<details class="lab-hpo-fail" data-key="fail-{name}"><summary>실패 {len(fails)}: {kinds}</summary>'
+                         f"<ul>{items}</ul></details>")
         acts = [f'<a href="/api/report?name={r.e(row["report"])}" target="_blank" rel="noopener">보고서</a>']
-        if live and c["complete"] >= 10:
-            acts.append(f'<button type="button" class="pl-btn" data-hpo-top="{name}" title="상위 5개 설정을 seed 3개로 다시 학습 (대기열)">상위 5개 재학습</button>')
-        if live and row.get("has_reference_source"):
-            acts.append(f'<button type="button" class="pl-btn" data-hpo-refcheck="{name}" title="누적 기록의 지금 설정을 '
-                        f'일반 학습 경로로 기록 seed와 탐색 seed로 다시 학습해, 기록이 재현되는지와 seed 차이를 봅니다 (대기열)">'
-                        "재현 확인</button>")
-        if live and not row.get("ref_pending") and (old_ref or (ref is None and c["complete"] + c["pruned"] > 0)):
-            acts.append(f'<button type="button" class="pl-btn" data-hpo-requeue="{name}" title="지금 설정을 정확히 재현한 trial을 맨 앞에 넣습니다 (실행 중이면 다음 trial)">기준 trial 다시 넣기</button>')
-        body.append(
-            f"<tr><td>{box}</td><td><b>{name}</b><div class='sub'>{r.e(row.get('description') or '')}</div></td>"
-            f"<td>{r.e(row['target'])}<div class='sub'>{r.e(row['objective'])}</div></td>"
-            f'<td><span class="st {HPO_STATE_CLASS.get(state, "")}">{r.e(STATE_NAMES.get(state, state))}</span></td>'
-            f"<td style='min-width:170px'>{bar}</td><td>{ref_cell}</td>"
-            f"<td>{_fmt(row.get('best'))} {r.e(unit) if row.get('best') is not None else ''}</td><td>{gain_cell}</td>"
-            f"<td>{sat_cell}</td><td>{end_cell}</td><td class='lab-hpo-acts'>{' '.join(acts)}</td></tr>")
-    table = ('<div class="tw lab-hpo-scroll"><table class="lab-hpo"><tr><th></th><th>탐색</th><th>대상 · 지표</th><th>상태</th><th>진행</th>'
-             "<th>지금 설정</th><th>최고</th><th>지금 대비</th><th>포화</th><th>예상 끝</th><th>보기 · 동작</th></tr>"
-             + "".join(body) + "</table></div>")
-    note = ('<p class="sub">지금 대비 = 최고 ÷ 지금 설정 - 1 (음수면 나아짐). 포화 = 최근 50개 trial에서 최고 기록 개선이 '
-            "max(1%, seed 표준편차)보다 작음. 예상 끝은 지금 속도 기준이며, 대기열의 다른 실험 시간은 빠져 있습니다. "
-            "trial은 검증 run 하나로 고른 값이라 낙관적입니다. 상위 설정은 seed 3개로 다시 학습해 판정합니다. "
-            "표는 실행 중, 대기, 멈춤, 완료, 미실행 순이며 안에서 스크롤됩니다. GPU 메모리가 모자란 설정은 batch를 조각내 "
-            "같은 실효 batch로 학습하고, trial 하나는 탐색 파일의 train.max_minutes(기본 120분)까지만 GPU를 씁니다.</p>")
-    return head + actions + table + note
+        waiting = any(i["kind"] == "상위 5개 확정" for i in row.get("followups") or [])
+        if (live and state not in ("running", "queued") and (state == "done" or c["complete"] >= 10)
+                and c["complete"] and not row.get("top") and not waiting):
+            acts.append(f'<button type="button" class="pl-btn" data-arm="한 번 더 누르면 넣습니다" data-hpo-top="{name}" '
+                        'title="탐색 상위 5개 설정을 seed 42·43·44로 다시 학습해 결과를 확정합니다 (대기열)">상위 5개 확정</button>')
+        started.append(f"<tr><td>{box}</td><td title='{r.e(row.get('description') or '')}'>{title}</td><td>{state_cell}</td>"
+                       f"<td>{progress}</td><td>{_hpo_result(row)}</td><td class='lab-hpo-acts'>{' '.join(acts)}</td></tr>")
+
+    submit = ('<div class="lab-actions" id="lab-hpo-actions"><button type="button" class="pl-btn pl-main" data-hpo-submit '
+              'data-arm="한 번 더 누르면 대기열에 넣습니다">▶ 체크한 탐색을 대기열에 넣기</button><span class="lab-msg"></span></div>'
+              if live else "")
+    table = ('<h4>시작한 탐색</h4><div class="tw lab-hpo-scroll"><table class="lab-hpo"><tr><th></th><th>탐색</th><th>상태</th>'
+             "<th>진행</th><th>결과 (누적 기록과 비교)</th><th>동작</th></tr>" + "".join(started) + "</table></div>"
+             if started else '<h4>시작한 탐색</h4><p class="empty">아직 시작한 탐색이 없습니다.</p>')
+    groups = []
+    for task, name in (("forecast", "미래값 예측"), ("virtual_sensor", "가상 센서")):
+        part = [html for t, html in fresh if t == task]
+        if part:
+            groups.append(f"<tr><th colspan='3'>{name} {len(part)}개</th></tr>" + "".join(part))
+    other = [html for t, html in fresh if t not in ("forecast", "virtual_sensor")]
+    if other:
+        groups.append("".join(other))
+    folded = (f'<details class="more lab-hpo-new" data-key="hpo-new"><summary><b>아직 넣지 않은 탐색 {len(fresh)}개</b> '
+              "(펼쳐서 체크한 뒤 아래 버튼으로 넣기)</summary><div class='tw'><table class='lab-hpo lab-hpo-newt'>"
+              + "".join(groups) + "</table></div></details>" if fresh else "")
+    note = ('<p class="sub">기록 = 누적 기록에서 지금 설정의 seed 평균(탐색 전 기준). 탐색 최고는 trial 하나(seed 1개) 값이라 '
+            "흔들림이 크고, <b>상위 5개 확정</b>(seed 3개)으로 다시 학습한 값이 결론입니다. %는 기록 대비이며 음수가 나아진 것입니다. "
+            "예상 시각은 지금까지의 속도로 계산합니다. GPU 메모리가 모자란 설정은 batch를 조각내 같은 실효 batch로 학습하고, "
+            "trial 하나는 최대 120분까지만 GPU를 씁니다. 탐색 설정 파일을 고치면 대기 중인 탐색에도 시작할 때 반영됩니다.</p>")
+    return head + queue + table + folded + submit + note
 
 
 # ----------------------------------------------------------------------------- the tab
@@ -466,9 +540,10 @@ def lab_section(ledger: pd.DataFrame) -> str:
         '<div class="lab-note" id="lab-readonly" hidden><b>보기 전용 화면입니다.</b> 학습은 담당자가 별도로 실행하며, '
         "이 화면에서는 진행 상황과 결과를 확인할 수 있습니다. 학습이 끝나면 화면 상단에 새 결과 알림이 표시됩니다.</div>"
         '<h3>극한 탐색 (Optuna, 포화까지)</h3>'
-        '<p class="note">탐색 하나 = 대상 하나 · 모델 하나의 하이퍼파라미터를 여러 개 함께 바꾸는 trial 150개입니다. '
-        "첫 trial은 지금 최고 설정이고, 성적이 낮은 trial은 학습 도중에 끊습니다. 체크한 탐색을 대기열에 넣으면 GPU 4장을 모두 "
-        "쓰며 하나씩 차례로 돕니다(멈춘 탐색은 이어서). 끝난 탐색은 <b>상위 5개 재학습</b>으로 seed 3개를 돌려 판정합니다.</p>"
+        '<p class="note">탐색 하나는 대상 하나의 PatchTST 설정을 여러 개 함께 바꿔 가며 trial 150개를 학습합니다 '
+        "(성적이 낮은 trial은 도중에 끊음, GPU 4장). 쓰는 순서: <b>① 넣기</b> 아래 '아직 넣지 않은 탐색'을 펼쳐 체크하고 "
+        "대기열에 넣기, <b>② 지켜보기</b> 대기열에서 순서와 예상 시각 확인(먼저 실행, 취소, 멈추기), "
+        "<b>③ 확정</b> 끝난 탐색은 '상위 5개 확정'으로 seed 3개 재학습. 결과는 누적 기록의 지금 설정과 비교합니다.</p>"
         '<div id="lab-hpo"><p class="sub">읽는 중…</p></div>'
         '<div id="lab-new"><h3>새 실험 등록 (하이퍼파라미터 조합)</h3>'
         '<p class="note">칸에 값을 쉼표로 여러 개 넣으면(예: <code>8, 32</code>) 가능한 조합을 모두 만듭니다. '
@@ -528,7 +603,13 @@ table.lab-hpo td.lab-hpo-acts{white-space:normal;min-width:150px} .lab-hpo-acts 
 table.lab-hpo td:nth-child(2){min-width:220px}
 .lab-hpo-scroll{max-height:470px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--grid);border-radius:8px}
 .lab-hpo-scroll table.lab-hpo{margin:0} .lab-hpo-scroll table.lab-hpo th{position:sticky;top:0;z-index:1}
-table.lab-hpo th{word-break:keep-all} .lab-hpo-fail{margin-top:4px;white-space:normal;max-width:300px} .lab-hpo-fail summary{cursor:pointer;color:var(--text2)}
+table.lab-hpo th{word-break:keep-all} .lab-hpo-fail{margin-top:4px;white-space:normal;max-width:300px}
+.lab-hpo-queue{margin:4px 0 14px;padding:0;list-style:none;display:grid;gap:6px}
+.lab-hpo-queue li{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;padding:6px 10px;border:1px solid var(--grid);
+  border-radius:8px} .lab-hpo-qbtn{margin-left:auto;display:flex;gap:6px} .lab-hpo-qbtn .pl-btn{padding:2px 10px}
+.pl-btn.armed{border-color:var(--critical);color:var(--critical);font-weight:600}
+.lab-hpo-new{margin:10px 0} table.lab-hpo-newt th{text-align:left;padding-top:10px}
+table.lab-hpo-newt td:first-child{width:28px} table.lab-hpo-newt td:last-child{width:30%} .lab-hpo-fail summary{cursor:pointer;color:var(--text2)}
 .lab-hpo-fail ul{margin:4px 0 0;padding-left:18px} .lab-hpo-fail li{margin:2px 0}
 table.lab-xlist tr[data-xsel]{cursor:pointer} table.lab-xlist tr[data-xsel]:hover td{background:var(--shade)}
 table.lab-xlist tr.on td{background:var(--shade);font-weight:600} table.lab-xlist tr.on td:first-child{box-shadow:inset 3px 0 0 var(--s1)}
@@ -575,9 +656,17 @@ get('/api/meta').then(meta=>{M=meta;$('lab-offline').hidden=true;$('lab-live').h
     if(!location.hash){const b=document.querySelector("nav button[data-tab='lab']");if(b)b.click();}}
   queue();setInterval(queue,5000);first();setInterval(first,20000);hpo();setInterval(hpo,10000);}).catch(()=>{});
 // 극한 탐색: study table, queue the checked studies, current-setting trial, top settings again with seeds
-function hpo(){const box=$('lab-hpo');if(!box)return;const keep=new Set([...box.querySelectorAll('.lab-hpo-pick:checked')].map(i=>i.value));
+// two clicks instead of a browser dialog (a page can block dialogs): the first click arms the button for 5 s and
+// pauses the refresh, the second one acts
+let HPO_HOLD=0;
+function arm(b,fn){if(b.classList.contains('armed')){b.classList.remove('armed');HPO_HOLD=0;fn();return;}
+  const text=b.textContent;b.classList.add('armed');b.textContent=b.dataset.arm;HPO_HOLD=Date.now()+5000;
+  setTimeout(()=>{if(b.classList.contains('armed')){b.classList.remove('armed');b.textContent=text;}},5000);}
+function hpo(){const box=$('lab-hpo');if(!box||Date.now()<HPO_HOLD)return;
+  const keep=new Set([...box.querySelectorAll('.lab-hpo-pick:checked')].map(i=>i.value));
   const msg=(box.querySelector('#lab-hpo-actions .lab-msg')||{}).textContent||'';
-  get('/api/fragment/hpo').then(html=>{const sc=box.querySelector('.lab-hpo-scroll'),top=sc?sc.scrollTop:0,left=sc?sc.scrollLeft:0;
+  get('/api/fragment/hpo').then(html=>{if(Date.now()<HPO_HOLD)return;
+    const sc=box.querySelector('.lab-hpo-scroll'),top=sc?sc.scrollTop:0,left=sc?sc.scrollLeft:0;
     const open=new Set([...box.querySelectorAll('details[data-key][open]')].map(d=>d.dataset.key));
     box.innerHTML=html;box.querySelectorAll('.lab-hpo-pick').forEach(i=>{if(keep.has(i.value))i.checked=true;});
     box.querySelectorAll('details[data-key]').forEach(d=>{if(open.has(d.dataset.key))d.open=true;});
@@ -585,21 +674,18 @@ function hpo(){const box=$('lab-hpo');if(!box)return;const keep=new Set([...box.
     const m=box.querySelector('#lab-hpo-actions .lab-msg');if(m)m.textContent=msg;
     const say=t=>{const x=box.querySelector('#lab-hpo-actions .lab-msg');if(x)x.textContent=t;};
     const gpus=()=>F?[...F.gpus].sort().join(',')||'cpu':'auto';
+    const done=(b,text)=>r=>{say(r.error?'오류: '+r.error:text);if(b)b.disabled=false;queue();hpo();};
     const sub=box.querySelector('[data-hpo-submit]');if(sub)sub.onclick=()=>{const names=[...box.querySelectorAll('.lab-hpo-pick:checked')].map(i=>i.value);
-      if(!names.length){say('탐색을 하나 이상 체크하세요');return;}
-      if(!confirm('탐색 '+names.length+'개를 이 순서대로 대기열에 넣을까요? 하나씩 차례로 GPU '+gpus()+'를 씁니다.'))return;
-      sub.disabled=true;say('대기열에 넣는 중…');post('/api/hpo/submit',{names:names,gpus:gpus(),report:true}).then(r=>{
-        say(r.error?'오류: '+r.error:'대기열에 넣었습니다: '+r.ids.join(', '));sub.disabled=false;queue();hpo();});};
-    const ref=box.querySelector('[data-hpo-reference]');if(ref)ref.onclick=()=>{ref.disabled=true;say('기준점을 계산하는 중… (학습 없음)');
-      post('/api/hpo/reference',{}).then(r=>{say(r.error?'오류: '+r.error:'기준점을 다시 뽑았습니다: '+r.experiments.join(', '));ref.disabled=false;hpo();});};
-    box.querySelectorAll('[data-hpo-top]').forEach(b=>b.onclick=()=>{if(!confirm(b.dataset.hpoTop+': 상위 5개 설정을 seed 3개(42·43·44)로 다시 학습할까요?'))return;
-      b.disabled=true;post('/api/hpo/top',{name:b.dataset.hpoTop,k:5,seeds:'42,43,44',gpus:gpus()}).then(r=>{
-        say(r.error?'오류: '+r.error:'대기열에 넣었습니다: '+r.ids.join(', '));queue();hpo();});});
-    box.querySelectorAll('[data-hpo-refcheck]').forEach(b=>b.onclick=()=>{if(!confirm(b.dataset.hpoRefcheck+': 지금 설정을 일반 학습 경로로 기록 seed와 탐색 seed로 다시 학습할까요? (대기열, seed 수만큼 작업)'))return;
-      b.disabled=true;post('/api/hpo/refcheck',{name:b.dataset.hpoRefcheck,gpus:gpus()}).then(r=>{
-        say(r.error?'오류: '+r.error:'재현 실험을 대기열에 넣었습니다 (seed '+r.seeds.join(', ')+'): '+r.ids.join(', '));queue();hpo();});});
-    box.querySelectorAll('[data-hpo-requeue]').forEach(b=>b.onclick=()=>{b.disabled=true;post('/api/hpo/requeue',{name:b.dataset.hpoRequeue}).then(r=>{
-      say(r.error?'오류: '+r.error:(r.queued?b.dataset.hpoRequeue+': 지금 설정 trial을 맨 앞에 넣었습니다':'이미 들어가 있거나 누적 기록에서 지금 설정을 찾지 못했습니다'));hpo();});});
+      if(!names.length){say('넣을 탐색을 하나 이상 체크하세요 (아래 "아직 넣지 않은 탐색"을 펼치면 보입니다)');return;}
+      arm(sub,()=>{sub.disabled=true;say('대기열에 넣는 중…');post('/api/hpo/submit',{names:names,gpus:gpus(),report:true}).then(done(sub,'대기열에 넣었습니다: '+names.join(', ')));});};
+    box.querySelectorAll('[data-hpo-top]').forEach(b=>b.onclick=()=>arm(b,()=>{b.disabled=true;
+      post('/api/hpo/top',{name:b.dataset.hpoTop,k:5,seeds:'42,43,44',gpus:gpus()}).then(done(null,b.dataset.hpoTop+': 상위 5개 확정을 대기열에 넣었습니다'));}));
+    box.querySelectorAll('[data-q-stop]').forEach(b=>b.onclick=()=>arm(b,()=>{b.disabled=true;
+      post('/api/cancel',{id:b.dataset.qStop}).then(done(null,'멈추는 중입니다 (극한 탐색은 다시 넣으면 이어서 합니다)'));}));
+    box.querySelectorAll('[data-q-cancel]').forEach(b=>b.onclick=()=>arm(b,()=>{b.disabled=true;
+      post('/api/cancel',{id:b.dataset.qCancel}).then(done(null,'취소했습니다'));}));
+    box.querySelectorAll('[data-q-next]').forEach(b=>b.onclick=()=>{b.disabled=true;
+      post('/api/queue/next',{id:b.dataset.qNext}).then(done(null,'다음 차례로 옮겼습니다'));});
   }).catch(()=>{});}
 // a whole plan file (markdown): preview every request, then queue them all in the order written
 function planText(){return $('lab-file-text').value;}
@@ -703,9 +789,9 @@ function run(){if(!F.ok)return;$('lab-run').disabled=true;post('/api/submit',bod
   $('lab-preview').insertAdjacentHTML('afterbegin',r.error?`<p class="lab-err">${esc(r.error)}</p>`:
     `<p class="st good">대기열에 넣었습니다: ${r.ids.map(esc).join(', ')} . 아래 진행 상황에서 확인하세요.</p>`);
   $('lab-run').disabled=false;queue();});}
-function queue(){get('/api/fragment/queue').then(html=>{const q=$('lab-queue');const open=[...q.querySelectorAll('details[open]')].map(d=>d.dataset.log);
+function queue(){if(Date.now()<HPO_HOLD)return;get('/api/fragment/queue').then(html=>{const q=$('lab-queue');const open=[...q.querySelectorAll('details[open]')].map(d=>d.dataset.log);
   const old=q.querySelector('.lab-reqs'),top=old?old.scrollTop:0;
-  q.innerHTML=html;const box=q.querySelector('.lab-reqs');if(box)box.scrollTop=top;q.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>{if(confirm('이 요청을 취소할까요?'))post('/api/cancel',{id:b.dataset.cancel}).then(queue);});
+  q.innerHTML=html;const box=q.querySelector('.lab-reqs');if(box)box.scrollTop=top;q.querySelectorAll('[data-cancel]').forEach(b=>{b.dataset.arm='한 번 더 누르면 취소합니다';b.onclick=()=>arm(b,()=>post('/api/cancel',{id:b.dataset.cancel}).then(()=>{queue();hpo();}));});
   q.querySelectorAll('[data-hide]').forEach(b=>b.onclick=()=>{if(confirm('이 요청을 진행 상황 목록에서 지울까요? 결과는 누적 기록과 탐색 결과에 남습니다.'))
     post('/api/hide',{id:b.dataset.hide}).then(r=>{if(r.error)alert(r.error);queue();});});
   q.querySelectorAll('[data-hide-all]').forEach(b=>b.onclick=()=>{if(confirm('끝난 요청 '+b.dataset.hideAll+'건(완료·실패·취소)을 목록에서 지울까요? 결과는 누적 기록과 탐색 결과에 남습니다.'))
